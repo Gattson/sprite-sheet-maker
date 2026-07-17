@@ -1,0 +1,783 @@
+:root {
+  --bg: #16161c;
+  --panel: #1f1f28;
+  --panel-edge: #2c2c38;
+  --text: #d8d8e0;
+  --text-dim: #8a8a98;
+  --accent: #41a6f6;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 system-ui, sans-serif;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* ---------- top bar ---------- */
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--panel-edge);
+}
+
+#topbar h1 {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  margin-right: 8px;
+}
+
+.group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* pushes this group (and everything after it) to the right edge */
+.group.push { margin-left: auto; }
+
+/* ---------- File dropdown menu ---------- */
+#file-wrap { position: relative; }
+
+#file-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+}
+
+#file-menu[hidden] { display: none; }
+
+#file-menu hr {
+  border: none;
+  border-top: 1px solid var(--panel-edge);
+}
+
+#file-menu .menu-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#file-menu .menu-item { text-align: left; }
+
+/* New-project mode picker: two radio labels side by side */
+#mode-row { justify-content: space-between; }
+#mode-row label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+#file-menu select {
+  padding: 5px 6px;
+  background: var(--bg);
+  border: 1px solid var(--panel-edge);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+}
+
+.group label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
+input[type="number"] {
+  width: 52px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--panel-edge);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+}
+
+button {
+  padding: 5px 10px;
+  background: #2a2a35;
+  border: 1px solid var(--panel-edge);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: #343442; }
+button:disabled { opacity: 0.4; cursor: default; }
+
+#zoom-label {
+  min-width: 44px;
+  text-align: center;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- main layout ---------- */
+main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+#toolbar {
+  width: 150px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--panel);
+  border-right: 1px solid var(--panel-edge);
+  overflow-y: auto;
+}
+
+#toolbar hr {
+  border: none;
+  border-top: 1px solid var(--panel-edge);
+  margin: 6px 0;
+}
+
+.tool {
+  text-align: left;
+  padding: 7px 10px;
+}
+
+.tool .icon { display: inline-block; width: 18px; }
+
+.tool.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0c0c12;
+  font-weight: 600;
+}
+
+/* Brush size + tip shape (shared by the brush and eraser tools) */
+#brush-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+#brush-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+#brush-shapes { display: flex; gap: 4px; }
+
+.shape {
+  padding: 2px 8px;
+  line-height: 1.4;
+}
+
+.shape.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0c0c12;
+}
+
+#inp-brush-size {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* Freeform-only stroke settings; pixel mode hides them (and freeform hides
+   the square/circle tip toggle — freeform tips are always round). */
+.brush-sub {
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+}
+body.mode-free .brush-sub { display: flex; }
+body.mode-free #brush-shapes { display: none; }
+
+.brush-sub input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+#color-well input[type="color"] {
+  width: 100%;
+  height: 36px;
+  padding: 0;
+  border: 1px solid var(--panel-edge);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+
+#palette {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+
+.swatch {
+  aspect-ratio: 1;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+.swatch.active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---------- floating preview popup (playback happens in the main canvas;
+              this optional panel is a small always-visible loop monitor) ---------- */
+#preview-panel {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  width: 200px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(31, 31, 40, 0.95);
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 6;
+  overflow: hidden;
+}
+
+#preview-panel[hidden] { display: none; }
+
+#preview-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--panel-edge);
+  cursor: grab;        /* the header doubles as the panel's drag handle */
+  touch-action: none;
+}
+
+#preview-head:active { cursor: grabbing; }
+
+#preview-head span {
+  flex: 1;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+#preview-head button {
+  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+#preview {
+  width: 100%;
+  /* canvas keeps its own aspect ratio; upscale stays crisp */
+  image-rendering: pixelated;
+  background: repeating-conic-gradient(#4a4a52 0% 25%, #5a5a63 0% 50%) 0 0 / 12px 12px;
+}
+
+/* Freeform projects interpolate the preview instead of showing fat pixels. */
+#preview.smooth { image-rendering: auto; }
+
+/* ---------- selection action bar ---------- */
+#select-bar {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  background: rgba(31, 31, 40, 0.95);
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 5;
+  white-space: nowrap;
+}
+
+#select-bar[hidden] { display: none; }
+
+#select-bar button {
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+/* W / H / angle readout + manual entry — freeform only (typing a size would
+   resample pixel art, which that mode deliberately never does). */
+#sel-dims {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  margin-right: 6px;
+  color: var(--text-dim);
+}
+
+body.mode-free #sel-dims { display: flex; }
+
+#sel-dims label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+/* ---------- slider number boxes (exact-value entry on every slider) ---------- */
+input.num {
+  width: 44px;
+  padding: 1px 3px;
+  font: inherit;
+  font-size: 12px;
+  text-align: right;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--panel-edge);
+  border-radius: 4px;
+}
+
+input.num:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ---------- brush library panel (floating overlay, Procreate-style) ---------- */
+#brush-panel {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  width: 208px;
+  max-height: calc(100% - 20px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(31, 31, 40, 0.95);
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 6; /* above the layers panel when they overlap */
+  overflow: hidden;
+}
+
+#brush-panel[hidden] { display: none; }
+
+#brush-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--panel-edge);
+  cursor: grab;        /* the header doubles as the panel's drag handle */
+  touch-action: none;
+}
+
+#brush-head:active { cursor: grabbing; }
+
+#brush-head span {
+  flex: 1;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+#brush-head button {
+  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+#brush-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  overflow-y: auto;
+}
+
+#brush-list .brush {
+  position: relative;
+  padding: 4px 6px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: #26262f; /* dark card so the white stroke swatch reads */
+  cursor: pointer;
+}
+
+#brush-list .brush:hover { background: #2a2a35; }
+
+#brush-list .brush.active {
+  background: rgba(65, 166, 246, 0.28); /* the Procreate-blue selected card */
+  border-color: var(--accent);
+}
+
+#brush-list .brush span {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+#brush-list .brush-swatch {
+  display: block;
+  width: 100%;
+}
+
+#brush-list .brush-del {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* The library opener lives in the brush box, freeform only. */
+#btn-brush-lib {
+  display: none;
+  width: 100%;
+  margin-bottom: 6px;
+  text-align: left;
+}
+
+body.mode-free #btn-brush-lib { display: block; }
+
+/* The smudge tool only exists in freeform mode. */
+body:not(.mode-free) .tool[data-tool="smudge"] { display: none; }
+
+/* JS hides the hardness slider for texture brushes; without this the
+   body.mode-free display rule would win over the hidden attribute. */
+body.mode-free .brush-sub[hidden] { display: none; }
+
+/* ---------- layers panel (floating overlay, Procreate-style) ---------- */
+#layers-panel {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 210px;
+  max-height: calc(100% - 20px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(31, 31, 40, 0.95);
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 5;
+  overflow: hidden;
+}
+
+#layers-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--panel-edge);
+  cursor: grab;        /* the header doubles as the panel's drag handle */
+  touch-action: none;  /* let pointer events drive the drag on touch too */
+}
+
+#layers-head:active { cursor: grabbing; }
+
+#layers-head span {
+  flex: 1;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+#layers-head button {
+  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+#layers-panel.collapsed #layers,
+#layers-panel.collapsed #layer-adjust,
+#layers-panel.collapsed .layer-controls { display: none; }
+#layers-panel.collapsed #layers-head { border-bottom: none; }
+
+#layers {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  overflow-y: auto;
+}
+
+#layers .layer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+#layers .layer:hover { background: #2a2a35; }
+
+#layers .layer.active {
+  background: rgba(65, 166, 246, 0.22);
+  border-color: var(--accent);
+}
+
+#layers .layer-thumb {
+  image-rendering: pixelated;
+  /* mini transparency checker behind the layer's content */
+  background: repeating-conic-gradient(#4a4a52 0% 25%, #5a5a63 0% 50%) 0 0 / 8px 8px;
+  border: 1px solid var(--panel-edge);
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+#layers .layer span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Compact non-default markers on a row: "50% M 🔒". The name span flexes;
+   badges must not, or long names would squeeze them out entirely. */
+#layers .layer .layer-badges {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* Appearance controls for the SELECTED layer (opacity / blend / alpha lock) */
+#layer-adjust {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--panel-edge);
+  font-size: 12px;
+}
+
+#layer-adjust label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#layer-adjust input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+#layer-adjust b {
+  width: 34px;
+  text-align: right;
+  font-weight: 600;
+}
+
+#layer-adjust-row {
+  display: flex;
+  gap: 6px;
+}
+
+#sel-layer-blend { flex: 1; }
+
+#btn-layer-lock.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0c0c12;
+}
+
+.layer-controls {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--panel-edge);
+}
+
+.layer-controls button {
+  flex: 1;
+  padding: 3px 0;
+}
+
+/* ---------- canvas ---------- */
+#canvas-wrap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+#view {
+  display: block;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+#canvas-wrap.panning #view,
+#canvas-wrap.pan-tool #view { cursor: grab; }
+#canvas-wrap.panning-active #view { cursor: grabbing; }
+
+/* ---------- onion-skin settings popover ---------- */
+/* Anchored bottom-right of the canvas area, right above the framebar's
+   Onion… button that opens it. */
+#onion-panel {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 190px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(31, 31, 40, 0.95);
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 6;
+}
+
+#onion-panel[hidden] { display: none; }
+
+.onion-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
+.onion-row input[type="range"] { width: 100%; }
+
+#onion-colors {
+  display: flex;
+  gap: 14px;
+  color: var(--text-dim);
+}
+
+#onion-colors label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+#onion-colors input[type="color"] {
+  width: 34px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--panel-edge);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+
+/* ---------- frame strip ---------- */
+#framebar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--panel-edge);
+}
+
+#frames {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  overflow-x: auto;
+  padding: 3px;
+}
+
+.frame {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 60px;
+  height: 60px;
+  flex: 0 0 auto;
+  /* mini transparency checker behind each thumbnail */
+  background: repeating-conic-gradient(#4a4a52 0% 25%, #5a5a63 0% 50%) 0 0 / 12px 12px;
+  border: 1px solid var(--panel-edge);
+  padding: 0;
+}
+
+.frame canvas { image-rendering: pixelated; }
+
+.frame.active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The frame the player is currently showing — gold, so it can't be confused
+   with the blue "being edited" outline while the loop runs. */
+.frame.playing {
+  outline: 2px solid #ffc83c;
+  outline-offset: 1px;
+}
+
+.frame span {
+  position: absolute;
+  bottom: 1px;
+  right: 3px;
+  font-size: 10px;
+  color: var(--text);
+  text-shadow: 0 0 3px #000, 0 0 3px #000;
+  pointer-events: none;
+}
+
+#framebar .toggles {
+  gap: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* Transport controls (playback lives in the main canvas). */
+#framebar .fps {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
+#framebar .fps input { width: 46px; }
+
+#framebar .toggles label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+/* ---------- status bar ---------- */
+#statusbar {
+  display: flex;
+  gap: 24px;
+  padding: 5px 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--panel-edge);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+#st-coords { min-width: 70px; }
+#st-hint { margin-left: auto; }

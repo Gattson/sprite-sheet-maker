@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sprite Sheet Maker</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="topbar">
+  <h1>Sprite Sheet Maker</h1>
+  <div class="group" id="file-wrap">
+    <button id="btn-file" title="New, save, and load projects">File &#9662;</button>
+    <div id="file-menu" hidden>
+      <div class="menu-row" id="mode-row" title="Locked once the project is created. Pixel art: grid, palette, chunky pixels. Freeform: smooth painting (Phase 6, being built)">
+        <label><input type="radio" id="mode-pixel" name="new-mode" checked> Pixel art</label>
+        <label><input type="radio" id="mode-free" name="new-mode"> Freeform</label>
+      </div>
+      <select id="sel-preset" title="Common canvas sizes — picking one fills in W and H">
+        <option value="">Size preset&hellip;</option>
+        <optgroup label="Sprites &amp; tiles">
+          <option value="8x8">8 × 8 — tiny sprite / tile</option>
+          <option value="16x16">16 × 16 — classic sprite</option>
+          <option value="32x32">32 × 32 — standard sprite</option>
+          <option value="64x64">64 × 64 — large sprite</option>
+          <option value="128x128">128 × 128 — XL sprite / portrait</option>
+        </optgroup>
+        <optgroup label="Retro screens">
+          <option value="160x144">160 × 144 — Game Boy</option>
+          <option value="240x160">240 × 160 — Game Boy Advance</option>
+          <option value="256x224">256 × 224 — SNES</option>
+          <option value="256x240">256 × 240 — NES</option>
+          <option value="320x240">320 × 240 — QVGA / early PC</option>
+        </optgroup>
+        <optgroup label="Modern &amp; HD">
+          <option value="320x180">320 × 180 — 16:9 pixel-art scene</option>
+          <option value="640x360">640 × 360 — 16:9 scene, large</option>
+          <option value="1280x720">1280 × 720 — HD</option>
+          <option value="1920x1080">1920 × 1080 — Full HD</option>
+          <option value="3840x2160">3840 × 2160 — 4K</option>
+          <option value="7680x4320">7680 × 4320 — 8K (max)</option>
+        </optgroup>
+      </select>
+      <div class="menu-row">
+        <label>W <input id="inp-w" type="number" min="1" max="7680" value="32"></label>
+        <label>H <input id="inp-h" type="number" min="1" max="4320" value="32"></label>
+        <button id="btn-new">New</button>
+      </div>
+      <hr>
+      <button id="btn-save" class="menu-item" title="Save project as a JSON file (Ctrl+S)">Save project</button>
+      <button id="btn-load" class="menu-item" title="Load a saved project, or import a PNG/JPEG to work from — the image becomes a new project in the mode picked above">Load / import image&hellip;</button>
+      <hr>
+      <div class="menu-row">
+        <button id="btn-export" class="menu-item" title="All frames as one PNG sprite sheet">Export sheet (PNG)</button>
+        <label title="Sheet layout: columns per row (0 = all frames in one strip)">Cols <input id="inp-cols" type="number" min="0" max="99" value="0"></label>
+      </div>
+      <button id="btn-export-gif" class="menu-item" title="Animated GIF at the preview FPS — plays anywhere, but caps at 256 colors with hard transparency (smooth freeform art will band; APNG is the lossless option)">Export GIF</button>
+      <button id="btn-export-apng" class="menu-item" title="Animated PNG at the preview FPS — lossless, keeps transparency">Export APNG</button>
+      <button id="btn-export-video" class="menu-item" title="Record to MP4 or WebM (whichever this browser encodes); transparency becomes dark gray">Export video</button>
+      <button id="btn-export-zip" class="menu-item" title="Each frame as its own PNG, zipped — for video editors and game engines">Export frames (ZIP)</button>
+      <input id="inp-file" type="file" accept=".json,application/json,image/png,image/jpeg" hidden>
+    </div>
+  </div>
+  <div class="group">
+    <button id="btn-undo" title="Undo (Ctrl+Z)" disabled>&#8617; Undo</button>
+    <button id="btn-redo" title="Redo (Ctrl+Y)" disabled>&#8618; Redo</button>
+  </div>
+  <div class="group">
+    <button id="btn-zoom-out" title="Zoom out (-)">&minus;</button>
+    <span id="zoom-label">16&times;</span>
+    <button id="btn-zoom-in" title="Zoom in (+)">+</button>
+    <button id="btn-fit" title="Fit canvas to view (0)">Fit</button>
+  </div>
+</header>
+<main>
+  <aside id="toolbar">
+    <button class="tool active" data-tool="brush" title="Brush (B)"><span class="icon">&#9998;</span> Brush</button>
+    <button class="tool" data-tool="eraser" title="Eraser (E)"><span class="icon">&#9003;</span> Eraser</button>
+    <button class="tool" data-tool="smudge" title="Smudge (U) — drags the colors already on the layer; the Strength slider sets how far they carry"><span class="icon">&#9757;</span> Smudge</button>
+    <button class="tool" data-tool="fill" title="Fill bucket (G)"><span class="icon">&#9639;</span> Fill</button>
+    <button class="tool" data-tool="eyedropper" title="Eyedropper (I)"><span class="icon">&#128167;</span> Pick</button>
+    <button class="tool" data-tool="select" title="Select a rectangle (S) — drag inside it to move; Ctrl+C/X/V copy/cut/paste onto any frame or layer"><span class="icon">&#9633;</span> Select</button>
+    <button class="tool" data-tool="pan" title="Drag the canvas around (H — or hold Space with any tool)"><span class="icon">&#9995;</span> Pan</button>
+    <hr>
+    <div id="brush-box" title="Brush &amp; eraser size — [ and ] to adjust">
+      <button id="btn-brush-lib" title="Open the brush library — pick a texture brush or import your own tip image">Brush: Round &#9662;</button>
+      <div id="brush-row">
+        <span>Size <input id="size-num" class="num" type="number" min="1" max="256" value="1"></span>
+        <span id="brush-shapes">
+          <button id="shape-square" class="shape active" title="Square tip">&#9632;</button>
+          <button id="shape-circle" class="shape" title="Round tip">&#9679;</button>
+        </span>
+      </div>
+      <input id="inp-brush-size" type="range" min="1" max="64" value="1">
+      <div class="brush-sub free-only" id="opacity-box" title="Stroke opacity — one stroke never builds up past this">
+        <span>Opacity <input id="opacity-num" class="num" type="number" min="1" max="100" value="100">%</span>
+        <input id="inp-brush-opacity" type="range" min="1" max="100" value="100">
+      </div>
+      <div class="brush-sub free-only" id="strength-box" hidden title="Smudge strength — how far color drags along the stroke; low is a gentle blur, high pulls a long smear">
+        <span>Strength <input id="strength-num" class="num" type="number" min="1" max="100" value="50">%</span>
+        <input id="inp-smudge-strength" type="range" min="1" max="100" value="50">
+      </div>
+      <div class="brush-sub free-only" id="hardness-box" title="Tip edge: 100% = hard round, low = soft airbrush (round brush only)">
+        <span>Hardness <input id="hardness-num" class="num" type="number" min="0" max="100" value="80">%</span>
+        <input id="inp-brush-hardness" type="range" min="0" max="100" value="80">
+      </div>
+      <div class="brush-sub free-only" title="Fill tolerance — how far a color may differ from the clicked one and still be filled over (raise it to flow past soft edges)">
+        <span>Fill tolerance <input id="tolerance-num" class="num" type="number" min="0" max="100" value="12">%</span>
+        <input id="inp-fill-tol" type="range" min="0" max="100" value="12">
+      </div>
+    </div>
+    <hr>
+    <label id="color-well" title="Current color">
+      <input id="inp-color" type="color" value="#1a1c2c">
+    </label>
+    <div id="palette" title="Left-click: select · Right-click: remove swatch"></div>
+  </aside>
+  <div id="canvas-wrap">
+    <canvas id="view"></canvas>
+    <div id="select-bar" hidden>
+      <span id="sel-dims">
+        <label title="Selection width in art pixels — type a value to set it exactly (resizes about the center)">W <input id="inp-sel-w" class="num" type="number" min="1" step="0.1"></label>
+        <label title="Selection height in art pixels — type a value to set it exactly (resizes about the center)">H <input id="inp-sel-h" class="num" type="number" min="1" step="0.1"></label>
+        <label title="Rotation in degrees — updates live while the knob turns; type a value to set it exactly">&#8736; <input id="inp-sel-angle" class="num" type="number" step="1">&deg;</label>
+      </span>
+      <button id="btn-sel-rotl" title="Rotate 90&deg; counter-clockwise">&#8634;</button>
+      <button id="btn-sel-rotr" title="Rotate 90&deg; clockwise">&#8635;</button>
+      <button id="btn-sel-fliph" title="Flip horizontally">&#8596;</button>
+      <button id="btn-sel-flipv" title="Flip vertically">&#8597;</button>
+      <button id="btn-sel-copy" title="Copy (Ctrl+C)">Copy</button>
+      <button id="btn-sel-cut" title="Cut (Ctrl+X)">Cut</button>
+      <button id="btn-sel-del" title="Clear the selected pixels (Del)">Clear</button>
+      <button id="btn-sel-commit" title="Place the floating selection (Enter, or click outside it)">&#10003;</button>
+      <button id="btn-sel-cancel" title="Cancel / deselect (Esc or right-click)">&#10005;</button>
+    </div>
+    <div id="brush-panel" hidden>
+      <div id="brush-head">
+        <span>Brushes</span>
+        <button id="btn-brush-import" title="Import a PNG or JPEG as a brush tip — white/opaque paints, black/transparent doesn't">+</button>
+        <button id="btn-brush-close" title="Close the brush library">&#10005;</button>
+      </div>
+      <div id="brush-list"></div>
+      <input id="inp-brush-file" type="file" accept="image/png,image/jpeg" hidden>
+    </div>
+    <div id="preview-panel" hidden>
+      <div id="preview-head">
+        <span>Preview</span>
+        <button id="btn-preview-close" title="Close the preview panel">&#10005;</button>
+      </div>
+      <canvas id="preview"></canvas>
+    </div>
+    <div id="onion-panel" hidden>
+      <div class="onion-row" title="How many neighboring frames to ghost in each direction — farther frames fade progressively">
+        <span>Frames <input id="onion-frames-num" class="num" type="number" min="1" max="8" value="1"></span>
+        <input id="inp-onion-frames" type="range" min="1" max="8" value="1">
+      </div>
+      <div class="onion-row" title="How visible the nearest ghost is — farther frames fade down from here">
+        <span>Opacity <input id="onion-opacity-num" class="num" type="number" min="5" max="100" value="45">%</span>
+        <input id="inp-onion-opacity" type="range" min="5" max="100" value="45">
+      </div>
+      <div id="onion-colors">
+        <label title="Tint for frames BEFORE the current one">Prev <input id="inp-onion-prev-color" type="color" value="#ff5a5a"></label>
+        <label title="Tint for frames AFTER the current one">Next <input id="inp-onion-next-color" type="color" value="#5aaaff"></label>
+      </div>
+    </div>
+    <div id="layers-panel">
+      <div id="layers-head">
+        <span>Layers</span>
+        <button id="btn-layers-collapse" title="Collapse / expand the panel">&#9662;</button>
+        <button id="btn-layer-add" title="Add a layer above the current one">+</button>
+      </div>
+      <div id="layers"></div>
+      <div id="layer-adjust">
+        <label title="This layer's opacity — how strongly it shows over the layers below (all frames)">Opacity
+          <input id="inp-layer-opacity" type="range" min="0" max="100" value="100">
+          <input id="layer-opacity-num" class="num" type="number" min="0" max="100" value="100">%
+        </label>
+        <div id="layer-adjust-row">
+          <select id="sel-layer-blend" title="Blend mode — how this layer's colors mix with the layers below">
+            <option value="normal">Normal</option>
+            <option value="multiply">Multiply</option>
+            <option value="screen">Screen</option>
+            <option value="overlay">Overlay</option>
+          </select>
+          <button id="btn-layer-lock" title="Alpha lock — paint only lands where this layer already has pixels; transparency can't change">&#128274;</button>
+        </div>
+      </div>
+      <div class="layer-controls">
+        <button id="btn-layer-dup" title="Duplicate the current layer">&#10697;</button>
+        <button id="btn-layer-del" title="Delete the current layer from every frame">&#128465;</button>
+        <button id="btn-layer-up" title="Move the current layer up">&#9650;</button>
+        <button id="btn-layer-down" title="Move the current layer down">&#9660;</button>
+      </div>
+    </div>
+  </div>
+</main>
+<div id="framebar">
+  <div class="group">
+    <button id="btn-play" title="Play / pause the animation in the canvas (P)">&#9654; Play</button>
+    <label class="fps" title="Playback speed, frames per second">FPS <input id="inp-fps" type="number" min="1" max="60" value="8"></label>
+  </div>
+  <div class="group">
+    <button id="btn-frame-add" title="Add blank frame after current (N)">+ Frame</button>
+    <button id="btn-frame-dup" title="Duplicate current frame (D)">&#10697; Dup</button>
+    <button id="btn-frame-del" title="Delete current frame (Del)">&#128465;</button>
+    <button id="btn-frame-left" title="Move frame left">&#9664;</button>
+    <button id="btn-frame-right" title="Move frame right">&#9654;</button>
+  </div>
+  <div id="frames"></div>
+  <div class="group toggles">
+    <label title="Ghost of the previous frame under the canvas (O)"><input type="checkbox" id="chk-onion-prev" checked> Ghost prev</label>
+    <label title="Ghost of the next frame too"><input type="checkbox" id="chk-onion-next"> Ghost next</label>
+    <button id="btn-onion-cfg" title="Onion skin settings — how many frames to ghost, their opacity, and the prev/next tint colors">Onion&hellip;</button>
+    <label title="Crosshair guides through the canvas center (X)"><input type="checkbox" id="chk-origin" checked> Origin</label>
+    <label title="Small always-playing preview in a floating panel — the main canvas plays too (P)"><input type="checkbox" id="chk-preview"> Preview</label>
+  </div>
+</div>
+<footer id="statusbar">
+  <span id="st-coords">&mdash;</span>
+  <span id="st-frame">frame 1/1</span>
+  <span id="st-tool">brush</span>
+  <span id="st-hint">Wheel: zoom &middot; Space: pan &middot; Right-drag: erase &middot; [ ]: brush size &middot; Alt+click: pick &middot; S: select &middot; Ctrl+C/X/V: copy/cut/paste &middot; , / . : frames</span>
+</footer>
+<script src="export.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
