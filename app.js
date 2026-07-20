@@ -48,6 +48,11 @@ const MAX_BRUSH = 64;      // brush/eraser tip side length, in art pixels
 const MAX_BRUSH_FREE = 256; // freeform tips can be much larger (HD canvases)
 const MIN_ZOOM = 1 / 32;   // screen pixels per art pixel (fractional = zoomed out)
 const MAX_ZOOM = 80;
+// Freeform display: below this zoom the view smooths (right for painted art);
+// at or past it you're inspecting individual pixels, so show them honestly
+// with nearest-neighbor — bilinear at high zoom made even crisp pixels look
+// fuzzy. Matches the zoom where pixel mode starts drawing its per-pixel grid.
+const PIXEL_ZOOM = 8;
 const MAX_W = 7680;        // canvas caps: up to 8K UHD (7680×4320)
 const MAX_H = 4320;
 
@@ -89,6 +94,15 @@ const state = {
   onionPrevColor: '#ff5a5a',         // tint for frames behind (red — the animation convention)
   onionNextColor: '#5aaaff',         // tint for frames ahead (blue)
   showOrigin: true,                  // crosshair guides through the canvas center
+  // Workspace panels (Toggles menu). UI preferences, never saved in projects —
+  // hiding chrome is about the current working session, not the artwork.
+  showTools: true,                   // the left tool/brush/color panel
+  showLayers: true,                  // the floating layers panel
+  showAnim: true,                    // the frame strip along the bottom
+  // Rulers (to-do #11): per-side visibility + per-side unit ('px'|'in'|'cm').
+  // UI preferences like the panel toggles above — never saved in projects.
+  rulers: { top: false, bottom: false, left: false, right: false },
+  rulerUnit: { top: 'px', bottom: 'px', left: 'px', right: 'px' },
 };
 
 /* ======================================================================
@@ -111,11 +125,26 @@ const ctx = view.getContext('2d');
  * identity, so a plane lives for as long as its frame and layer both exist —
  * never clone one by spreading.
  */
-function makePlane(src) {
+function makePlane(src, vector) {
   const canvas = document.createElement('canvas');
   canvas.width = state.width;
   canvas.height = state.height;
   const c = canvas.getContext('2d');
+  if (state.mode === 'free' && vector) {
+    // Vector plane (Phase 8a): the STROKE LIST is the truth and the canvas
+    // is only a rasterized mirror — the same truth+mirror shape pixel mode
+    // uses, which is why everything reading canvases (composites, onion,
+    // exports) works on vector layers unchanged. `src` is a strokes array
+    // (from a loaded file or the plane being duplicated) — always cloned,
+    // so two planes can never share stroke objects.
+    const p = { pixels: null, ctx: c, canvas, strokes: [], touched: false };
+    if (Array.isArray(src) && src.length) {
+      p.strokes = src.map(cloneStroke);
+      renderVectorPlane(p);
+      p.touched = true;
+    }
+    return p;
+  }
   if (state.mode === 'free') {
     if (src) c.drawImage(src, 0, 0);
     return { pixels: null, ctx: c, canvas, touched: !!src };
@@ -138,9 +167,9 @@ function makeFrame(layerPixels) {
   canvas.width = state.width;
   canvas.height = state.height;
   const f = {
-    layers: state.layers.map((_, li) => {
+    layers: state.layers.map((m, li) => {
       const src = layerPixels ? layerPixels[li] : null;
-      const p = makePlane(src);
+      const p = makePlane(src, m.kind === 'vector');
       if (src && state.mode === 'pixel') repaintLayer(p); // free: makePlane drew it
       return p;
     }),
@@ -161,7 +190,8 @@ const curLayer = () => cur().layers[state.layer];
  *  scan, so they track a `touched` flag instead (set by strokes and loads —
  *  it can over-report after an undo, which only costs a needless confirm). */
 const planeHasArt = (l) =>
-  state.mode === 'free' ? !!l.touched : l.pixels.some((p) => p !== null);
+  l.strokes ? l.strokes.length > 0
+    : state.mode === 'free' ? !!l.touched : l.pixels.some((p) => p !== null);
 /** Does any layer of any frame contain any art? (guards destructive actions) */
 const anyArt = () => state.frames.some((f) => f.layers.some(planeHasArt));
 
@@ -179,6 +209,19 @@ let lastArt = null;          // previous art position during a stroke (for lines
 let panning = false;
 let panAnchor = null;        // {sx, sy, panX, panY} captured when panning starts
 let spaceDown = false;       // spacebar held = temporary pan mode
+let enterDown = false;       // Enter held = the same temporary pan (owner request:
+                             // a pan key under the right hand; Enter still commits
+                             // a floating selection first — see the keydown handler)
+
+// --- Touch gestures (tablets / touch screens) ---
+// Every touch pointer currently on the canvas, by pointerId. A single finger
+// draws exactly like a mouse; the moment a SECOND finger lands, whatever the
+// first one started is revoked (a half-second of accidental stroke must not
+// survive — Procreate muscle memory) and both fingers navigate: pinch zoom
+// anchored between the fingertips, plus two-finger pan. Pens ('pen') and
+// mice never enter this map, so palm-off stylus work is untouched.
+const touchPts = new Map();  // pointerId -> {x, y} screen position
+let gesture = null;          // {cx, cy, d} previous centroid + finger spread
 let fitted = false;          // has the initial fit-to-view happened yet?
 
 // --- Selection (Select tool) ---
@@ -194,10 +237,14 @@ let fitted = false;          // has the initial fit-to-view happened yet?
 // buffer onto the active layer through the normal undo path.
 let selection = null;        // {x, y, w, h} marquee in art coords
 let floating = null;         // {pixels, w, h, x, y, canvas, liftEntry, angle, sw, sh}
-let selDrag = null;          // {x0, y0} marquee anchor while dragging one out
+let selDrag = null;          // {x0, y0, vec?} marquee anchor while dragging one out
+let vecPointDrag = null;     // 8b: dragging one control point of a vector stroke
+let vecErase = null;         // 8c: whole-stroke eraser gesture on a vector layer
 let floatDrag = null;        // {dx, dy} grab offset while moving the buffer
 let xformDrag = null;        // freeform handle drag — see the select pointerdown path
 let hoverHandle = null;      // freeform handle under the cursor (hover highlight)
+let hoverDot = null;         // control-dot index under the cursor (vector stroke)
+let proofing = false;        // print soft-proof view (Toggles menu, print projects)
 let clipboard = null;        // {pixels, w, h} — survives frame/layer switches
 
 // --- Freeform stroke (free mode's brush/eraser) ---
@@ -237,7 +284,7 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
  * pixels, layer metadata, palette and FPS. `frames` is nested
  * [frame][layer] -> pixel array. Both "New" and "Load" funnel through here.
  */
-function newProject(w, h, frames, layersMeta, palette, fpsVal, mode) {
+function newProject(w, h, frames, layersMeta, palette, fpsVal, mode, extra) {
   setPlaying(false);
   // Selection state belongs to the old project; drop it (clipboard survives,
   // so copy-paste across projects works).
@@ -246,8 +293,25 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode) {
   selDrag = null;
   floatDrag = null;
   xformDrag = null;
+  vecPointDrag = null;
+  vecErase = null;
   syncSelectBar();
   state.mode = mode === 'free' ? 'free' : 'pixel';
+  // Print intent (owner request): projects made "for print" carry their
+  // physical unit + DPI. Purely additive metadata — it drives the CMYK
+  // readout, the soft-proof view, and DPI-tagged PNG exports; the canvas
+  // itself is pixels either way. Digital projects stay px/300 defaults.
+  state.intent = extra && extra.intent === 'print' ? 'print' : 'digital';
+  state.unit = extra && ['in', 'cm'].includes(extra.unit) ? extra.unit : 'px';
+  state.dpi = clamp(parseInt(extra && extra.dpi, 10) || 300, 36, 1200);
+  document.body.classList.toggle('intent-print', state.intent === 'print');
+  proofing = false;
+  $('chk-proof').checked = false;
+  // Every ruler resets to the project's native unit (print: its in/cm;
+  // digital: px) — the corner buttons re-cycle from there.
+  const ru = state.intent === 'print' ? state.unit : 'px';
+  state.rulerUnit = { top: ru, bottom: ru, left: ru, right: ru };
+  syncRulerUI();
   state.width = w;
   state.height = h;
   // Appearance fields are optional-with-defaults so pre-6d v3 files (and the
@@ -259,6 +323,9 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode) {
       opacity: typeof m.opacity === 'number' ? clamp(m.opacity, 0, 1) : 1,
       blend: BLEND_MODES.includes(m.blend) ? m.blend : 'normal',
       alphaLock: m.alphaLock === true,
+      // Phase 8a: raster or vector, fixed for the layer's life. Vector only
+      // exists in freeform projects — anything else normalizes to raster.
+      kind: state.mode === 'free' && m.kind === 'vector' ? 'vector' : 'raster',
     }));
   state.layer = state.layers.length - 1; // start on the top layer
   state.frames = (frames || [null]).map((fp) => makeFrame(fp));
@@ -268,20 +335,23 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode) {
   renderLayers();
   if (palette) {
     state.palette = palette;
+    syncPaletteDivergence(); // the loaded strip may not match the active library row
     renderPalette();
   }
   if (fpsVal) $('inp-fps').value = clamp(fpsVal, 1, 60);
   $('inp-w').value = w;
   $('inp-h').value = h;
+  // Mode radios mirror the (possibly loaded) project; preview upscaling is
+  // crisp nearest-neighbor for pixel art, smooth interpolation for freeform.
+  $('mode-pixel').checked = state.mode === 'pixel';
+  $('mode-free').checked = state.mode === 'free' && state.intent !== 'print';
+  $('mode-print').checked = state.mode === 'free' && state.intent === 'print';
+  syncFilePresets(); // the preset dropdown follows the checked mode
   // Keep the preset select honest: show the matching preset if there is one,
   // otherwise fall back to the placeholder.
   const preset = $('sel-preset');
   preset.value = `${w}x${h}`;
   if (preset.selectedIndex === -1) preset.value = '';
-  // Mode radios mirror the (possibly loaded) project; preview upscaling is
-  // crisp nearest-neighbor for pixel art, smooth interpolation for freeform.
-  $('mode-pixel').checked = state.mode === 'pixel';
-  $('mode-free').checked = state.mode === 'free';
   preview.classList.toggle('smooth', state.mode === 'free');
   // Mode-specific chrome: opacity/hardness sliders only exist for freeform,
   // square/circle tips only for pixel (freeform tips are always round).
@@ -293,6 +363,7 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode) {
   }
   $('inp-brush-size').max = maxBrush();
   setBrushSize(state.brushSize); // re-clamp to the mode's tip ceiling
+  $('start-screen').hidden = true; // any project creation dismisses the chooser
   preview.width = w;  // preview backing store is art-sized; CSS upscales it
   preview.height = h;
   renderFrames();
@@ -468,6 +539,7 @@ function repaintLayer(layer) {
  *  at its own opacity and blend mode (both are native canvas compositing —
  *  the browser blends against everything stacked below, alpha included). */
 function recomposite(f) {
+  compositeGen++; // the soft-proof cache keys on this
   f.ctx.clearRect(0, 0, state.width, state.height);
   state.layers.forEach((m, li) => {
     if (!m.visible) return;
@@ -481,6 +553,36 @@ function recomposite(f) {
 }
 
 /** Recomposite every frame + refresh thumbnails (after layer-wide changes). */
+// Soft-proof cache: the shown frame's composite pushed through proofRgb(),
+// rebuilt only when the composite actually changed (compositeGen) or the
+// shown frame switched — a full-frame ImageData pass is too heavy per render.
+let compositeGen = 0;
+let proofCv = null;
+let proofKey = '';
+function proofedComposite(f, idx) {
+  const key = `${compositeGen}:${idx}`;
+  if (proofKey !== key || !proofCv ||
+      proofCv.width !== state.width || proofCv.height !== state.height) {
+    if (!proofCv || proofCv.width !== state.width || proofCv.height !== state.height) {
+      proofCv = document.createElement('canvas');
+      proofCv.width = state.width;
+      proofCv.height = state.height;
+    }
+    const img = f.ctx.getImageData(0, 0, state.width, state.height);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      if (!d[i + 3]) continue;
+      const sim = proofRgb(d[i], d[i + 1], d[i + 2]);
+      d[i] = sim[0];
+      d[i + 1] = sim[1];
+      d[i + 2] = sim[2];
+    }
+    proofCv.getContext('2d').putImageData(img, 0, 0);
+    proofKey = key;
+  }
+  return proofCv;
+}
+
 function recompositeAll() {
   for (const f of state.frames) {
     recomposite(f);
@@ -539,9 +641,17 @@ function render() {
   //    (they obey the same Ghost prev/next toggles — flip them off for a
   //    clean view). The edited frame is untouched, so pausing with the
   //    button puts you right back where you were working.
-  //    Pixel mode scales nearest-neighbor (crisp pixels); freeform smooths.
+  //    Pixel mode scales nearest-neighbor (crisp pixels); freeform smooths —
+  //    but only up to PIXEL_ZOOM, past which the pixels themselves are the
+  //    subject and bilinear would misreport them as fuzz.
   const shownIdx = playing ? playFrame : state.frame;
-  ctx.imageSmoothingEnabled = state.mode === 'free';
+  // Soft proof (print projects): show the frame through the process-ink
+  // simulation. Skipped mid-gesture — re-proofing 3M px per pointermove
+  // would chug; the view snaps back to proofed ink on release.
+  const proofed = proofing && state.intent === 'print' && !stroke && !drawing
+    ? proofedComposite(state.frames[shownIdx], shownIdx)
+    : null;
+  ctx.imageSmoothingEnabled = state.mode === 'free' && zoom < PIXEL_ZOOM;
   for (let d = state.onionFrames; d >= 1; d--) {
     const alpha = state.onionOpacity * Math.pow(ONION_FALLOFF, d - 1);
     if (state.onionPrev && shownIdx - d >= 0) {
@@ -551,7 +661,7 @@ function render() {
       drawGhost(state.frames[shownIdx + d], state.onionNextColor, alpha);
     }
   }
-  ctx.drawImage(state.frames[shownIdx].canvas, panX, panY, cw, ch);
+  ctx.drawImage(proofed || state.frames[shownIdx].canvas, panX, panY, cw, ch);
 
   // 3. Grid lines — pixel mode only. Minor lines per pixel (only useful when
   //    zoomed in); stronger lines every 8 pixels as a sprite-work reference.
@@ -587,9 +697,34 @@ function render() {
   //     a transform box: content and outline rotate about the box center,
   //     and the Select tool grows resize handles + a rotate knob.
   if (floating && !playing) {
-    ctx.imageSmoothingEnabled = state.mode === 'free';
+    ctx.imageSmoothingEnabled = state.mode === 'free' && zoom < PIXEL_ZOOM;
     const f = floating;
-    if (f.angle) {
+    if (f.vecStrokes) {
+      // Live vector preview: re-rasterize the strokes through the CURRENT
+      // box transform (the same math commit runs), so what a drag shows IS
+      // the commit result — no scaled-bitmap mush. Cached per box state;
+      // only pointer moves that change the box pay the re-rasterize.
+      const key = `${f.x},${f.y},${f.w},${f.h},${f.angle},${f.flipX},${f.flipY}`;
+      if (f.previewKey !== key) {
+        const t = vecBoxXform(f);
+        const ts = f.vecStrokes.map((s) => xformStroke(s, t));
+        let b = null;
+        for (const s of ts) {
+          const sb = strokeBounds(s);
+          b = growRect(b, sb.x0, sb.y0, sb.x1, sb.y1);
+        }
+        f.preview = b
+          ? { canvas: strokesProxy(ts, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0),
+              x: b.x0, y: b.y0 }
+          : null;
+        f.previewKey = key;
+      }
+      if (f.preview) {
+        ctx.drawImage(f.preview.canvas,
+          panX + f.preview.x * zoom, panY + f.preview.y * zoom,
+          f.preview.canvas.width * zoom, f.preview.canvas.height * zoom);
+      }
+    } else if (f.angle) {
       ctx.save();
       ctx.translate(panX + (f.x + f.w / 2) * zoom, panY + (f.y + f.h / 2) * zoom);
       ctx.rotate(f.angle);
@@ -662,6 +797,26 @@ function render() {
           ctx.strokeRect(hx - HS + 0.5, hy - HS + 0.5, HS * 2 - 1, HS * 2 - 1);
         }
       }
+      // Control dots (8b): exactly one selected vector stroke, not lifted —
+      // its (screen-thinned) points are grabbable, so show them. The dot
+      // under the cursor — or the one being dragged, which stays lit for
+      // the whole gesture — draws bigger in the UI accent, like the
+      // transform handles do.
+      if (sel.strokes && sel.strokes.length === 1 && !floating) {
+        const s = sel.strokes[0];
+        const hotIdx = vecPointDrag ? vecPointDrag.index : hoverDot;
+        ctx.lineWidth = 1;
+        for (const i of vecDotIndices(s, zoom)) {
+          const hot = i === hotIdx;
+          ctx.fillStyle = hot ? '#41a6f6' : '#ffffff';
+          ctx.strokeStyle = hot ? '#ffffff' : 'rgba(0, 0, 0, 0.8)';
+          ctx.beginPath();
+          ctx.arc(panX + s.pts[i][0] * zoom, panY + s.pts[i][1] * zoom,
+                  hot ? 5.5 : 3.5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
     }
   }
 
@@ -703,9 +858,101 @@ function render() {
     ctx.stroke();
   }
 
+  // 7. Rulers (to-do #11) — topmost chrome, hidden during playback like
+  //    the rest of the scaffolding.
+  if (!playing) drawRulers(zoom, panX, panY);
+
   // render() runs after every change, so this keeps the (stopped) preview
   // mirroring the edited frame live, including mid-stroke.
   updatePreview();
+}
+
+/* ---- Rulers: per-side strips drawn into the view, tracking pan/zoom.
+ * Each side has its own unit (px / in / cm — the corner buttons cycle it);
+ * physical units read through the project DPI, so a print project's ruler
+ * really measures the sheet. ---- */
+
+const RULER_W = 22;              // strip thickness, screen px
+const RULER_STEPS_PX = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+const RULER_STEPS_PHYS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100];
+
+/** Nice label step (in ruler units) so majors sit ≥ ~50 screen px apart.
+ *  PURE — unit-tested headlessly. */
+function rulerStep(screenPerUnit, isPx) {
+  const steps = isPx ? RULER_STEPS_PX : RULER_STEPS_PHYS;
+  for (const s of steps) {
+    if (s * screenPerUnit >= 50) return s;
+  }
+  return steps[steps.length - 1];
+}
+
+function drawRulers(zoom, panX, panY) {
+  ctx.font = '9px system-ui, sans-serif';
+  ctx.lineWidth = 1;
+  for (const side of ['top', 'bottom', 'left', 'right']) {
+    if (!state.rulers[side]) continue;
+    const unit = state.rulerUnit[side];
+    const pxPerUnit = unit === 'px' ? 1 : unit === 'in' ? state.dpi : state.dpi / 2.54;
+    const spu = pxPerUnit * zoom;                  // screen px per ruler unit
+    const step = rulerStep(spu, unit === 'px');
+    const horiz = side === 'top' || side === 'bottom';
+    const len = horiz ? viewW : viewH;
+    const pan = horiz ? panX : panY;
+
+    // Strip + its inner boundary line.
+    ctx.fillStyle = 'rgba(26, 26, 34, 0.92)';
+    if (side === 'top') ctx.fillRect(0, 0, viewW, RULER_W);
+    else if (side === 'bottom') ctx.fillRect(0, viewH - RULER_W, viewW, RULER_W);
+    else if (side === 'left') ctx.fillRect(0, 0, RULER_W, viewH);
+    else ctx.fillRect(viewW - RULER_W, 0, RULER_W, viewH);
+    const inner = side === 'top' ? RULER_W - 0.5
+      : side === 'bottom' ? viewH - RULER_W + 0.5
+      : side === 'left' ? RULER_W - 0.5 : viewW - RULER_W + 0.5;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+    ctx.beginPath();
+    if (horiz) { ctx.moveTo(0, inner); ctx.lineTo(viewW, inner); }
+    else { ctx.moveTo(inner, 0); ctx.lineTo(inner, viewH); }
+    ctx.stroke();
+
+    // Ticks: majors labeled, four minors between them when there's room.
+    const minor = (step / 5) * spu;
+    const showMinor = minor >= 7;
+    const u0 = Math.floor((-pan / zoom / pxPerUnit) / step) * step;
+    ctx.strokeStyle = 'rgba(216, 216, 224, 0.6)';
+    ctx.fillStyle = 'rgba(216, 216, 224, 0.75)';
+    ctx.beginPath();
+    const tick = (s, big) => {
+      const S = Math.round(s) + 0.5;
+      const T = big ? 7 : 4;
+      if (side === 'top') { ctx.moveTo(S, RULER_W - T); ctx.lineTo(S, RULER_W); }
+      else if (side === 'bottom') { ctx.moveTo(S, viewH - RULER_W); ctx.lineTo(S, viewH - RULER_W + T); }
+      else if (side === 'left') { ctx.moveTo(RULER_W - T, S); ctx.lineTo(RULER_W, S); }
+      else { ctx.moveTo(viewW - RULER_W, S); ctx.lineTo(viewW - RULER_W + T, S); }
+    };
+    const labels = [];
+    for (let u = u0; pan + u * spu <= len + step * spu; u += step) {
+      const s = pan + u * spu;
+      tick(s, true);
+      // toFixed kills float noise (0.30000000000000004 → "0.3").
+      labels.push([s, unit === 'px' ? String(u) : String(parseFloat(u.toFixed(2)))]);
+      if (showMinor) {
+        for (let k = 1; k < 5; k++) tick(s + k * minor, false);
+      }
+    }
+    ctx.stroke();
+    for (const [s, text] of labels) {
+      if (horiz) {
+        ctx.fillText(text, Math.round(s) + 3, side === 'top' ? 9 : viewH - RULER_W + 17);
+      } else {
+        // Vertical rulers: numbers run bottom-to-top alongside the tick.
+        ctx.save();
+        ctx.translate(side === 'left' ? 10 : viewW - RULER_W + 17, Math.round(s) - 3);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText(text, 0, 0);
+        ctx.restore();
+      }
+    }
+  }
 }
 
 /**
@@ -787,6 +1034,31 @@ function setZoom(newZoom, anchorX, anchorY) {
   render();
 }
 
+/**
+ * One frame of a two-finger gesture: given the previous and current finger
+ * pair (centroid cx/cy + spread d, screen px) and the current view transform,
+ * return the transform that keeps the art glued to the fingers — the art
+ * point under the centroid tracks it (that's the pan), and zoom scales by
+ * the spread ratio, clamped to the same limits as every other zoom path.
+ * Applied incrementally per pointermove, so clamping can't accumulate drift.
+ * Pure, so the headless suite can verify the math (see __ssmTest).
+ */
+function pinchView(prev, now, zoom, panX, panY) {
+  // Guard d=0: two stacked fingers must not divide the zoom away.
+  const k = clamp(zoom * (prev.d > 0 ? now.d / prev.d : 1), MIN_ZOOM, MAX_ZOOM) / zoom;
+  return {
+    zoom: zoom * k,
+    panX: now.cx - (prev.cx - panX) * k,
+    panY: now.cy - (prev.cy - panY) * k,
+  };
+}
+
+/** The live two-finger anchor: first two touches, in landing order. */
+function gestureAnchor() {
+  const [a, b] = touchPts.values();
+  return { cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, d: Math.hypot(b.x - a.x, b.y - a.y) };
+}
+
 /** Center the artwork in the viewport at the largest comfortable zoom.
  *  Whole zooms look crispest, so round down to one when there's room; big
  *  canvases need fractional zoom just to fit on screen at all. */
@@ -812,9 +1084,18 @@ function fitView() {
 //     just the stroke's bounding box (full-canvas snapshots of an HD RGBA
 //     canvas would blow the budget in a couple of strokes).
 
-/** Roughly how many stored pixels an entry costs (patches keep two copies). */
+/** Roughly how many stored pixels an entry costs (patches keep two copies).
+ *  Vector entries carry stroke OBJECTS, not pixels — points are priced at a
+ *  few pixels each so even thousand-point strokes stay near-free. */
+const vecCost = (v) =>
+  v.stroke ? v.stroke.pts.length                       // 'add' (8a painting)
+    : v.edits ? v.edits.reduce((n, ed) => n + ed.before.pts.length + ed.after.pts.length, 0)
+    : v.items ? v.items.reduce((n, it) => n + it.stroke.pts.length, 0) // 'remove'
+    : (v.before.length + v.after.length) * 8; // 'list': REF snapshots, near-free
 const entryCost = (e) =>
-  e.pixels ? e.pixels.length : e.rect.w * e.rect.h * 2;
+  e.pixels ? e.pixels.length
+    : e.vec ? vecCost(e.vec) * 4 + 32
+    : e.rect.w * e.rect.h * 2;
 
 /** Drop oldest entries once a stack owes more pixels than the budget. */
 function trimHistory(stack) {
@@ -864,6 +1145,50 @@ function applyHistory(from, to) {
       to.push({ frame: entry.frame, plane: entry.plane, pixels: entry.plane.pixels });
       entry.plane.pixels = entry.pixels;
       repaintLayer(entry.plane);
+    } else if (entry.vec) {
+      // Rasterized-away layers have no stroke list anymore — their vector
+      // history is dead, skipped like entries for deleted frames/layers.
+      if (!entry.plane.strokes) continue;
+      // Vector entry: mutate the stroke LIST — the truth — then re-rasterize
+      // the mirror from it. Three ops: 'add' (painting) removes on undo and
+      // re-adds on redo; 'remove' (delete/discard) is its inverse, restoring
+      // strokes at their recorded z-indices; 'edit' (transform / point drag)
+      // pours before/after snapshots into the SAME stroke objects. Object
+      // identity finds strokes, same convention as frames and planes.
+      const v = entry.vec;
+      const list = entry.plane.strokes;
+      const undoing = from === state.undo;
+      if (v.op === 'add') {
+        if (undoing) {
+          const i = list.indexOf(v.stroke);
+          if (i !== -1) list.splice(i, 1);
+        } else {
+          list.push(v.stroke);
+        }
+      } else if (v.op === 'remove') {
+        if (undoing) {
+          for (const it of v.items) list.splice(Math.min(it.i, list.length), 0, it.stroke);
+        } else {
+          for (let k = v.items.length - 1; k >= 0; k--) {
+            const i = list.indexOf(v.items[k].stroke);
+            if (i !== -1) list.splice(i, 1);
+          }
+        }
+      } else if (v.op === 'edit') {
+        for (const ed of v.edits) applyVecSnap(ed.stroke, undoing ? ed.before : ed.after);
+      } else if (v.op === 'list') {
+        // Splitting-eraser gesture: swap the whole list (ref snapshots —
+        // the stroke objects themselves were never mutated).
+        entry.plane.strokes = (undoing ? v.before : v.after).slice();
+      }
+      renderVectorPlane(entry.plane);
+      // Any live vector selection may now box strokes that moved or no
+      // longer exist — drop it rather than show a stale box.
+      if (selection && selection.strokes) {
+        selection = null;
+        syncSelectBar();
+      }
+      to.push(entry);
     } else {
       // Freeform entry: stamp the appropriate patch back onto the plane. The
       // entry carries both sides, so it just moves between the stacks whole.
@@ -980,7 +1305,7 @@ function eyedrop(x, y) {
   } else {
     c = pixelAt(cur(), x, y);
   }
-  if (c) selectColor(c);
+  if (c) selectColor(c, true); // a picked color must not recolor a selection
 }
 
 /**
@@ -1074,6 +1399,13 @@ function freeFill(x, y, color) {
 // into undo history.
 
 const STAMP_SPACING = 0.15; // gap between stamps, as a fraction of tip diameter
+// Round brushes at or below this size stamp CRISP: a rasterized disc at 1–2px
+// is nothing but anti-aliased edge (no solid interior exists), which is why
+// thin freeform lines read as fuzz. Small round tips therefore snap to the
+// pixel grid and land as hard aliased squares — automatic, no separate
+// "pixel brush" (owner decision 2026-07-18). Texture brushes are exempt
+// (their masks are already meaningless this small) and so is smudge.
+const CRISP_MAX = 2;
 // Smudge stamps much tighter: at paint spacing each deposit's soft rim reads
 // as a ring and the trail looks like a stack of coins. The per-stamp rates
 // are renormalized in beginStroke so the overall strength stays the same.
@@ -1192,7 +1524,20 @@ const PRESET_BRUSHES = [
 ];
 let brushes = PRESET_BRUSHES.slice();
 
-const curBrush = () => brushes.find((b) => b.id === state.brush) || brushes[0];
+// Vector pens (Phase 8a) — the Vector tab of the brush library. Selecting one
+// switches the paint ENGINE: strokes are recorded as editable objects on a
+// vector layer instead of pixels (see the vector-stroke section). Pen tapers
+// its width with pressure; Marker draws a uniform ribbon. Fixed set for now —
+// vector pens have no masks to import.
+const VECTOR_BRUSHES = [
+  { id: 'vec-pen',    name: 'Pen',    kind: 'vector', pen: 'pen' },
+  { id: 'vec-marker', name: 'Marker', kind: 'vector', pen: 'marker' },
+];
+
+const curBrush = () =>
+  brushes.find((b) => b.id === state.brush) ||
+  VECTOR_BRUSHES.find((b) => b.id === state.brush) ||
+  brushes[0];
 
 /** A brush's white-on-transparent mask canvas (presets generate lazily;
  *  imported brushes arrive with `mask` already set). */
@@ -1220,7 +1565,10 @@ function brushMask(b) {
 function buildTip(b, color, d, hardness) {
   const c = document.createElement('canvas');
   const g = c.getContext('2d');
-  if (b.kind === 'round') {
+  // Vector pens have no mask — anything that needs a bitmap tip while one
+  // is selected (the eraser on a raster layer, smudge's grab mask) gets a
+  // hard round disc, the pen's raster-world equivalent.
+  if (b.kind === 'round' || b.kind === 'vector') {
     c.width = c.height = d;
     const r = d / 2;
     const [cr, cg, cb] = hexToRGB(color);
@@ -1252,6 +1600,371 @@ function freeTip(color) {
     tipCache = { key, canvas: buildTip(b, color, d, state.brushHardness) };
   }
   return tipCache.canvas;
+}
+
+/** Integer landing corner for a crisp small stamp of side `di`: odd sizes
+ *  center on the pixel containing the point (a 1px tip paints the pixel the
+ *  cursor is IN), even sizes on the nearest pixel corner (a 2px tip hugs the
+ *  crossing closest to the cursor). PURE — unit-tested headlessly. */
+function crispXY(x, y, di) {
+  return di % 2
+    ? { x: Math.floor(x) - (di - 1) / 2, y: Math.floor(y) - (di - 1) / 2 }
+    : { x: Math.round(x) - di / 2, y: Math.round(y) - di / 2 };
+}
+
+/* ---- Vector strokes (Phase 8a): editable stroke objects on vector layers.
+ * A stroke is { color, w, opacity, pen, pts: [[x, y, pressure], ...] } — the
+ * pts are the streamlined pointer path in art coords. Rendering draws each
+ * segment as a CAPSULE (a circle at both ends plus the connecting quad) so
+ * joints are seamless at any angle; Pen tapers the radius with pressure,
+ * Marker keeps it constant. Strokes render at FULL alpha into a shared
+ * scratch canvas first and composite onto the plane at the stroke's opacity —
+ * overlapping capsules at alpha 1 can't darken, so a stroke never builds
+ * past its own opacity (the same trick as the bitmap stroke buffer). ---- */
+
+/** Per-point radius: Pen follows pressure, Marker is a uniform ribbon. */
+const vecRadius = (s, pressure) =>
+  (s.w / 2) * (s.pen === 'pen' ? Math.max(pressure, 0.05) : 1);
+
+/** Deep-copy a stroke so planes never share point arrays (dup frame/layer). */
+const cloneStroke = (s) => ({
+  color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
+  pts: s.pts.map((p) => p.slice()),
+});
+
+/** A stroke's dirty rect {x0,y0,x1,y1} in float art px (feed to clampRect):
+ *  point bounds padded by the largest radius + 1px of anti-aliasing. PURE. */
+function strokeBounds(s) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, r = 0;
+  for (const p of s.pts) {
+    x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]);
+    y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]);
+    r = Math.max(r, vecRadius(s, p[2]));
+  }
+  return { x0: x0 - r - 1, y0: y0 - r - 1, x1: x1 + r + 1, y1: y1 + r + 1 };
+}
+
+/** Draw a whole stroke into ctx `g` at full alpha as ONE path filled ONCE:
+ *  a circle at every point plus the connecting trapezoids, all wound
+ *  CLOCKWISE (screen coords) so the nonzero fill rule unions them — same-
+ *  direction overlaps can never cancel into holes. One fill means one
+ *  anti-aliased boundary: edge pixels get the union shape's true coverage
+ *  instead of accumulating every segment's rim, so a dense freshly-drawn
+ *  stroke and a scaled-up sparse one wear IDENTICAL clean edges. */
+function drawVecStroke(g, s) {
+  g.fillStyle = s.color;
+  g.beginPath();
+  const pts = s.pts;
+  for (let i = 0; i < pts.length; i++) {
+    const [x, y, p] = pts[i];
+    const r = vecRadius(s, p);
+    g.moveTo(x + r, y); // each subpath starts fresh — no connecting lines
+    g.arc(x, y, r, 0, Math.PI * 2); // anticlockwise=false = clockwise on screen
+    if (i) {
+      const [x0, y0, p0] = pts[i - 1];
+      const r0 = vecRadius(s, p0);
+      const dx = x - x0, dy = y - y0;
+      const len = Math.hypot(dx, dy);
+      if (len > 1e-6) {
+        const nx = -dy / len, ny = dx / len; // left normal to the segment
+        // p0−n·r0 → p1−n·r1 → p1+n·r1 → p0+n·r0 walks clockwise (y-down
+        // screen coords), matching arc()'s orientation above.
+        g.moveTo(x0 - nx * r0, y0 - ny * r0);
+        g.lineTo(x - nx * r, y - ny * r);
+        g.lineTo(x + nx * r, y + ny * r);
+        g.lineTo(x0 + nx * r0, y0 + ny * r0);
+        g.closePath();
+      }
+    }
+  }
+  g.fill();
+}
+
+// Shared full-alpha scratch for vector rendering, rebuilt when the project
+// dimensions change. One canvas serves every plane — renders are synchronous.
+let vecScratch = null;
+function vecScratchCtx() {
+  if (!vecScratch || vecScratch.canvas.width !== state.width ||
+      vecScratch.canvas.height !== state.height) {
+    const c = document.createElement('canvas');
+    c.width = state.width;
+    c.height = state.height;
+    vecScratch = c.getContext('2d');
+  }
+  return vecScratch;
+}
+
+/** Re-rasterize a vector plane's mirror canvas from its stroke list (the
+ *  truth). Called after any change to the list — stroke undo/redo, loads,
+ *  duplication. Painting itself merges incrementally and doesn't need it.
+ *  `exclude` (a Set) skips strokes — used while they're "lifted" into a
+ *  transform float, which draws them as its own overlay instead. */
+function renderVectorPlane(plane, exclude) {
+  plane.ctx.clearRect(0, 0, plane.canvas.width, plane.canvas.height);
+  const g = vecScratchCtx();
+  for (const s of plane.strokes) {
+    if (exclude && exclude.has(s)) continue;
+    const r = clampRect(strokeBounds(s));
+    if (!r) continue;
+    g.clearRect(r.x, r.y, r.w, r.h);
+    drawVecStroke(g, s);
+    plane.ctx.save();
+    plane.ctx.globalAlpha = s.opacity;
+    // Copy only the stroke's own rect — a full-canvas blit per stroke would
+    // make loads O(strokes × area).
+    plane.ctx.drawImage(g.canvas, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+    plane.ctx.restore();
+  }
+  plane.touched = plane.strokes.length > 0;
+}
+
+/* ---- Vector stroke EDITING (Phase 8b) — selection, hit tests, snapshots.
+ * Selecting strokes reuses the marquee/transform-box UI: a vector selection
+ * is the usual {x,y,w,h} box plus a `.strokes` array of the selected stroke
+ * OBJECTS. Transforms ride the float machinery — the box is metadata and
+ * only commitFloat() applies it to the points, so editing is always exact. */
+
+/** Snapshot the editable fields of a stroke (for undo edits / drag cancel). */
+const snapVec = (s) => ({ color: s.color, w: s.w, pts: s.pts.map((p) => p.slice()) });
+
+/** Pour a snapshot back into the SAME stroke object (identity-keyed undo). */
+function applyVecSnap(s, snap) {
+  s.color = snap.color;
+  s.w = snap.w;
+  s.pts = snap.pts.map((p) => p.slice());
+}
+
+/** Selection box around a set of strokes (their combined padded bounds). */
+function makeVecSelection(strokes) {
+  if (!strokes.length) return null;
+  let b = null;
+  for (const s of strokes) {
+    const sb = strokeBounds(s);
+    b = growRect(b, sb.x0, sb.y0, sb.x1, sb.y1);
+  }
+  return { x: b.x0, y: b.y0, w: b.x1 - b.x0, h: b.y1 - b.y0, strokes };
+}
+
+/** The transform a vector float's box will apply at commit: scale (flips
+ *  ride as sign) about the lift-time center, rotate, land at the current
+ *  center. Shared by commitFloat and the live preview so what the drag
+ *  shows IS what commit produces. */
+function vecBoxXform(f) {
+  return {
+    sx: (f.w / f.sw) * (f.flipX ? -1 : 1),
+    sy: (f.h / f.sh) * (f.flipY ? -1 : 1),
+    c1x: f.x + f.w / 2, c1y: f.y + f.h / 2,
+    ox: f.ox, oy: f.oy, angle: f.angle,
+  };
+}
+
+/** Run one stroke through a box transform, returning a NEW stroke (the
+ *  original is untouched — commit copies the results in, the preview just
+ *  rasterizes and discards them). Widths scale by the mean axis factor. */
+function xformStroke(s, t) {
+  const wScale = (Math.abs(t.sx) + Math.abs(t.sy)) / 2;
+  return {
+    color: s.color, opacity: s.opacity, pen: s.pen,
+    w: clamp(s.w * wScale, 0.1, MAX_BRUSH_FREE),
+    pts: s.pts.map((p) => {
+      const v = rotVec((p[0] - t.ox) * t.sx, (p[1] - t.oy) * t.sy, t.angle);
+      return [t.c1x + v.x, t.c1y + v.y, p[2]];
+    }),
+  };
+}
+
+/** Squared distance from (px,py) to the segment (x0,y0)-(x1,y1). */
+function segDist2(px, py, x0, y0, x1, y1) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const L2 = dx * dx + dy * dy;
+  const t = L2 ? clamp(((px - x0) * dx + (py - y0) * dy) / L2, 0, 1) : 0;
+  const qx = x0 + t * dx - px, qy = y0 + t * dy - py;
+  return qx * qx + qy * qy;
+}
+
+/** Does (x,y) land on the stroke's ink (+slack, all in art px)? PURE. */
+function strokeHit(s, x, y, slack) {
+  const pts = s.pts;
+  if (pts.length === 1) {
+    const r = vecRadius(s, pts[0][2]) + slack;
+    return (x - pts[0][0]) ** 2 + (y - pts[0][1]) ** 2 <= r * r;
+  }
+  for (let i = 1; i < pts.length; i++) {
+    const r = Math.max(vecRadius(s, pts[i - 1][2]), vecRadius(s, pts[i][2])) + slack;
+    if (segDist2(x, y, pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) <= r * r) return true;
+  }
+  return false;
+}
+
+/** Which point indices get a visible control dot: thinned so dots sit ≥14
+ *  screen px apart (a decimated path can still hold hundreds of points),
+ *  endpoints always included. PURE. */
+function vecDotIndices(s, zoom) {
+  const idxs = [0];
+  let last = s.pts[0];
+  for (let i = 1; i < s.pts.length - 1; i++) {
+    const p = s.pts[i];
+    if (Math.hypot(p[0] - last[0], p[1] - last[1]) * zoom >= 14) {
+      idxs.push(i);
+      last = p;
+    }
+  }
+  if (s.pts.length > 1) idxs.push(s.pts.length - 1);
+  return idxs;
+}
+
+/** The visible dot nearest (x,y) within ~7 screen px, or -1. */
+function vecDotAt(s, x, y, zoom) {
+  const slack = 7 / zoom;
+  let best = -1, bd = slack * slack;
+  for (const i of vecDotIndices(s, zoom)) {
+    const d = (s.pts[i][0] - x) ** 2 + (s.pts[i][1] - y) ** 2;
+    if (d <= bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+/** Render ONLY the given strokes into a box-sized canvas (the float's
+ *  visual proxy, and the clipboard bake). Parts of a stroke lying outside
+ *  the project canvas can't render here (the scratch is canvas-sized) —
+ *  a drag preview may clip them, but commit math never loses them. */
+function strokesProxy(strokes, x, y, w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.ceil(w));
+  c.height = Math.max(1, Math.ceil(h));
+  const g = c.getContext('2d');
+  const scr = vecScratchCtx();
+  for (const s of strokes) {
+    const r = clampRect(strokeBounds(s));
+    if (!r) continue;
+    scr.clearRect(r.x, r.y, r.w, r.h);
+    drawVecStroke(scr, s);
+    g.save();
+    g.globalAlpha = s.opacity;
+    g.drawImage(scr.canvas, r.x, r.y, r.w, r.h, r.x - x, r.y - y, r.w, r.h);
+    g.restore();
+  }
+  return c;
+}
+
+/**
+ * Split a stroke around the eraser disc at (x, y, R) — the owner-requested
+ * upgrade over whole-stroke deletion: the line splits AT ITS POINTS (the
+ * control dots are a zoom-thinned display of these same points) and only
+ * the touched chunk dies. Both endpoints of every segment the disc reaches
+ * are cut out; the surviving runs become new strokes with the original's
+ * look. Runs of a single point are dropped as debris (a lone point renders
+ * as an orphan dot), which also means a genuine one-point dot stroke that
+ * was touched simply dies. Returns the replacement strokes (possibly []);
+ * NEVER mutates `s` — the gesture's undo snapshot keeps the original.
+ */
+function splitStroke(s, x, y, R) {
+  if (s.pts.length === 1) return []; // strokeHit already said the dot is hit
+  // Refine first: fast strokes record SPARSE points, and cutting only at
+  // recorded points would bite out huge chunks. Subdivide long segments
+  // (plain lerp — the capsule between two points IS a straight line, so
+  // inserted points are exact geometry, pressure included) so the cut
+  // granularity is bounded by the eraser size, not by drawing speed.
+  const step = Math.max(R, 1);
+  const pts = [];
+  for (let i = 0; i < s.pts.length; i++) {
+    if (i) {
+      const a = s.pts[i - 1], b = s.pts[i];
+      const n = Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / step);
+      for (let k = 1; k < n; k++) {
+        const t = k / n;
+        pts.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                  a[2] + (b[2] - a[2]) * t]);
+      }
+    }
+    pts.push(s.pts[i].slice());
+  }
+  const touched = new Array(pts.length).fill(false);
+  for (let i = 1; i < pts.length; i++) {
+    const r = Math.max(vecRadius(s, pts[i - 1][2]), vecRadius(s, pts[i][2])) + R;
+    if (segDist2(x, y, pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) <= r * r) {
+      touched[i - 1] = touched[i] = true;
+    }
+  }
+  const out = [];
+  let run = [];
+  const flush = () => {
+    if (run.length >= 2) {
+      out.push({ color: s.color, w: s.w, opacity: s.opacity, pen: s.pen, pts: run });
+    }
+    run = [];
+  };
+  for (let i = 0; i < pts.length; i++) {
+    if (touched[i]) flush();
+    else run.push(pts[i].slice());
+  }
+  flush();
+  return out;
+}
+
+/** One eraser touch (8c): every stroke whose ink lies within the eraser
+ *  disc (radius = half the tip size) is SPLIT around it in place — live
+ *  feedback — replacement pieces keep the stroke's z-position. endStroke
+ *  books the whole gesture as one list-snapshot entry. No render() here:
+ *  the callers repaint once per pointer event either way, so the cursor
+ *  ring keeps following the pointer across empty stretches. */
+function vecEraseAt(x, y) {
+  const v = vecErase;
+  const R = state.brushSize / 2;
+  let hit = false;
+  for (let i = v.plane.strokes.length - 1; i >= 0; i--) {
+    const s = v.plane.strokes[i];
+    if (strokeHit(s, x, y, R)) {
+      v.plane.strokes.splice(i, 1, ...splitStroke(s, x, y, R));
+      v.changed = true;
+      hit = true;
+    }
+  }
+  if (hit) {
+    renderVectorPlane(v.plane);
+    recomposite(v.frame);
+  }
+  return hit;
+}
+
+/**
+ * Apply an editing mutation to every selected vector stroke as ONE undo
+ * entry (8b: recolor via the color picker, re-width via the size slider).
+ * Consecutive calls with the same tag onto the same still-newest entry
+ * MERGE into it — a continuous picker/slider drag fires dozens of input
+ * events and must not stack dozens of entries. Returns false when no
+ * vector selection is active (callers then just do their normal job).
+ */
+function editSelectedStrokes(tag, mutate) {
+  if (!selection || !selection.strokes) return false;
+  const plane = curLayer();
+  const frame = cur();
+  const strokes = selection.strokes;
+  const last = state.undo[state.undo.length - 1];
+  let entry =
+    last && last.vec && last.vec.tag === tag && last.plane === plane &&
+    last.vec.edits.length === strokes.length &&
+    last.vec.edits.every((ed, i) => ed.stroke === strokes[i])
+      ? last : null;
+  if (!entry) {
+    // `after` starts as a copy of `before` so pushFreeUndo's cost trimming
+    // can price the entry; the real after-snapshots land below the mutate.
+    entry = { frame, plane,
+              vec: { op: 'edit', tag,
+                     edits: strokes.map((s) => ({ stroke: s, before: snapVec(s), after: snapVec(s) })) } };
+    pushFreeUndo(entry);
+  }
+  for (const s of strokes) mutate(s);
+  for (const ed of entry.vec.edits) ed.after = snapVec(ed.stroke);
+  renderVectorPlane(plane);
+  recomposite(frame);
+  selection = makeVecSelection(strokes); // width changes resize the box
+  updateThumb(frame);
+  drawLayerThumb(state.layer);
+  updateUI();
+  syncSelectBar();
+  render();
+  return true;
 }
 
 /** Grow a float rect {x0,y0,x1,y1} to cover another box (null = first box). */
@@ -1299,7 +2012,7 @@ const smudgeAlpha = () => 1 - (1 - state.smudgeStrength) ** 2;
 
 /** Start a freeform stroke at a (float) art position. `smudge` strokes
  *  deposit no color of their own — see smudgeStamp(). */
-function beginStroke(x, y, pressure, erase, smudge) {
+function beginStroke(x, y, pressure, erase, smudge, vector) {
   const preview = document.createElement('canvas');
   preview.width = state.width;
   preview.height = state.height;
@@ -1330,11 +2043,20 @@ function beginStroke(x, y, pressure, erase, smudge) {
     carry: null,                  // smudge: premultiplied float RGBA "paint on
     carryBase: 0,                 //   the finger" — never quantized to 8-bit
     angle: 0,                     // stroke travel direction (for follow tips)
+    // Vector strokes (8a): the growing point list, plus the pen params
+    // pinned at stroke start. Present = this stroke records an editable
+    // object instead of pixels; stamp() is bypassed (vecSeg draws capsules).
+    vec: vector
+      ? { pen: curBrush().pen, w: state.brushSize, pts: [[x, y, pressure]] }
+      : null,
     // Alpha lock, pinned at stroke start: the buffer merges with source-atop
     // instead of source-over, so paint lands only where the plane already
     // has alpha (and exactly at that alpha — atop preserves dest coverage).
-    // Smudge preserves alpha differently — see finishStroke().
-    lock: state.layers[state.layer].alphaLock,
+    // Smudge preserves alpha differently — see finishStroke(). Vector
+    // strokes ignore the lock: the stroke OBJECT is the truth and renders
+    // fully on any re-rasterize, so an atop-merged mirror would silently
+    // disagree with it.
+    lock: !vector && state.layers[state.layer].alphaLock,
     // Paint/erase strokes composite at the Opacity slider; smudge carries
     // pixels at its own Strength slider (opacity is meaningless for a tool
     // that deposits no color).
@@ -1358,8 +2080,36 @@ function beginStroke(x, y, pressure, erase, smudge) {
     stroke.deposit = 1 - (1 - s) ** k;
     stroke.pickup = Math.max(0.008, 1 - s ** k);
   }
-  stamp(x, y, pressure);          // a click with no drag still leaves a dot
+  if (vector) {
+    vecRefresh(x, y, pressure, x, y, pressure); // opening dot (a click = a dot)
+  } else {
+    stamp(x, y, pressure);        // a click with no drag still leaves a dot
+  }
   refreshStroke();
+}
+
+/** Rebuild the ENTIRE in-progress vector stroke in the buffer with the
+ *  same single-fill the committed renderer uses — live painting and every
+ *  later re-render (undo, transform, load) are byte-identical, including
+ *  the anti-aliased edge. Appending a point only changes the union shape
+ *  near the newest capsule, so the dirty SEG rect stays that capsule's
+ *  bounds (pixels elsewhere refill to the exact same bytes); the whole-
+ *  stroke RECT grows to the full bounds, which the clear must cover.
+ *  (x0,y0,p0)-(x1,y1,p1) is the newest segment — pass the same point twice
+ *  for the opening dot. */
+function vecRefresh(x0, y0, p0, x1, y1, p1) {
+  const v = stroke.vec;
+  const proto = { color: stroke.color, w: v.w, pen: v.pen, pts: v.pts };
+  const b = strokeBounds(proto);
+  const g = stroke.bufCtx;
+  const full = clampRect(b);
+  if (full) g.clearRect(full.x, full.y, full.w, full.h);
+  drawVecStroke(g, proto);
+  stroke.rect = growRect(stroke.rect, b.x0, b.y0, b.x1, b.y1);
+  const reach = Math.max(vecRadius(v, p0), vecRadius(v, p1)) + 1;
+  stroke.seg = growRect(stroke.seg,
+    Math.min(x0, x1) - reach, Math.min(y0, y1) - reach,
+    Math.max(x0, x1) + reach, Math.max(y0, y1) + reach);
 }
 
 /** One tip stamp; pressure scales the diameter. Texture brushes land each
@@ -1385,6 +2135,21 @@ function stamp(x, y, pressure) {
     g.drawImage(freeTip(stroke.color), -s / 2, -s / 2, s, s);
     g.restore();
     reach = (s * Math.SQRT2) / 2 + 1; // a rotated square reaches its diagonal
+  } else if (state.brushSize <= CRISP_MAX) {
+    // Crisp small round tips (see CRISP_MAX): integer-snapped aliased
+    // squares instead of a sub-pixel AA disc — fillRect at whole coords
+    // introduces no anti-aliasing at all, so a 1px brush paints EXACTLY one
+    // full-strength pixel per stamp (hardness has nothing to soften at this
+    // scale and is ignored). Keyed on the SELECTED size, not the pressure-
+    // scaled stamp size, so the tapered tail of a big soft stroke never
+    // suddenly turns blocky; within a crisp stroke, pen pressure still
+    // tapers 2px down to 1px through the same rounding. Erase and alpha
+    // lock are untouched — they act on the buffer's alpha at merge time.
+    const di = Math.max(1, Math.round(d));
+    const c = crispXY(x, y, di);
+    g.fillStyle = stroke.color;
+    g.fillRect(c.x, c.y, di, di);
+    reach = di / 2 + 1;
   } else {
     g.drawImage(freeTip(stroke.color), x - d / 2, y - d / 2, d, d);
   }
@@ -1518,6 +2283,24 @@ function moveStroke(rx, ry, pressure) {
   if (Math.hypot(nx - stroke.x, ny - stroke.y) > 0.5) {
     stroke.angle = Math.atan2(ny - stroke.y, nx - stroke.x);
   }
+  if (stroke.vec) {
+    // Vector: no stamp spacing — each pointer event appends one point and
+    // one capsule, which connect seamlessly by construction. Sub-half-pixel
+    // wiggles are decimated: they'd bloat the recorded path (the file, the
+    // undo cost, future point editing) without changing the ribbon.
+    stroke.seg = null;
+    const pts = stroke.vec.pts;
+    const last = pts[pts.length - 1];
+    if (Math.hypot(nx - last[0], ny - last[1]) >= 0.5) {
+      pts.push([nx, ny, pressure]);
+      vecRefresh(last[0], last[1], last[2], nx, ny, pressure);
+    }
+    stroke.x = nx;
+    stroke.y = ny;
+    stroke.pressure = pressure;
+    refreshStroke();
+    return;
+  }
   const { stamps, rem } = stampPositions(
     stroke.x, stroke.y, nx, ny, stroke.pressure, pressure, state.brushSize, stroke.rem,
     stroke.smudge ? SMUDGE_SPACING : STAMP_SPACING);
@@ -1558,6 +2341,7 @@ function refreshStroke() {
 /** Rebuild one rect of a frame's composite canvas. While a stroke is live,
  *  `override` (its preview canvas) stands in for the active plane. */
 function patchComposite(f, r, override) {
+  compositeGen++; // the soft-proof cache keys on this
   f.ctx.save();
   f.ctx.beginPath();
   f.ctx.rect(r.x, r.y, r.w, r.h);
@@ -1580,6 +2364,26 @@ function finishStroke() {
   stroke = null;
   const r = clampRect(s.rect);
   if (!r) { render(); return; } // never touched the canvas
+  if (s.vec) {
+    // Vector stroke: the TRUTH is the stroke object joining the plane's
+    // list; the mirror just adopts the preview's rect (the incremental
+    // capsules there are the same math a full re-render would produce).
+    // The undo entry carries the object, not pixels — undo removes it from
+    // the list and re-rasterizes, so truth and mirror can never diverge.
+    const obj = { color: s.color, w: s.vec.w, opacity: s.opacity,
+                  pen: s.vec.pen, pts: s.vec.pts };
+    s.plane.strokes.push(obj);
+    s.plane.ctx.putImageData(s.prevCtx.getImageData(r.x, r.y, r.w, r.h), r.x, r.y);
+    s.plane.touched = true;
+    pushFreeUndo({ frame: s.frame, plane: s.plane, rect: r,
+                   vec: { op: 'add', stroke: obj } });
+    patchComposite(s.frame, r);
+    updateThumb(s.frame);
+    drawLayerThumb(state.layer);
+    updateUI();
+    render();
+    return;
+  }
   const before = s.plane.ctx.getImageData(r.x, r.y, r.w, r.h);
   const after = s.prevCtx.getImageData(r.x, r.y, r.w, r.h);
   // Smudge drags alpha around as freely as color; on an alpha-locked layer
@@ -1807,6 +2611,30 @@ function liftSelection() {
   }
   const { x, y, w, h } = selection;
 
+  // Vector layers (8b): "lifting" hides the selected strokes from the
+  // mirror and boxes a rendered proxy of them. The stroke objects stay in
+  // the plane's list, UNTOUCHED — the box is metadata, and only commit
+  // applies it to the points (exact math, no resampling, ever). Cancel is
+  // therefore free: re-render with nothing excluded.
+  if (selection.strokes) {
+    const strokes = selection.strokes;
+    const plane = curLayer();
+    const frame = cur();
+    floating = {
+      vecStrokes: strokes, vecBefore: strokes.map(snapVec), plane, frame,
+      pixels: null, x, y, w, h, sw: w, sh: h, angle: 0,
+      ox: x + w / 2, oy: y + h / 2, // lift-time center, the transform origin
+      flipX: false, flipY: false,
+      canvas: strokesProxy(strokes, x, y, w, h),
+    };
+    renderVectorPlane(plane, new Set(strokes));
+    recomposite(frame);
+    updateThumb(frame);
+    drawLayerThumb(state.layer);
+    selection = null;
+    return true;
+  }
+
   // Freeform: cut the region's RGBA out into a floating canvas. No history
   // entry yet — commit/cancel/discard reconstruct the "before" state from
   // liftBefore, so a whole move is always exactly one undo step.
@@ -1864,6 +2692,37 @@ function commitFloat() {
   if (!floating) return;
   const f = floating;
   floating = null;
+
+  // Vector float (8b): apply the box's transform to the stroke POINTS —
+  // scale (with flips as sign) about the lift-time center, rotate, land at
+  // the new center. Widths scale with the mean axis factor. This is the
+  // whole "box is metadata" payoff: any amount of fiddling costs nothing,
+  // and the result re-rasterizes crisp from the transformed points.
+  if (f.vecStrokes) {
+    const { plane, frame } = f;
+    const t = vecBoxXform(f);
+    const moved = t.angle !== 0 || t.sx !== 1 || t.sy !== 1 ||
+                  t.c1x !== f.ox || t.c1y !== f.oy;
+    if (moved) {
+      for (const s of f.vecStrokes) {
+        const n = xformStroke(s, t); // same math the live preview showed
+        s.pts = n.pts;
+        s.w = n.w;
+      }
+      pushFreeUndo({ frame, plane,
+        vec: { op: 'edit',
+               edits: f.vecStrokes.map((s, i) => ({ stroke: s, before: f.vecBefore[i], after: snapVec(s) })) } });
+    }
+    renderVectorPlane(plane); // the strokes rejoin the mirror
+    recomposite(frame);
+    selection = makeVecSelection(f.vecStrokes); // stay selected for re-tweaks
+    updateThumb(frame);
+    drawLayerThumb(state.layer);
+    updateUI();
+    syncSelectBar();
+    render();
+    return;
+  }
 
   // Freeform: stamp the buffer (source-over, so its transparent parts keep
   // the art below) and record ONE patch covering both the lift hole and the
@@ -1980,7 +2839,15 @@ function commitFloat() {
 /** Esc / ✕ / right-click: put lifted pixels back where they came from (and
  *  drop the lift's undo entry — net zero); a pasted buffer is just discarded. */
 function cancelSelection() {
-  if (floating && state.mode === 'free') {
+  if (floating && floating.vecStrokes) {
+    // Vector float: the points were never touched — re-rendering with
+    // nothing excluded puts everything back. Net zero, no history.
+    renderVectorPlane(floating.plane);
+    recomposite(floating.frame);
+    updateThumb(floating.frame);
+    refreshLayerThumbs();
+    floating = null;
+  } else if (floating && state.mode === 'free') {
     if (floating.liftBefore) {
       // Pour the lifted RGBA back into its hole — net zero, no history.
       const plane = curLayer();
@@ -2055,6 +2922,12 @@ function flipFloat(horizontal) {
   if (state.mode === 'free') {
     if (!liftSelection()) return;
     const f = floating;
+    // Vector float: also record the mirror for commit's point math (the
+    // canvas bake below keeps the on-screen proxy honest in the meantime).
+    if (f.vecStrokes) {
+      if (horizontal) f.flipX = !f.flipX;
+      else f.flipY = !f.flipY;
+    }
     const c = document.createElement('canvas');
     c.width = f.sw;
     c.height = f.sh;
@@ -2116,7 +2989,13 @@ function copySelection() {
   } else if (selection) {
     const { x, y, w, h } = selection;
     const plane = curLayer();
-    if (state.mode === 'free') {
+    if (selection.strokes) {
+      // Vector: bake ONLY the selected strokes into an RGBA clipboard —
+      // pasteable anywhere the raster clipboard is (strokes-as-strokes
+      // paste is future polish; the clipboard stays raster in 8b).
+      const c = strokesProxy(selection.strokes, x, y, w, h);
+      clipboard = { canvas: c, w: c.width, h: c.height };
+    } else if (state.mode === 'free') {
       clipboard = { canvas: snap(plane.canvas, w, h, x, y), w, h };
     } else {
       const buf = new Array(w * h).fill(null);
@@ -2137,6 +3016,24 @@ function copySelection() {
  *  mode the lift's undo entry already covers that; freeform lifts don't make
  *  one (see liftSelection), so record the hole as a patch here. */
 function discardFloat() {
+  // Vector float: discarding deletes the strokes outright (they were only
+  // hidden from the mirror while lifted). Indices ride the entry so undo
+  // restores them at their original z-order.
+  if (floating.vecStrokes) {
+    const f = floating;
+    floating = null;
+    const items = f.vecStrokes
+      .map((s) => ({ stroke: s, i: f.plane.strokes.indexOf(s) }))
+      .filter((it) => it.i !== -1)
+      .sort((a, b) => a.i - b.i);
+    for (let k = items.length - 1; k >= 0; k--) f.plane.strokes.splice(items[k].i, 1);
+    pushFreeUndo({ frame: f.frame, plane: f.plane, vec: { op: 'remove', items } });
+    renderVectorPlane(f.plane);
+    recomposite(f.frame);
+    updateThumb(f.frame);
+    updateUI();
+    return;
+  }
   if (state.mode === 'free' && floating.liftRect) {
     const { liftRect: r, liftBefore } = floating;
     const plane = curLayer();
@@ -2175,7 +3072,21 @@ function clearSelectionPixels() {
     flashHint('The active layer is hidden — click its eye to show it first.');
     return;
   }
-  if (state.mode === 'free') {
+  if (selection.strokes) {
+    // Vector: delete the selected stroke OBJECTS (one entry, z-order kept).
+    const plane = curLayer();
+    const frame = cur();
+    const items = selection.strokes
+      .map((s) => ({ stroke: s, i: plane.strokes.indexOf(s) }))
+      .filter((it) => it.i !== -1)
+      .sort((a, b) => a.i - b.i);
+    for (let k = items.length - 1; k >= 0; k--) plane.strokes.splice(items[k].i, 1);
+    pushFreeUndo({ frame, plane, vec: { op: 'remove', items } });
+    renderVectorPlane(plane);
+    recomposite(frame);
+    selection = null;
+    syncSelectBar();
+  } else if (state.mode === 'free') {
     const { x, y, w, h } = selection;
     const plane = curLayer();
     const before = plane.ctx.getImageData(x, y, w, h);
@@ -2236,6 +3147,12 @@ function pasteClipboard() {
     flashHint('The active layer is hidden — click its eye to show it first.');
     return;
   }
+  // Pasting stamps pixels; a raster layer must take them (8b will paste
+  // strokes as strokes). Hop like the brush does rather than refuse.
+  if (state.mode === 'free' && state.layers[state.layer].kind === 'vector' &&
+      !ensureLayerKind('raster')) {
+    return;
+  }
   commitFloat();
   selectTool('select');
   const cx = Math.round((viewW / 2 - state.panX) / state.zoom - clipboard.w / 2);
@@ -2286,8 +3203,23 @@ $('btn-sel-cancel').addEventListener('click', cancelSelection);
 view.addEventListener('pointerdown', (e) => {
   const sx = e.offsetX, sy = e.offsetY;
 
-  // Middle button, the pan tool, or left button while holding space: pan.
-  if (e.button === 1 || (e.button === 0 && (spaceDown || state.tool === 'pan'))) {
+  // Touch bookkeeping first: one finger falls through and behaves like a
+  // mouse; a second turns the interaction into a navigation gesture (and a
+  // third+ just joins the map so lift order can't confuse the anchor).
+  if (e.pointerType === 'touch') {
+    touchPts.set(e.pointerId, { x: sx, y: sy });
+    if (touchPts.size >= 2) {
+      cancelPointerInput();       // revoke whatever finger #1 started
+      gesture = gestureAnchor();
+      view.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      return;
+    }
+  }
+
+  // Middle button, the pan tool, or left button while holding Space or
+  // Enter: pan.
+  if (e.button === 1 || (e.button === 0 && (spaceDown || enterDown || state.tool === 'pan'))) {
     panning = true;
     panAnchor = { sx, sy, panX: state.panX, panY: state.panY };
     view.style.cursor = ''; // the transform hover cursor must not mask the pan grab
@@ -2321,6 +3253,21 @@ view.addEventListener('pointerdown', (e) => {
     if (rightBtn) {
       cancelSelection();
       return;
+    }
+    // Vector point editing (8b): with exactly ONE stroke selected and no
+    // float pending, a grab on a visible control dot starts a point drag —
+    // checked before the handle grab because dots live inside the box.
+    if (state.mode === 'free' && !floating && selection && selection.strokes &&
+        selection.strokes.length === 1) {
+      const s0 = selection.strokes[0];
+      const q0 = screenToArtF(sx, sy);
+      const di = vecDotAt(s0, q0.x, q0.y, state.zoom);
+      if (di !== -1) {
+        vecPointDrag = { stroke: s0, index: di, before: snapVec(s0),
+                         plane: curLayer(), frame: cur(), moved: false };
+        view.setPointerCapture(e.pointerId);
+        return;
+      }
     }
     // Freeform: transform-handle grabs beat everything else. The handles
     // live on the plain marquee too — grabbing one lifts first, so "select,
@@ -2366,15 +3313,44 @@ view.addEventListener('pointerdown', (e) => {
       }
       return;
     }
-    // Start a fresh marquee.
+    // Vector layers (8b): a tap on a stroke's ink selects it — topmost
+    // first, matching what a click visually lands on. Missing every stroke
+    // falls through to a marquee that captures strokes on release.
+    const vecLayer = state.mode === 'free' && state.layers[state.layer].kind === 'vector';
+    if (vecLayer) {
+      const plane = curLayer();
+      const slack = 4 / state.zoom; // ~4 screen px of grab forgiveness
+      for (let i = plane.strokes.length - 1; i >= 0; i--) {
+        if (strokeHit(plane.strokes[i], q.x, q.y, slack)) {
+          selection = makeVecSelection([plane.strokes[i]]);
+          syncSelectBar();
+          render();
+          return;
+        }
+      }
+    }
+    // Start a fresh marquee (on vector layers it selects STROKES on release).
     const ax = clamp(p.x, 0, state.width - 1);
     const ay = clamp(p.y, 0, state.height - 1);
-    selDrag = { x0: ax, y0: ay };
+    selDrag = { x0: ax, y0: ay, vec: vecLayer };
     selection = { x: ax, y: ay, w: 1, h: 1 };
     view.setPointerCapture(e.pointerId);
     syncSelectBar();
     render();
     return;
+  }
+
+  // Engine/layer agreement (8a): vector pens record strokes on vector
+  // layers, bitmap brushes paint pixels on raster layers. A left-click
+  // paint with the "wrong" layer active hops to (or creates) a matching
+  // one BEFORE the visibility/lock guards below, so those judge the layer
+  // that will actually be edited. Right-drag is the eraser — it never hops.
+  if (state.mode === 'free' && state.tool === 'brush' && !rightBtn) {
+    if (curBrush().kind === 'vector') {
+      if (!ensureLayerKind('vector')) return;
+    } else if (state.layers[state.layer].kind === 'vector') {
+      if (!ensureLayerKind('raster')) return;
+    }
   }
 
   // Drawing on a layer you can't see only causes confusion — block it.
@@ -2394,15 +3370,44 @@ view.addEventListener('pointerdown', (e) => {
 
   // Freeform painting & filling (select was handled above, both modes).
   if (state.mode === 'free') {
+    const vecLayer = state.layers[state.layer].kind === 'vector';
     if (state.tool === 'fill') {
+      // Vector fills (closed shapes) are out of scope for 8a — filling the
+      // MIRROR would silently disagree with the stroke list.
+      if (vecLayer) {
+        flashHint('Fill needs a raster layer — vector shapes come later.');
+        return;
+      }
       freeFill(p.x, p.y, rightBtn ? null : state.color);
       if (!rightBtn) addUsedColor(state.color);
       return;
     }
-    const q = screenToArtF(sx, sy);
     const erase = rightBtn || state.tool === 'eraser';
+    if (vecLayer && state.tool === 'smudge' && !rightBtn) {
+      // Pixel-level smearing would edit the mirror behind the stroke
+      // list's back — smudge stays raster-only.
+      flashHint('Smudge works on raster layers.');
+      return;
+    }
+    if (vecLayer && erase) {
+      // Splitting eraser (owner upgrade over 8c's whole-stroke delete):
+      // the disc cuts strokes AT THEIR POINTS and erases only the chunk
+      // it touches — surviving runs live on as separate strokes. The
+      // gesture books ONE list-snapshot entry on release; the gesture-
+      // start list is also the touch-revoke restore point.
+      const plane = curLayer();
+      const q0 = screenToArtF(sx, sy);
+      vecErase = { plane, frame: cur(), orig: plane.strokes.slice(),
+                   changed: false, last: q0 };
+      vecEraseAt(q0.x, q0.y);
+      view.setPointerCapture(e.pointerId);
+      render();
+      return;
+    }
+    const q = screenToArtF(sx, sy);
     // Right-drag stays the eraser even on the smudge tool.
-    beginStroke(q.x, q.y, penPressure(e), erase, state.tool === 'smudge' && !rightBtn);
+    beginStroke(q.x, q.y, penPressure(e), erase, state.tool === 'smudge' && !rightBtn,
+                vecLayer && state.tool === 'brush');
     if (!erase && state.tool !== 'smudge') addUsedColor(state.color);
     view.setPointerCapture(e.pointerId);
     return;
@@ -2438,6 +3443,25 @@ view.addEventListener('pointerdown', (e) => {
 view.addEventListener('pointermove', (e) => {
   const sx = e.offsetX, sy = e.offsetY;
   hoverS = { x: sx, y: sy }; // raw screen position (freeform brush circle)
+
+  // Fingers in a gesture drive the view transform and never draw. The two
+  // anchor fingers move one event at a time, so each move re-reads the pair.
+  if (e.pointerType === 'touch' && touchPts.has(e.pointerId)) {
+    touchPts.set(e.pointerId, { x: sx, y: sy });
+    if (gesture) {
+      if (touchPts.size >= 2) {
+        const now = gestureAnchor();
+        const t = pinchView(gesture, now, state.zoom, state.panX, state.panY);
+        state.zoom = t.zoom;
+        state.panX = t.panX;
+        state.panY = t.panY;
+        gesture = now;
+        updateUI();
+        render();
+      }
+      return;
+    }
+  }
 
   if (panning) {
     state.panX = panAnchor.panX + (sx - panAnchor.sx);
@@ -2499,6 +3523,49 @@ view.addEventListener('pointermove', (e) => {
     return;
   }
 
+  // Whole-stroke eraser sweep (8c): sample the path BETWEEN events too —
+  // a fast flick must not hop over a thin stroke. Repaint every event
+  // (hit or not) so the cursor ring follows the pointer.
+  if (vecErase) {
+    const q = screenToArtF(sx, sy);
+    const step = Math.max(state.brushSize / 2, 0.5);
+    const dist = Math.hypot(q.x - vecErase.last.x, q.y - vecErase.last.y);
+    for (let t = step; t < dist; t += step) {
+      vecEraseAt(vecErase.last.x + ((q.x - vecErase.last.x) * t) / dist,
+                 vecErase.last.y + ((q.y - vecErase.last.y) * t) / dist);
+    }
+    vecEraseAt(q.x, q.y);
+    vecErase.last = q;
+    render();
+    return;
+  }
+
+  // Vector point drag (8b): the grabbed point follows the pointer exactly;
+  // neighbors within a cosine-falloff window move proportionally, so a
+  // reshape bends the line organically instead of kinking one point. All
+  // offsets recompute from the drag-start snapshot — no accumulation drift.
+  if (vecPointDrag) {
+    const d = vecPointDrag;
+    const q = screenToArtF(sx, sy);
+    const P0 = d.before.pts;
+    const dx = q.x - P0[d.index][0];
+    const dy = q.y - P0[d.index][1];
+    const K = Math.max(2, Math.round(P0.length / 6));
+    const pts = d.stroke.pts;
+    for (let j = Math.max(0, d.index - K); j <= Math.min(pts.length - 1, d.index + K); j++) {
+      const t = Math.abs(j - d.index) / K;
+      const w = 0.5 * (1 + Math.cos(Math.PI * t));
+      pts[j][0] = P0[j][0] + dx * w;
+      pts[j][1] = P0[j][1] + dy * w;
+    }
+    d.moved = d.moved || dx !== 0 || dy !== 0;
+    renderVectorPlane(d.plane);
+    recomposite(d.frame);
+    selection = makeVecSelection([d.stroke]); // the box tracks the reshape
+    render();
+    return;
+  }
+
   if (drawing) {
     // Connect from the last position so fast drags don't leave gaps.
     paintLine(lastArt.x, lastArt.y, p.x, p.y, erasing ? null : state.color);
@@ -2517,11 +3584,25 @@ view.addEventListener('pointermove', (e) => {
     ? floating || selection
     : null;
   hoverHandle = selBox ? hitHandle(sx, sy, selBox) : null;
-  if (selBox && !spaceDown) {
+  // Control-dot hover (single selected vector stroke, not lifted): light
+  // the dot under the cursor so it's obvious which part of the line a grab
+  // will reshape. Dots beat handles, matching pointerdown's grab order.
+  hoverDot = null;
+  if (state.mode === 'free' && state.tool === 'select' && !floating &&
+      selection && selection.strokes && selection.strokes.length === 1) {
+    const qd = screenToArtF(sx, sy);
+    const di = vecDotAt(selection.strokes[0], qd.x, qd.y, state.zoom);
+    if (di !== -1) {
+      hoverDot = di;
+      hoverHandle = null;
+    }
+  }
+  if (selBox && !spaceDown && !enterDown) {
     const q = screenToArtF(sx, sy);
-    view.style.cursor = hoverHandle
-      ? (hoverHandle.rot ? 'grab' : resizeCursor(hoverHandle, selBox.angle || 0))
-      : (pointInBox(q.x, q.y, selBox) ? 'move' : '');
+    view.style.cursor = hoverDot !== null ? 'grab'
+      : hoverHandle
+        ? (hoverHandle.rot ? 'grab' : resizeCursor(hoverHandle, selBox.angle || 0))
+        : (pointInBox(q.x, q.y, selBox) ? 'move' : '');
   } else if (view.style.cursor) {
     view.style.cursor = '';
   }
@@ -2535,12 +3616,52 @@ function endStroke() {
     panning = false;
     wrap.classList.remove('panning-active');
   }
+  // A vector marquee resolves on release: strokes with any point inside the
+  // dragged rect become the selection (the rect itself is discarded).
+  if (selDrag && selDrag.vec && selection && !selection.strokes) {
+    const r = selection;
+    const got = curLayer().strokes.filter((s) =>
+      s.pts.some((p) => p[0] >= r.x && p[0] < r.x + r.w && p[1] >= r.y && p[1] < r.y + r.h));
+    selection = got.length ? makeVecSelection(got) : null;
+    syncSelectBar();
+  }
   selDrag = null;
   floatDrag = null;
   // Releasing the knob relaxes grabbing back to grab; the next pointermove
   // re-derives the cursor from whatever is actually underneath.
   if (xformDrag && xformDrag.kind === 'rotate') view.style.cursor = 'grab';
   xformDrag = null;
+  // A finished eraser gesture books ONE list-snapshot entry: whatever mix
+  // of splits and deletions happened, undo/redo just swap the whole stroke
+  // list (refs, not clones — near-free). Empty swings book nothing.
+  if (vecErase) {
+    const v = vecErase;
+    vecErase = null;
+    if (v.changed) {
+      pushFreeUndo({ frame: v.frame, plane: v.plane,
+        vec: { op: 'list', before: v.orig, after: v.plane.strokes.slice() } });
+      updateThumb(v.frame);
+      drawLayerThumb(state.layer);
+      updateUI();
+    }
+    render();
+    return;
+  }
+  // A finished point drag books ONE edit entry (a mere click on a dot
+  // books nothing).
+  if (vecPointDrag) {
+    const d = vecPointDrag;
+    vecPointDrag = null;
+    if (d.moved) {
+      pushFreeUndo({ frame: d.frame, plane: d.plane,
+        vec: { op: 'edit', edits: [{ stroke: d.stroke, before: d.before, after: snapVec(d.stroke) }] } });
+      updateThumb(d.frame);
+      drawLayerThumb(state.layer);
+      updateUI();
+    }
+    render();
+    return;
+  }
   if (stroke) {
     finishStroke(); // freeform stroke: merge + history
     return;
@@ -2556,13 +3677,85 @@ function endStroke() {
   }
 }
 
-view.addEventListener('pointerup', endStroke);
-view.addEventListener('pointercancel', endStroke);
+/**
+ * Revoke whatever the pointer is midway through — called when a second
+ * finger turns the interaction into a navigation gesture, so the accidental
+ * first-finger mark VANISHES instead of committing. In freeform that's
+ * free: a live stroke only paints its preview canvas, the plane is
+ * untouched until finishStroke — dropping the stroke and re-reading the
+ * plane into the composite erases every trace. In pixel mode the stroke
+ * has already written the plane, so restore the snapshot pushUndo() took
+ * at its start. (The redo stack that push cleared is gone for good —
+ * the price of any new action, cancelled or not.)
+ */
+function cancelPointerInput() {
+  if (panning) {
+    panning = false;
+    wrap.classList.remove('panning-active');
+  }
+  // A half-dragged VECTOR marquee is dropped outright — a plain rect must
+  // never survive on a vector layer (the pixel lift paths would misread it).
+  if (selDrag && selDrag.vec && selection && !selection.strokes) selection = null;
+  selDrag = null;   // a half-dragged pixel marquee keeps its current rectangle
+  floatDrag = null; // a floating selection stays lifted, just stops moving
+  // A handle drag ends where it stands (same as releasing it — endStroke's
+  // semantics); the float keeps its current box, Esc still cancels fully.
+  if (xformDrag && xformDrag.kind === 'rotate') view.style.cursor = 'grab';
+  xformDrag = null;
+  // A revoked eraser gesture puts every casualty back — nothing was booked.
+  if (vecErase) {
+    vecErase.plane.strokes = vecErase.orig.slice();
+    renderVectorPlane(vecErase.plane);
+    recomposite(vecErase.frame);
+    vecErase = null;
+  }
+  // A revoked point drag restores the snapshot — the reshape vanishes.
+  if (vecPointDrag) {
+    applyVecSnap(vecPointDrag.stroke, vecPointDrag.before);
+    renderVectorPlane(vecPointDrag.plane);
+    recomposite(vecPointDrag.frame);
+    selection = makeVecSelection([vecPointDrag.stroke]);
+    vecPointDrag = null;
+  }
+  if (stroke) {
+    const s = stroke;
+    stroke = null;
+    const r = clampRect(s.rect);
+    if (r) patchComposite(s.frame, r); // drop the preview from the composite
+  }
+  if (drawing) {
+    drawing = false;
+    const entry = state.undo.pop();    // this stroke's own pointerdown snapshot
+    entry.plane.pixels = entry.pixels;
+    repaintLayer(entry.plane);
+    recomposite(entry.frame);
+    updateThumb(entry.frame);
+    drawLayerThumb(state.layer);
+    updateUI();
+  }
+  render();
+}
+
+function pointerEnd(e) {
+  if (e.pointerType === 'touch' && touchPts.delete(e.pointerId) && gesture) {
+    // Still two fingers down: re-anchor around the survivors (the pair may
+    // have changed). Fewer ends the gesture — and the leftover finger stays
+    // inert until it lifts, because the stroke it might have owned was
+    // cancelled when the gesture began.
+    gesture = touchPts.size >= 2 ? gestureAnchor() : null;
+    return;
+  }
+  endStroke();
+}
+
+view.addEventListener('pointerup', pointerEnd);
+view.addEventListener('pointercancel', pointerEnd);
 
 view.addEventListener('pointerleave', () => {
   hover = null;
   hoverS = null;
   hoverHandle = null;
+  hoverDot = null;
   updateStatus();
   if (!drawing && !stroke) render();
 });
@@ -2587,10 +3780,11 @@ wrap.addEventListener('wheel', (e) => {
  * ==================================================================== */
 
 window.addEventListener('keydown', (e) => {
-  // Escape closes the File menu — checked before the input guard so it also
-  // works while focus is in the menu's W/H fields.
-  if (e.code === 'Escape' && !fileMenu.hidden) {
+  // Escape closes the topbar menus — checked before the input guard so it
+  // also works while focus is in the File menu's W/H fields.
+  if (e.code === 'Escape' && (!fileMenu.hidden || !togglesMenu.hidden)) {
     fileMenu.hidden = true;
+    togglesMenu.hidden = true;
     return;
   }
   // Don't steal keystrokes from inputs, the animation textarea, or selects.
@@ -2600,6 +3794,22 @@ window.addEventListener('keydown', (e) => {
 
   if (e.code === 'Space') {
     spaceDown = true;
+    wrap.classList.add('panning');
+    e.preventDefault();
+    return;
+  }
+  // Enter: with a floating selection, a fresh press COMMITS it (its
+  // long-standing job). Otherwise holding Enter is a second temporary-pan
+  // modifier, exactly like Space (owner request: a pan key under the right
+  // hand). Only a FRESH press may commit — the key auto-repeats while held,
+  // and a float lifted mid-hold (the arrow keys lift one) must not be
+  // swallowed by a repeat event.
+  if (e.code === 'Enter' || e.code === 'NumpadEnter') {
+    if (floating && !e.repeat) {
+      commitFloat();
+      return;
+    }
+    enterDown = true;
     wrap.classList.add('panning');
     e.preventDefault();
     return;
@@ -2651,7 +3861,6 @@ window.addEventListener('keydown', (e) => {
     case 'KeyH': selectTool('pan'); break;
     case 'KeyS': selectTool('select'); break;
     case 'Escape': cancelSelection(); break;
-    case 'Enter': commitFloat(); break;
     case 'Comma': selectFrame(state.frame - 1); break;   // previous frame
     case 'Period': selectFrame(state.frame + 1); break;  // next frame
     case 'KeyN': addFrame(); break;
@@ -2675,10 +3884,11 @@ window.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('keyup', (e) => {
-  if (e.code === 'Space') {
-    spaceDown = false;
-    wrap.classList.remove('panning');
-  }
+  if (e.code === 'Space') spaceDown = false;
+  else if (e.code === 'Enter' || e.code === 'NumpadEnter') enterDown = false;
+  else return;
+  // The pan cursor stays up while EITHER pan key is still held.
+  if (!spaceDown && !enterDown) wrap.classList.remove('panning');
 });
 
 /* ======================================================================
@@ -2716,7 +3926,8 @@ const addFrame = () => insertFrame(makeFrame());
 function dupFrame() {
   commitFloat(); // so the duplicate includes what's being moved
   insertFrame(makeFrame(cur().layers.map(
-    (l) => (state.mode === 'free' ? l.canvas : l.pixels.slice()))));
+    (l) => (l.strokes ? l.strokes                       // vector: makePlane clones
+      : state.mode === 'free' ? l.canvas : l.pixels.slice()))));
 }
 
 function deleteFrame() {
@@ -2778,11 +3989,14 @@ $('btn-frame-del').addEventListener('click', deleteFrame);
 $('btn-frame-left').addEventListener('click', () => moveFrame(-1));
 $('btn-frame-right').addEventListener('click', () => moveFrame(1));
 
-/** Wire a checkbox to a boolean state field; blur so shortcuts keep working. */
-function bindToggle(id, key) {
+/** Wire a checkbox to a boolean state field; blur so shortcuts keep working.
+ *  `after` runs before the repaint for toggles with side effects beyond the
+ *  canvas (the panel show/hides below). */
+function bindToggle(id, key, after) {
   $(id).addEventListener('change', (e) => {
     state[key] = e.target.checked;
     e.target.blur();
+    if (after) after();
     render();
   });
 }
@@ -2790,10 +4004,23 @@ bindToggle('chk-onion-prev', 'onionPrev');
 bindToggle('chk-onion-next', 'onionNext');
 bindToggle('chk-origin', 'showOrigin');
 
+/** Show/hide whole workspace panels (the Toggles menu). Hiding the tool
+ *  panel or the frame strip resizes the canvas area — the ResizeObserver
+ *  on #canvas-wrap re-renders for us when that happens. */
+function applyPanels() {
+  $('toolbar').hidden = !state.showTools;
+  $('layers-panel').hidden = !state.showLayers;
+  $('framebar').hidden = !state.showAnim;
+}
+bindToggle('chk-show-tools', 'showTools', applyPanels);
+bindToggle('chk-show-layers', 'showLayers', applyPanels);
+bindToggle('chk-show-anim', 'showAnim', applyPanels);
+
 /* --- Onion-skin settings popover (Procreate's Animation Assist knobs) ---
- * Reach, opacity, and the per-direction tints live behind the framebar's
- * Onion… button. The prev/next checkboxes above stay the master on/off
- * switches — this popover only shapes how the ghosts look. */
+ * Reach, opacity, and the per-direction tints live behind the Onion
+ * settings… button (in the Toggles menu since the merge that brought the
+ * two features together). The prev/next checkboxes above stay the master
+ * on/off switches — this popover only shapes how the ghosts look. */
 
 $('btn-onion-cfg').addEventListener('click', () => {
   $('onion-panel').hidden = !$('onion-panel').hidden;
@@ -2924,6 +4151,7 @@ function renderLayers() {
     const badges = document.createElement('span');
     badges.className = 'layer-badges';
     const parts = [];
+    if (m.kind === 'vector') parts.push('V'); // vector layer, at a glance
     if (m.opacity !== 1) parts.push(`${Math.round(m.opacity * 100)}%`);
     if (m.blend !== 'normal') parts.push(m.blend[0].toUpperCase());
     if (m.alphaLock) parts.push('\u{1F512}');
@@ -2958,7 +4186,7 @@ function insertLayer(meta, planeFor) {
   const at = state.layer + 1;
   state.layers.splice(at, 0, meta);
   for (const f of state.frames) {
-    const p = makePlane(planeFor ? planeFor(f) : null);
+    const p = makePlane(planeFor ? planeFor(f) : null, meta.kind === 'vector');
     if (planeFor && state.mode === 'pixel') repaintLayer(p); // free: drawn by makePlane
     f.layers.splice(at, 0, p);
   }
@@ -2970,14 +4198,47 @@ function insertLayer(meta, planeFor) {
 
 const addLayer = () =>
   insertLayer({ name: `Layer ${state.layers.length + 1}`, visible: true,
-                opacity: 1, blend: 'normal', alphaLock: false });
+                opacity: 1, blend: 'normal', alphaLock: false, kind: 'raster' });
+
+/**
+ * Make the active layer match the paint engine (8a, owner decision): hop to
+ * the NEWEST layer of the wanted kind, creating one if none exists — so a
+ * vector pen "just works" from a raster layer and vice versa, Procreate-
+ * style frictionless. Returns false only when a new layer was needed but
+ * the project is at the layer cap (insertLayer alerts).
+ */
+function ensureLayerKind(kind) {
+  if (state.layers[state.layer].kind === kind) return true;
+  for (let i = state.layers.length - 1; i >= 0; i--) {
+    if (state.layers[i].kind === kind) {
+      selectLayer(i);
+      flashHint(`Switched to ${kind} layer "${state.layers[i].name}".`);
+      return true;
+    }
+  }
+  if (state.layers.length >= MAX_LAYERS) {
+    flashHint(`This needs a ${kind} layer, but the project is at the layer cap.`);
+    return false;
+  }
+  const n = state.layers.length + 1;
+  insertLayer({ name: kind === 'vector' ? `Vector ${n}` : `Layer ${n}`,
+                visible: true, opacity: 1, blend: 'normal', alphaLock: false,
+                kind });
+  flashHint(`Created ${kind} layer "${state.layers[state.layer].name}".`);
+  return true;
+}
 
 const dupLayer = () => {
   const m = state.layers[state.layer];
   const li = state.layer;
+  // Vector planes duplicate by strokes (makePlane clones the list and
+  // re-renders its mirror); raster free planes by canvas; pixel by array.
   insertLayer({ name: `${m.name} copy`, visible: m.visible,
-                opacity: m.opacity, blend: m.blend, alphaLock: m.alphaLock },
-              (f) => (state.mode === 'free' ? f.layers[li].canvas : f.layers[li].pixels.slice()));
+                opacity: m.opacity, blend: m.blend, alphaLock: m.alphaLock,
+                kind: m.kind },
+              (f) => (m.kind === 'vector' ? f.layers[li].strokes
+                : state.mode === 'free' ? f.layers[li].canvas
+                : f.layers[li].pixels.slice()));
 };
 
 function deleteLayer() {
@@ -3014,6 +4275,35 @@ function moveLayer(dir) {
   recompositeAll();
   renderLayers();
 }
+
+/**
+ * One-way rasterize (8c): a vector layer's mirror canvases — already the
+ * rendered truth-by-proxy — BECOME the truth, exactly like any other
+ * freeform raster layer. Dropping the stroke lists is the only change, so
+ * the layer looks pixel-identical before and after. Not undoable (the
+ * layer-op policy); old vector history entries for these planes die and
+ * are skipped by applyHistory, same as entries for deleted layers.
+ */
+function rasterizeLayer() {
+  const m = state.layers[state.layer];
+  if (m.kind !== 'vector') {
+    flashHint('Only vector layers can be rasterized.');
+    return;
+  }
+  if (!confirm(`Rasterize layer "${m.name}" on every frame? Strokes become plain pixels — this can't be undone.`)) return;
+  commitFloat();
+  if (selection && selection.strokes) {
+    selection = null;
+    syncSelectBar();
+  }
+  for (const f of state.frames) delete f.layers[state.layer].strokes;
+  m.kind = 'raster';
+  renderLayers(); // the V badge goes away
+  updateStatus();
+  flashHint(`"${m.name}" is now a raster layer.`);
+}
+
+$('btn-layer-raster').addEventListener('click', rasterizeLayer);
 
 $('btn-layer-add').addEventListener('click', addLayer);
 $('btn-layer-dup').addEventListener('click', dupLayer);
@@ -3137,6 +4427,7 @@ function playTick() {
 function setPlaying(on) {
   if (on) commitFloat(); // a float belongs to the edited frame — land it first
   playing = on;
+  wrap.classList.toggle('playing', on); // CSS hides the ruler unit buttons
   $('btn-play').innerHTML = on ? '&#10074;&#10074; Pause' : '&#9654; Play';
   clearInterval(playTimer);
   playTimer = null;
@@ -3180,7 +4471,7 @@ $('btn-preview-close').addEventListener('click', () => {
 // Bump when the save format changes; loaders can then migrate old files.
 // v1: frames = [pixelArray]. v2: layers metadata + frames = [[layerPixels]].
 // v3: + mode field; freeform planes are PNG data-URL strings, not arrays.
-const PROJECT_VERSION = 3;
+const PROJECT_VERSION = 4; // v4 = v3 + vector layers (kind + stroke lists)
 
 /** Trigger a browser download of a Blob. */
 function download(filename, blob) {
@@ -3219,10 +4510,16 @@ function exportSheet() {
   state.frames.forEach((f, i) => {
     g.drawImage(f.canvas, (i % cols) * state.width, Math.floor(i / cols) * state.height);
   });
-  sheet.toBlob(
-    (blob) => download(`spritesheet-${state.width}x${state.height}-${n}f.png`, blob),
-    'image/png'
-  );
+  sheet.toBlob(async (blob) => {
+    // Print projects: tag the PNG with its physical density (pHYs chunk)
+    // so the file opens and prints at the true physical size elsewhere.
+    if (blob && state.intent === 'print') {
+      blob = new Blob(
+        [Exporters.addPngDpi(new Uint8Array(await blob.arrayBuffer()), state.dpi)],
+        { type: 'image/png' });
+    }
+    download(`spritesheet-${state.width}x${state.height}-${n}f.png`, blob);
+  }, 'image/png');
 }
 
 /* ---- Animation exports (encoders live in export.js) ---- */
@@ -3268,7 +4565,8 @@ $('btn-export-gif').addEventListener('click', (e) => runExport(e.currentTarget, 
 }));
 
 $('btn-export-apng').addEventListener('click', (e) => runExport(e.currentTarget, async () => {
-  const bytes = Exporters.encodeAPNG(await framePNGs(), fps());
+  let bytes = Exporters.encodeAPNG(await framePNGs(), fps());
+  if (state.intent === 'print') bytes = Exporters.addPngDpi(bytes, state.dpi);
   // .png, not .apng: an APNG is a valid PNG, and .png uploads anywhere.
   download(`animation-${exportBase()}.png`, new Blob([bytes], { type: 'image/png' }));
 }));
@@ -3285,7 +4583,7 @@ $('btn-export-zip').addEventListener('click', (e) => runExport(e.currentTarget, 
   const pad = String(pngs.length).length;
   const files = pngs.map((data, i) => ({
     name: `frame-${String(i + 1).padStart(pad, '0')}.png`,
-    data,
+    data: state.intent === 'print' ? Exporters.addPngDpi(data, state.dpi) : data,
   }));
   download(`frames-${exportBase()}.zip`,
     new Blob([Exporters.encodeZIP(files)], { type: 'application/zip' }));
@@ -3294,9 +4592,20 @@ $('btn-export-zip').addEventListener('click', (e) => runExport(e.currentTarget, 
 /** Serialize the whole project (frames, layers, palette, size, fps) and download it. */
 function saveProject() {
   commitFloat(); // a floating selection should be in the saved pixels
+  const anyVector = state.layers.some((m) => m.kind === 'vector');
+  // Print metadata rides along additively (absent = digital, like pre-print
+  // files) — parseProject treats it as optional, so no version bump.
+  const printMeta = state.intent === 'print'
+    ? { intent: 'print', unit: state.unit, dpi: state.dpi } : {};
+  // Coords round to 1/100 art px on save — invisible, and it keeps stroke
+  // JSON from carrying 15 digits of pointer noise per point.
+  const r2 = (v) => Math.round(v * 100) / 100;
   const data = {
     app: 'sprite-sheet-maker', // marker so we can recognize our own files
-    version: PROJECT_VERSION,
+    // A project with no vector layers still writes v3, so files stay
+    // loadable by the deployed pre-Phase-8 app until vector art appears.
+    version: anyVector ? PROJECT_VERSION : 3,
+    ...printMeta,
     mode: state.mode,
     width: state.width,
     height: state.height,
@@ -3307,12 +4616,20 @@ function saveProject() {
     layers: state.layers.map((m) => ({
       name: m.name, visible: m.visible,
       opacity: m.opacity, blend: m.blend, alphaLock: m.alphaLock,
+      ...(m.kind === 'vector' ? { kind: 'vector' } : {}),
     })),
     // Pixel planes save as hex arrays (diff-able, hand-fixable). Freeform
-    // planes save as PNG data-URLs — the plane's canvas is the truth there,
-    // and lossless PNG is hugely smaller than a per-pixel string array.
+    // raster planes save as PNG data-URLs — the plane's canvas is the truth
+    // there, and lossless PNG is hugely smaller than a per-pixel string
+    // array. Vector planes (v4) save their stroke lists — the truth — and
+    // re-rasterize on load.
     frames: state.frames.map((f) => f.layers.map((l) =>
-      state.mode === 'free' ? l.canvas.toDataURL('image/png') : l.pixels)),
+      l.strokes
+        ? { strokes: l.strokes.map((s) => ({
+            color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
+            pts: s.pts.map((p) => [r2(p[0]), r2(p[1]), r2(p[2])]),
+          })) }
+        : state.mode === 'free' ? l.canvas.toDataURL('image/png') : l.pixels)),
   };
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
   download(`sprite-project-${state.width}x${state.height}-${state.frames.length}f.json`, blob);
@@ -3354,6 +4671,34 @@ async function parseProject(text) {
     Array.isArray(px) && px.length === w * h
       ? px.map((c) => (isColor(c) ? c.toLowerCase() : null))
       : null;
+  // One saved vector stroke, validated field-by-field (the file may be
+  // hand-edited or truncated): a bad point voids the stroke, a bad stroke
+  // is dropped rather than rejecting the whole file — matching the "bad
+  // pixels become transparent" policy above.
+  const cleanStroke = (s) => {
+    if (!s || !Array.isArray(s.pts) || !s.pts.length) return null;
+    const pts = [];
+    for (const p of s.pts) {
+      const x = Array.isArray(p) ? +p[0] : NaN;
+      const y = Array.isArray(p) ? +p[1] : NaN;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      const pr = +p[2];
+      pts.push([x, y, Number.isFinite(pr) ? clamp(pr, 0.01, 1) : 1]);
+    }
+    return {
+      color: isColor(s.color) ? s.color.toLowerCase() : '#000000',
+      w: clamp(+s.w || 1, 1, MAX_BRUSH_FREE),
+      opacity: typeof s.opacity === 'number' ? clamp(s.opacity, 0.01, 1) : 1,
+      pen: s.pen === 'marker' ? 'marker' : 'pen',
+      pts,
+    };
+  };
+  // A saved vector plane is { strokes: [...] } — returns the cleaned strokes
+  // ARRAY (what makePlane takes as `src` for a vector layer).
+  const cleanVecPlane = (px) =>
+    px && typeof px === 'object' && Array.isArray(px.strokes)
+      ? px.strokes.map(cleanStroke).filter(Boolean)
+      : null;
 
   let layers;
   const frames = [];
@@ -3376,12 +4721,19 @@ async function parseProject(text) {
         ? m.opacity : 1,
       blend: m && BLEND_MODES.includes(m.blend) ? m.blend : 'normal',
       alphaLock: !!m && m.alphaLock === true,
+      // v4: vector layers. Only meaningful in freeform files; anything
+      // else (or any older version) normalizes to raster.
+      kind: mode === 'free' && d.version >= 4 && m && m.kind === 'vector'
+        ? 'vector' : 'raster',
     }));
     for (const fl of d.frames) {
       if (!Array.isArray(fl) || fl.length !== layers.length) return null;
       const planes = [];
-      for (const px of fl) {
-        const p = mode === 'free' ? await decodePlane(px, w, h) : cleanPlane(px);
+      for (let li = 0; li < fl.length; li++) {
+        const px = fl[li];
+        const p = layers[li].kind === 'vector' ? cleanVecPlane(px)
+          : mode === 'free' ? await decodePlane(px, w, h)
+          : cleanPlane(px);
         if (!p) return null;
         planes.push(p);
       }
@@ -3393,6 +4745,10 @@ async function parseProject(text) {
     w, h, frames, layers, mode,
     palette: palette.length ? palette : null,
     fps: parseInt(d.fps, 10) || null,
+    // Print metadata (optional, additive): absent or invalid = digital.
+    intent: d.intent === 'print' ? 'print' : 'digital',
+    unit: ['in', 'cm'].includes(d.unit) ? d.unit : 'px',
+    dpi: parseInt(d.dpi, 10) || null,
   };
 }
 
@@ -3450,7 +4806,9 @@ async function importImage(file) {
   }
   if (anyArt() && !confirm('Import image? Current frames will be replaced.')) return;
 
-  if ($('mode-free').checked) {
+  // The Print radio counts as freeform here (a printed import is painted
+  // art, not a pixel grid) — only the Pixel radio takes the flatten path.
+  if ($('mode-free').checked || $('mode-print').checked) {
     // Freeform planes take anything drawImage accepts — hand each frame a
     // canvas holding its slice of the image (the whole image when count=1).
     // No ImageData round-trip, so every alpha value carries over untouched.
@@ -3512,49 +4870,551 @@ $('inp-file').addEventListener('change', async (e) => {
     return;
   }
   if (anyArt() && !confirm('Load project? Current frames will be replaced.')) return;
-  newProject(proj.w, proj.h, proj.frames, proj.layers, proj.palette, proj.fps, proj.mode);
+  // proj doubles as the extra-metadata bag (intent/unit/dpi ride on it).
+  newProject(proj.w, proj.h, proj.frames, proj.layers, proj.palette, proj.fps, proj.mode, proj);
 });
 
 /* ======================================================================
  * Color & palette UI
  * ==================================================================== */
 
-/** Make `c` the active color and sync the picker + swatch highlight. */
-function selectColor(c) {
-  state.color = c;
-  $('inp-color').value = c;
-  renderPalette();
+/* ---- Print color feedback (owner request): approximate CMYK, no ICC ---- */
+
+/** Naive sRGB → CMYK device percentages (0..1). Labeled approximate:
+ *  real presses need ICC profiles, but this is the standard formula every
+ *  hobby tool shows and it makes ink coverage readable. */
+function rgbToCmyk(r, g, b) {
+  const R = r / 255, G = g / 255, B = b / 255;
+  const k = 1 - Math.max(R, G, B);
+  if (k >= 1) return { c: 0, m: 0, y: 0, k: 1 };
+  return { c: (1 - R - k) / (1 - k), m: (1 - G - k) / (1 - k),
+           y: (1 - B - k) / (1 - k), k };
 }
 
-/** Auto-add a color to the palette the first time it's actually painted with. */
-function addUsedColor(c) {
-  if (state.palette.includes(c)) return;
-  state.palette.push(c);
-  if (state.palette.length > MAX_PALETTE) state.palette.shift();
+// Measured-ish reflectances of real process inks (each ink absorbs a bit of
+// the "wrong" channels too — the reason printed neon green comes out dull).
+// Simulation: start from white paper, multiply each channel down per ink.
+const PROOF_INKS = [
+  [0.16, 0.55, 0.75], // cyan
+  [0.85, 0.19, 0.45], // magenta
+  [0.93, 0.90, 0.17], // yellow
+  [0.05, 0.05, 0.06], // black (near-total absorption, or grays print washed)
+];
+
+/** Simulate how (r,g,b) prints with process inks — the soft-proof color.
+ *  PURE; also drives the out-of-gamut warning (big delta = will dull). */
+function proofRgb(r, g, b) {
+  const { c, m, y, k } = rgbToCmyk(r, g, b);
+  const amt = [c, m, y, k];
+  const out = [1, 1, 1];
+  for (let i = 0; i < 4; i++) {
+    for (let ch = 0; ch < 3; ch++) out[ch] *= 1 - amt[i] * (1 - PROOF_INKS[i][ch]);
+  }
+  return [Math.round(out[0] * 255), Math.round(out[1] * 255), Math.round(out[2] * 255)];
+}
+
+/** Update the CMYK readout under the color well (print projects only):
+ *  ink percentages for the active color, plus a ⚠ when the printed color
+ *  will differ visibly from the screen color (out of the ink gamut). */
+function updateCmykReadout() {
+  const el = $('cmyk-readout');
+  if (state.intent !== 'print') { el.textContent = ''; return; }
+  const [r, g, b] = hexToRGB(state.color);
+  const { c, m, y, k } = rgbToCmyk(r, g, b);
+  const pct = (v) => Math.round(v * 100);
+  const sim = proofRgb(r, g, b);
+  const off = Math.max(Math.abs(sim[0] - r), Math.abs(sim[1] - g), Math.abs(sim[2] - b)) > 40;
+  el.textContent = `C${pct(c)} M${pct(m)} Y${pct(y)} K${pct(k)}${off ? ' ⚠' : ''}`;
+  el.title = off
+    ? 'Approximate ink coverage. ⚠ this color sits outside the printable gamut — it will print duller than it looks on screen (see Toggles → Print proof).'
+    : 'Approximate ink coverage for this color (no ICC profile — a guide, not a promise).';
+}
+
+/** Make `c` the active color and sync the picker + swatch highlight.
+ *  With vector strokes selected, picking a color also RECOLORS them (the
+ *  Illustrator convention) — except when the color came from the
+ *  eyedropper (`fromPick`), which is a read, not an assignment. */
+function selectColor(c, fromPick) {
+  state.color = c;
+  $('inp-color').value = c;
+  if (!fromPick) editSelectedStrokes('recolor', (s) => { s.color = c; });
   renderPalette();
+  updateCmykReadout();
+}
+
+/** Record a color the moment it's actually painted with. Auto-add feeds the
+ *  RECENTS palette only (owner decision, to-do #8): named palettes are
+ *  curated and never change on their own. When Recents is the active row
+ *  the strip mirrors it — which is exactly the pre-#8 auto-add behavior. */
+function addUsedColor(c) {
+  if (recentColors.includes(c)) return;
+  recentColors.push(c);
+  if (recentColors.length > MAX_PALETTE) recentColors.shift();
+  if (activePalId === 'recents') {
+    state.palette = recentColors.slice();
+    renderPalette();
+  }
+  persistPalettes();
+  renderPaletteList();
 }
 
 /** Rebuild the swatch grid. Small enough that full rebuilds are simplest. */
 function renderPalette() {
   const pal = $('palette');
   pal.innerHTML = '';
-  for (const c of state.palette) {
+  state.palette.forEach((c, i) => {
     const b = document.createElement('button');
     b.className = 'swatch' + (c === state.color ? ' active' : '');
     b.style.background = c;
-    b.title = c;
-    b.addEventListener('click', () => selectColor(c));
+    b.title = `${c} — double-click to edit, drag to reorder, right-click to remove`;
+    b.dataset.i = i; // the reorder drop target reads this back
+    b.addEventListener('click', () => {
+      if (palDragMoved) return; // that "click" was the tail of a reorder drag
+      selectColor(c);
+    });
+    b.addEventListener('dblclick', () => beginSwatchEdit(i));
     b.addEventListener('contextmenu', (ev) => {
       ev.preventDefault();
       state.palette = state.palette.filter((x) => x !== c);
       renderPalette();
+      stripEdited();
     });
+    b.addEventListener('pointerdown', (ev) => beginSwatchDrag(ev, b, i));
     pal.appendChild(b);
-  }
+  });
+  // With auto-add rerouted to Recents, adding a color to a curated strip
+  // needs an explicit control: the strip ends in a "+" for the current color.
+  const add = document.createElement('button');
+  add.className = 'swatch swatch-add';
+  add.textContent = '+';
+  add.title = 'Add the current color to this palette';
+  add.addEventListener('click', addCurrentToStrip);
+  pal.appendChild(add);
 }
 
 // 'input' fires continuously while dragging inside the picker — live preview.
 $('inp-color').addEventListener('input', (e) => selectColor(e.target.value));
+
+/* ======================================================================
+ * Palette library (to-do #8) — named palettes in a floating panel
+ * ==================================================================== */
+// The brush library's twin: one row per palette (name over a strip of color
+// chips), the selected row highlighted, [+] imports a .hex/.gpl file, user
+// rows carry a ✕. Palettes are a WORKSPACE asset like brushes — user
+// palettes, the Recents list, and the active row live in localStorage and
+// never enter project files. The project keeps saving its working strip
+// (`state.palette`) exactly as before, so the save format is untouched and
+// the deployed app reads new files unchanged.
+//
+// Curation model (owner-approved): a named palette only changes when the
+// user edits it. Painting feeds the special "Recents" row instead (see
+// addUsedColor). Editing the strip while a USER palette is active writes
+// back into it live; editing while a PRESET or Recents is active detaches
+// the strip (no row highlighted) — "Save as…" keeps the result.
+
+// Built-in classics, all ≤ MAX_PALETTE colors. (NES was considered and
+// skipped: its 54 colors exceed the 32-swatch strip.) Palettes are lists of
+// colors, not copyrightable works — shipping them is standard practice.
+const PAL_PRESETS = [
+  { id: 'p-sweetie', name: 'Sweetie 16', preset: true, colors: DEFAULT_PALETTE },
+  { id: 'p-pico8', name: 'PICO-8', preset: true, colors: [
+    '#000000', '#1d2b53', '#7e2553', '#008751',
+    '#ab5236', '#5f574f', '#c2c3c7', '#fff1e8',
+    '#ff004d', '#ffa300', '#ffec27', '#00e436',
+    '#29adff', '#83769c', '#ff77a8', '#ffccaa',
+  ] },
+  { id: 'p-gameboy', name: 'Game Boy', preset: true, colors: [
+    '#0f380f', '#306230', '#8bac0f', '#9bbc0f',
+  ] },
+  { id: 'p-db16', name: 'DawnBringer 16', preset: true, colors: [
+    '#140c1c', '#442434', '#30346d', '#4e4a4e',
+    '#854c30', '#346524', '#d04648', '#757161',
+    '#597dce', '#d27d2c', '#8595a1', '#6daa2c',
+    '#d2aa99', '#6dc2ca', '#dad45e', '#deeed6',
+  ] },
+  { id: 'p-db32', name: 'DawnBringer 32', preset: true, colors: [
+    '#000000', '#222034', '#45283c', '#663931',
+    '#8f563b', '#df7126', '#d9a066', '#eec39a',
+    '#fbf236', '#99e550', '#6abe30', '#37946e',
+    '#4b692f', '#524b24', '#323c39', '#3f3f74',
+    '#306082', '#5b6ee1', '#639bff', '#5fcde4',
+    '#cbdbfc', '#ffffff', '#9badb7', '#847e87',
+    '#696a6a', '#595652', '#76428a', '#ac3232',
+    '#d95763', '#d77bba', '#8f974a', '#8a6f30',
+  ] },
+  { id: 'p-endesga', name: 'Endesga 32', preset: true, colors: [
+    '#be4a2f', '#d77643', '#ead4aa', '#e4a672',
+    '#b86f50', '#733e39', '#3e2731', '#a22633',
+    '#e43b44', '#f77622', '#feae34', '#fee761',
+    '#63c74d', '#3e8948', '#265c42', '#193c3e',
+    '#124e89', '#0099db', '#2ce8f5', '#ffffff',
+    '#c0cbdc', '#8b9bb4', '#5a6988', '#3a4466',
+    '#262b44', '#181425', '#ff0044', '#68386c',
+    '#b55088', '#f6757a', '#e8b796', '#c28569',
+  ] },
+];
+
+let userPalettes = [];         // [{id, name, colors}] — localStorage-backed
+let recentColors = [];         // the auto-add list (the old strip behavior)
+let activePalId = 'p-sweetie'; // highlighted row; null = the strip diverged
+                               // (boot default strip IS Sweetie 16)
+
+const isPalColor = (c) => typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c);
+const sameColors = (a, b) => a.length === b.length && a.every((c, i) => c === b[i]);
+
+// Recents presents as a palette row, but its colors are the live list —
+// built on demand so the row can never go stale.
+const recentsPal = () => ({ id: 'recents', name: 'Recents', recents: true, colors: recentColors });
+
+function getPalette(id) {
+  if (id === 'recents') return recentsPal();
+  return PAL_PRESETS.find((p) => p.id === id) ||
+         userPalettes.find((p) => p.id === id) || null;
+}
+
+function persistPalettes() {
+  try {
+    localStorage.setItem('ssm.palettes', JSON.stringify(userPalettes));
+    localStorage.setItem('ssm.recentColors', JSON.stringify(recentColors));
+    localStorage.setItem('ssm.palette', activePalId || '');
+  } catch { /* storage full or blocked — palettes just won't survive reload */ }
+}
+
+/** Bring back user palettes, Recents, and the active row from localStorage,
+ *  then point the working strip at the restored selection. */
+function loadStoredPalettes() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('ssm.palettes') || 'null');
+    if (Array.isArray(saved)) {
+      userPalettes = saved
+        .filter((p) => p && typeof p.name === 'string' && Array.isArray(p.colors))
+        .map((p) => ({
+          id: typeof p.id === 'string' ? p.id : `u-${Math.random()}`,
+          name: p.name,
+          colors: p.colors.filter(isPalColor).map((c) => c.toLowerCase()).slice(0, MAX_PALETTE),
+        }));
+    }
+    const rec = JSON.parse(localStorage.getItem('ssm.recentColors') || 'null');
+    if (Array.isArray(rec)) {
+      recentColors = rec.filter(isPalColor).map((c) => c.toLowerCase()).slice(0, MAX_PALETTE);
+    }
+    const sel = localStorage.getItem('ssm.palette');
+    // First run keeps the boot default ('p-sweetie' — the strip already is
+    // Sweetie 16); a stored '' means the user left the strip detached.
+    if (sel !== null) activePalId = sel && getPalette(sel) ? sel : null;
+  } catch { /* corrupt storage — fall through with whatever validated */ }
+  const pal = activePalId && getPalette(activePalId);
+  if (pal && !sameColors(pal.colors, state.palette)) {
+    state.palette = pal.colors.slice();
+    renderPalette();
+  }
+  renderPaletteList();
+}
+
+/** Make a library row's colors the working strip. */
+function selectPalette(id) {
+  const pal = getPalette(id);
+  if (!pal) return;
+  activePalId = id;
+  state.palette = pal.colors.slice();
+  persistPalettes();
+  renderPalette();
+  renderPaletteList();
+}
+
+/** Every explicit strip mutation (add / remove / edit / reorder) funnels
+ *  here: user palettes take the edit live, presets and Recents detach. */
+function stripEdited() {
+  const pal = activePalId && getPalette(activePalId);
+  if (pal && !pal.preset && !pal.recents) {
+    pal.colors = state.palette.slice();
+  } else if (pal) {
+    activePalId = null; // the strip diverged — "Save as…" keeps it
+  }
+  persistPalettes();
+  renderPaletteList();
+}
+
+/** Loaded project files carry their own strip, which may not match the
+ *  library's active row — drop the highlight rather than lie about it. */
+function syncPaletteDivergence() {
+  const pal = activePalId && getPalette(activePalId);
+  if (pal && !sameColors(pal.colors, state.palette)) {
+    activePalId = null;
+    persistPalettes();
+  }
+  renderPaletteList();
+}
+
+function addCurrentToStrip() {
+  if (state.palette.includes(state.color)) {
+    flashHint('That color is already in this palette.');
+    return;
+  }
+  if (state.palette.length >= MAX_PALETTE) {
+    flashHint(`Palettes hold at most ${MAX_PALETTE} colors.`);
+    return;
+  }
+  state.palette.push(state.color);
+  renderPalette();
+  stripEdited();
+}
+
+/* ---- In-place swatch editing (double-click) ---- */
+
+let editSwatch = -1; // strip index being edited through the invisible picker
+
+function beginSwatchEdit(i) {
+  editSwatch = i;
+  const inp = $('inp-swatch-edit');
+  inp.value = state.palette[i];
+  inp.click(); // opens the native picker — we're inside a user gesture
+}
+
+// 'input' streams while the user drags inside the picker — live edits.
+$('inp-swatch-edit').addEventListener('input', (e) => {
+  if (editSwatch < 0 || editSwatch >= state.palette.length) return;
+  const v = e.target.value;
+  const old = state.palette[editSwatch];
+  state.palette[editSwatch] = v;
+  // Editing the swatch you're painting with follows through to the working
+  // color — but as curation, not assignment: selected vector strokes keep
+  // their color (unlike clicking a swatch, which recolors them).
+  if (state.color === old) {
+    state.color = v;
+    $('inp-color').value = v;
+    updateCmykReadout();
+  }
+  renderPalette();
+  stripEdited();
+});
+$('inp-swatch-edit').addEventListener('change', () => { editSwatch = -1; });
+
+/* ---- Swatch drag-reorder ---- */
+
+/** Reorder helper: move arr[from] so it lands at index `to`. PURE. */
+function movePalette(arr, from, to) {
+  const out = arr.slice();
+  out.splice(to, 0, out.splice(from, 1)[0]);
+  return out;
+}
+
+// Set when a reorder drag just ended, so the click that the browser fires
+// right after the pointerup doesn't ALSO select the dragged swatch. Cleared
+// on a microtask delay because that click may never arrive (the strip was
+// just rebuilt out from under it).
+let palDragMoved = false;
+
+function beginSwatchDrag(ev, btn, from) {
+  if (ev.button !== 0) return;
+  const x0 = ev.clientX;
+  const y0 = ev.clientY;
+  let moved = false;
+  btn.setPointerCapture(ev.pointerId);
+  // The drop slot is whatever swatch sits under the pointer (capture means
+  // move events keep firing on the grabbed button, not the one underneath).
+  const slotUnder = (e) => {
+    if (!moved) {
+      // NaN-safe: synthetic events without coordinates never start a drag.
+      if (!(Math.hypot(e.clientX - x0, e.clientY - y0) >= 5)) return null;
+      moved = true;
+    }
+    const el = document.elementFromPoint ? document.elementFromPoint(e.clientX, e.clientY) : null;
+    const t = el && el.closest && el.closest('#palette .swatch');
+    return t && t.dataset.i !== undefined ? t : null;
+  };
+  const mv = (e) => {
+    const t = slotUnder(e);
+    for (const s of $('palette').children) s.classList.toggle('drop', s === t);
+  };
+  const up = (e) => {
+    btn.removeEventListener('pointermove', mv);
+    btn.removeEventListener('pointerup', up);
+    const t = slotUnder(e);
+    for (const s of $('palette').children) s.classList.remove('drop');
+    if (!moved) return;
+    palDragMoved = true;
+    setTimeout(() => { palDragMoved = false; }, 0);
+    if (t) {
+      state.palette = movePalette(state.palette, from, parseInt(t.dataset.i, 10));
+      renderPalette();
+      stripEdited();
+    }
+  };
+  btn.addEventListener('pointermove', mv);
+  btn.addEventListener('pointerup', up);
+}
+
+/* ---- The library panel ---- */
+
+/** Rebuild the panel's rows (small enough that full rebuilds are simplest):
+ *  presets, then user palettes, then Recents pinned at the bottom. */
+function renderPaletteList() {
+  const box = $('palette-list');
+  box.innerHTML = '';
+  for (const p of [...PAL_PRESETS, ...userPalettes, recentsPal()]) {
+    const row = document.createElement('div');
+    row.className = 'pal' + (p.id === activePalId ? ' active' : '');
+    row.dataset.pid = p.id;
+    const name = document.createElement('span');
+    name.textContent = p.recents ? 'Recents (auto)' : p.name;
+    name.title = p.recents
+      ? `Every color you actually paint with lands here (newest last, capped at ${MAX_PALETTE})`
+      : p.preset
+        ? `${p.name} — built in. Editing the strip detaches it; Save as… keeps your version.`
+        : `${p.name} — double-click to rename`;
+    if (!p.preset && !p.recents) {
+      name.addEventListener('dblclick', (ev) => {
+        ev.stopPropagation();
+        const n = prompt('Rename palette:', p.name);
+        if (n && n.trim()) {
+          p.name = n.trim();
+          persistPalettes();
+          renderPaletteList();
+        }
+      });
+    }
+    row.appendChild(name);
+    if (!p.preset && !p.recents) {
+      const del = document.createElement('button');
+      del.className = 'pal-del';
+      del.textContent = '✕';
+      del.title = 'Delete this palette';
+      del.addEventListener('click', (ev) => {
+        ev.stopPropagation(); // don't also select the row
+        if (!confirm(`Delete palette "${p.name}"?`)) return;
+        userPalettes = userPalettes.filter((x) => x !== p);
+        if (activePalId === p.id) activePalId = null; // the strip keeps the colors
+        persistPalettes();
+        renderPaletteList();
+      });
+      row.appendChild(del);
+    }
+    const chips = document.createElement('div');
+    chips.className = 'pal-chips';
+    if (p.colors.length) {
+      for (const c of p.colors) {
+        const chip = document.createElement('i');
+        chip.style.background = c;
+        chips.appendChild(chip);
+      }
+    } else {
+      chips.textContent = '(empty)';
+    }
+    row.appendChild(chips);
+    row.addEventListener('click', () => selectPalette(p.id));
+    box.appendChild(row);
+  }
+}
+
+function createUserPalette(name, colors) {
+  const p = {
+    id: `u-${Date.now()}-${userPalettes.length}`,
+    name,
+    colors: colors.slice(0, MAX_PALETTE),
+  };
+  userPalettes.push(p);
+  selectPalette(p.id); // also persists + re-renders both views
+  return p;
+}
+
+/* ---- Palette file formats (all PURE — unit-tested headlessly) ---- */
+
+/** Serialize a color list as a Lospec .hex file: one rrggbb per line, no '#'. */
+const paletteToHexFile = (colors) => colors.map((c) => c.slice(1)).join('\n') + '\n';
+
+/** Parse a Lospec-style .hex palette: one hex color per line ('#' optional,
+ *  3-digit shorthand accepted), anything unparseable skipped, deduped,
+ *  capped at MAX_PALETTE. */
+function parseHexPalette(text) {
+  const out = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    let s = raw.trim().replace(/^#/, '');
+    if (/^[0-9a-f]{3}$/i.test(s)) s = s.replace(/./g, (ch) => ch + ch);
+    if (!/^[0-9a-f]{6}$/i.test(s)) continue;
+    const c = '#' + s.toLowerCase();
+    if (!out.includes(c)) out.push(c);
+    if (out.length === MAX_PALETTE) break;
+  }
+  return out;
+}
+
+/** Parse a GIMP .gpl palette → {name, colors}. Header lines ("GIMP
+ *  Palette", "Name: …", "Columns: …") and '#' comments skip; color lines
+ *  are "R G B [name]". */
+function parseGplPalette(text) {
+  let name = null;
+  const colors = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line === 'GIMP Palette' || line.startsWith('#') || /^Columns:/i.test(line)) continue;
+    const nm = line.match(/^Name:\s*(.*)$/i);
+    if (nm) { name = nm[1].trim() || null; continue; }
+    const m = line.match(/^(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})/);
+    if (!m) continue;
+    const c = '#' + [1, 2, 3]
+      .map((i) => clamp(parseInt(m[i], 10), 0, 255).toString(16).padStart(2, '0'))
+      .join('');
+    if (!colors.includes(c)) colors.push(c);
+    if (colors.length === MAX_PALETTE) break;
+  }
+  return { name, colors };
+}
+
+async function importPaletteFile(file) {
+  let text;
+  try {
+    text = await file.text();
+  } catch {
+    alert('Could not read that file.');
+    return;
+  }
+  // Sniff the format from the content, not the extension — a .gpl renamed
+  // to .txt should still work.
+  const gpl = /^\s*GIMP Palette/.test(text) ? parseGplPalette(text) : null;
+  const colors = gpl ? gpl.colors : parseHexPalette(text);
+  if (!colors.length) {
+    alert('No colors found — expected a .hex file (one hex color per line) or a GIMP .gpl palette.');
+    return;
+  }
+  const fallback = (file.name || 'Imported').replace(/\.[^.]+$/, '') || 'Imported';
+  createUserPalette((gpl && gpl.name) || fallback, colors);
+}
+
+/* ---- Wiring ---- */
+
+$('btn-palette-lib').addEventListener('click', () => {
+  $('palette-panel').hidden = !$('palette-panel').hidden;
+});
+$('btn-pal-close').addEventListener('click', () => {
+  $('palette-panel').hidden = true;
+});
+$('btn-pal-new').addEventListener('click', () => {
+  const name = prompt('Name the new palette:', `Palette ${userPalettes.length + 1}`);
+  if (!name || !name.trim()) return;
+  // Seeded with the current color — an empty strip would have nothing but a "+".
+  createUserPalette(name.trim(), [state.color]);
+});
+$('btn-pal-save').addEventListener('click', () => {
+  const name = prompt('Save the current strip as:', `Palette ${userPalettes.length + 1}`);
+  if (!name || !name.trim()) return;
+  createUserPalette(name.trim(), state.palette.slice());
+});
+$('btn-pal-export').addEventListener('click', () => {
+  const pal = activePalId && getPalette(activePalId);
+  const base = (((pal && !pal.recents) ? pal.name : 'palette') || 'palette')
+    .replace(/[^\w-]+/g, '-');
+  download(`${base}.hex`, new Blob([paletteToHexFile(state.palette)], { type: 'text/plain' }));
+});
+$('btn-pal-import').addEventListener('click', () => $('inp-pal-file').click());
+$('inp-pal-file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = ''; // so re-importing the same file still fires 'change'
+  if (file) await importPaletteFile(file);
+});
+
+// The panel drags by its header, same deal as the brush/layers panels.
+makePanelDraggable('palette-panel', 'palette-head');
 
 /* ======================================================================
  * Brush library panel (Phase 7) — freeform brush picker & PNG imports
@@ -3608,8 +5468,12 @@ async function loadStoredBrushes() {
       });
     }
   }
-  if (sel && brushes.some((b) => b.id === sel)) state.brush = sel;
-  renderBrushList();
+  if (sel && (brushes.some((b) => b.id === sel) ||
+              VECTOR_BRUSHES.some((b) => b.id === sel))) {
+    state.brush = sel;
+  }
+  // Open the library on the tab holding the restored selection.
+  setBrushTab(curBrush().kind === 'vector' ? 'vector' : 'bitmap');
   syncBrushUI();
 }
 
@@ -3624,6 +5488,20 @@ function drawBrushPreview(cv, b) {
   const h = cv.height;
   g.clearRect(0, 0, w, h);
   const size = h * 0.62;
+  if (b.kind === 'vector') {
+    // Vector pens preview with the real single-fill renderer along the
+    // same S, pressure-tapered for Pen, uniform for Marker.
+    const vpad = size / 2 + 2;
+    const proto = { color: '#f4f4f4', w: size, pen: b.pen, pts: [] };
+    for (let i = 0; i <= 24; i++) {
+      const t = i / 24;
+      proto.pts.push([vpad + t * (w - 2 * vpad),
+                      h / 2 + Math.sin(t * Math.PI * 2) * h * 0.16,
+                      0.25 + 0.75 * Math.sin(t * Math.PI)]);
+    }
+    drawVecStroke(g, proto);
+    return;
+  }
   const tip = buildTip(b, '#f4f4f4', Math.max(2, Math.round(size)), 0.8);
   const pad = size / 2 + 2;
   const spacing = Math.max(1, size * STAMP_SPACING);
@@ -3645,11 +5523,24 @@ function drawBrushPreview(cv, b) {
   }
 }
 
+// Which library tab is showing. UI-only state — the SELECTED brush (which
+// may live on the other tab) is what decides the paint engine.
+let brushTab = 'bitmap';
+
+function setBrushTab(tab) {
+  brushTab = tab;
+  $('tab-bitmap').classList.toggle('active', tab === 'bitmap');
+  $('tab-vector').classList.toggle('active', tab === 'vector');
+  // Imports are bitmap masks; the + button means nothing on the vector tab.
+  $('btn-brush-import').hidden = tab === 'vector';
+  renderBrushList();
+}
+
 /** Rebuild the library list (small enough that full rebuilds are simplest). */
 function renderBrushList() {
   const box = $('brush-list');
   box.innerHTML = '';
-  for (const b of brushes) {
+  for (const b of (brushTab === 'vector' ? VECTOR_BRUSHES : brushes)) {
     const row = document.createElement('div');
     row.className = 'brush' + (b.id === state.brush ? ' active' : '');
     const name = document.createElement('span');
@@ -3743,6 +5634,8 @@ async function importBrushFile(file) {
 $('btn-brush-lib').addEventListener('click', () => {
   $('brush-panel').hidden = !$('brush-panel').hidden;
 });
+$('tab-bitmap').addEventListener('click', () => setBrushTab('bitmap'));
+$('tab-vector').addEventListener('click', () => setBrushTab('vector'));
 $('btn-brush-close').addEventListener('click', () => {
   $('brush-panel').hidden = true;
 });
@@ -3807,12 +5700,16 @@ const toolLabel = () =>
 /** The mode's tip-size ceiling (freeform canvases warrant fatter brushes). */
 const maxBrush = () => (state.mode === 'free' ? MAX_BRUSH_FREE : MAX_BRUSH);
 
-/** Set the brush/eraser tip size, keeping slider, number box & status in sync. */
+/** Set the brush/eraser tip size, keeping slider, number box & status in sync.
+ *  With vector strokes selected, the slider RE-WIDTHS them instead (set to
+ *  the slider's absolute value — "make these 6px" reads predictably). */
 function setBrushSize(n) {
   state.brushSize = clamp(n, 1, maxBrush());
   $('inp-brush-size').value = state.brushSize;
   $('size-num').value = state.brushSize;
   $('st-tool').textContent = toolLabel();
+  const w = state.brushSize;
+  editSelectedStrokes('width', (s) => { s.w = w; });
   render(); // the hover footprint changed size
 }
 
@@ -3895,18 +5792,28 @@ function updateUI() {
   updateStatus();
 }
 
-// File menu: a small dropdown holding New / Save / Load.
+// File menu: a small dropdown holding New / Save / Load. The Toggles menu
+// next to it works the same way; opening either closes the other.
 const fileMenu = $('file-menu');
+const togglesMenu = $('toggles-menu');
 $('btn-file').addEventListener('click', (e) => {
   e.stopPropagation(); // or the document click handler below would re-close it
   e.currentTarget.blur(); // stopPropagation also skips the global blur handler
+  togglesMenu.hidden = true;
   fileMenu.hidden = !fileMenu.hidden;
 });
-// Clicking anywhere outside the menu closes it; clicking inside keeps it open
-// (so the W/H inputs are usable) — except the action buttons, which close it
-// themselves below.
+$('btn-toggles').addEventListener('click', (e) => {
+  e.stopPropagation();
+  e.currentTarget.blur();
+  fileMenu.hidden = true;
+  togglesMenu.hidden = !togglesMenu.hidden;
+});
+// Clicking anywhere outside a menu closes it; clicking inside keeps it open
+// (so the W/H inputs are usable, and several toggles can be flipped in one
+// visit) — except the File action buttons, which close it themselves below.
 document.addEventListener('click', (e) => {
   if (!fileMenu.hidden && !fileMenu.contains(e.target)) fileMenu.hidden = true;
+  if (!togglesMenu.hidden && !togglesMenu.contains(e.target)) togglesMenu.hidden = true;
 });
 for (const id of ['btn-new', 'btn-save', 'btn-load', 'btn-export',
                   'btn-export-gif', 'btn-export-apng', 'btn-export-video', 'btn-export-zip']) {
@@ -3918,6 +5825,39 @@ $('btn-redo').addEventListener('click', redo);
 $('btn-zoom-in').addEventListener('click', () => setZoom(state.zoom * 1.2, viewW / 2, viewH / 2));
 $('btn-zoom-out').addEventListener('click', () => setZoom(state.zoom / 1.2, viewW / 2, viewH / 2));
 $('btn-fit').addEventListener('click', fitView);
+
+// Captured once: the static pixel/screen preset markup from index.html.
+const DEFAULT_PRESET_HTML = $('sel-preset').innerHTML;
+
+/** File-menu New (owner request): the preset dropdown follows the mode
+ *  radios — Print shows ONLY the paper presets (as pixels at the chosen
+ *  DPI), anything else restores the original pixel/screen list. */
+function syncFilePresets() {
+  const isPrint = $('mode-print').checked;
+  $('print-dpi-row').hidden = !isPrint;
+  const sel = $('sel-preset');
+  if (isPrint) {
+    const dpi = filePrintDpi();
+    sel.innerHTML = '<option value="">Paper preset&hellip;</option>' +
+      START_PRESETS.print.map((p) => {
+        const w = inchesToPx(p.pw, dpi);
+        const h = inchesToPx(p.ph, dpi);
+        return `<option value="${w}x${h}">${p.name} — ${w}×${h}px</option>`;
+      }).join('');
+    sel.value = '';
+  } else if (sel.innerHTML !== DEFAULT_PRESET_HTML) {
+    sel.innerHTML = DEFAULT_PRESET_HTML;
+    sel.value = '';
+  }
+}
+
+const filePrintDpi = () =>
+  clamp(parseInt($('sel-print-dpi').value, 10) || 300, 36, 1200);
+
+for (const id of ['mode-pixel', 'mode-free', 'mode-print']) {
+  $(id).addEventListener('change', syncFilePresets);
+}
+$('sel-print-dpi').addEventListener('change', syncFilePresets);
 
 // Size presets: picking one just fills in W/H — New still creates the
 // project. Hand-editing W/H flips the select back to its placeholder so it
@@ -3938,6 +5878,12 @@ $('btn-new').addEventListener('click', () => {
   $('inp-w').value = w;
   $('inp-h').value = h;
   if (anyArt() && !confirm('Start a new canvas? All current frames will be lost.')) return;
+  if ($('mode-print').checked) {
+    // Same path as the boot screen's Print tab (white Paper layer and all);
+    // File-menu sizes are raw pixels, unit defaults to inches.
+    startProject('free', w, h, { intent: 'print', unit: 'in', dpi: filePrintDpi() });
+    return;
+  }
   newProject(w, h, null, null, null, null, $('mode-free').checked ? 'free' : 'pixel');
 });
 
@@ -3972,6 +5918,253 @@ document.addEventListener('click', (e) => {
   if (b) b.blur();
 });
 
+/* ======================================================================
+ * Start screen — the boot-time project chooser (owner request: no ready-
+ * made canvas; pick a mode + preset instead). The app still boots a
+ * default project UNDERNEATH the overlay so every subsystem is live; any
+ * newProject() — preset card, Create, File-menu New, load, import —
+ * dismisses the overlay (newProject hides it).
+ * ==================================================================== */
+
+const START_PRESETS = {
+  pixel: [
+    { w: 16, h: 16, name: 'Tiny sprite' },
+    { w: 32, h: 32, name: 'Classic sprite' },
+    { w: 64, h: 64, name: 'Big sprite' },
+    { w: 128, h: 128, name: 'Detailed art' },
+    { w: 160, h: 144, name: 'Game Boy' },
+    { w: 256, h: 240, name: 'NES screen' },
+  ],
+  free: [
+    { w: 512, h: 512, name: 'Small square' },
+    { w: 1080, h: 1080, name: 'Social square' },
+    { w: 1920, h: 1080, name: 'Full HD' },
+    { w: 1080, h: 1920, name: 'Vertical HD' },
+  ],
+  // Print presets are PHYSICAL sizes (inches; cm display converts) — pixels
+  // derive from the chosen DPI at creation time.
+  print: [
+    { pw: 4, ph: 6, name: 'Photo 4×6' },
+    { pw: 5, ph: 7, name: 'Photo 5×7' },
+    { pw: 8, ph: 8, name: 'Square print' },
+    { pw: 8, ph: 10, name: 'Photo 8×10' },
+    { pw: 8.27, ph: 11.69, name: 'A4' },
+    { pw: 8.5, ph: 11, name: 'US Letter' },
+  ],
+};
+
+const START_BLURBS = {
+  pixel: 'Grid + palette, chunky pixels — sprites, tiles and retro screens. The mode is locked once the project is created.',
+  free: 'Procreate-style smooth painting with pressure, layers and vector pens. The mode is locked once the project is created.',
+  print: 'Freeform painting sized in real-world units, with CMYK ink readouts, a print-proof view, and DPI-tagged PNG exports. Starts on a white Paper layer.',
+};
+
+let startTab = 'pixel';
+
+/** Print-tab helpers: physical size (stored in inches) ↔ pixels at the
+ *  chosen DPI, displayed in the chosen unit. */
+const startUnit = () => ($('start-unit').value === 'cm' ? 'cm' : 'in');
+const startDpi = () => clamp(parseInt($('start-dpi').value, 10) || 300, 36, 1200);
+const inchesToPx = (v, dpi) => Math.round(v * dpi);
+const physLabel = (pin, unit) =>
+  unit === 'cm' ? `${Math.round(pin * 2.54 * 10) / 10} cm` : `${pin}″`;
+
+/** Paint one preset card's thumbnail: a proportional canvas rectangle on
+ *  the editor checkerboard. Pixel presets checker at 8-art-px blocks, so
+ *  the coarseness READS the resolution (16×16 = two fat squares, NES =
+ *  fine grain) and coarse sizes get a few accent "art pixels"; freeform
+ *  presets get a smooth pressure-tapered stroke from the real renderer. */
+function drawStartThumb(cv, p, mode) {
+  const g = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  if (mode === 'print') {
+    // A sheet of paper: white rect in proportion, soft shadow, folded corner.
+    const sc = Math.min((W - 14) / p.pw, (H - 14) / p.ph);
+    const rw = p.pw * sc, rh = p.ph * sc;
+    const x0 = (W - rw) / 2, y0 = (H - rh) / 2;
+    g.fillStyle = 'rgba(0, 0, 0, 0.35)';
+    g.fillRect(x0 + 3, y0 + 3, rw, rh);
+    g.fillStyle = '#f2f2f4';
+    g.fillRect(x0, y0, rw, rh);
+    const fold = Math.min(14, rw * 0.3);
+    g.fillStyle = '#c9c9d2';
+    g.beginPath();
+    g.moveTo(x0 + rw - fold, y0);
+    g.lineTo(x0 + rw, y0 + fold);
+    g.lineTo(x0 + rw - fold, y0 + fold);
+    g.closePath();
+    g.fill();
+    g.strokeStyle = 'rgba(0, 0, 0, 0.4)';
+    g.strokeRect(x0 + 0.5, y0 + 0.5, rw - 1, rh - 1);
+    return;
+  }
+  const sc = Math.min((W - 10) / p.w, (H - 10) / p.h);
+  const rw = Math.max(12, p.w * sc), rh = Math.max(12, p.h * sc);
+  const x0 = (W - rw) / 2, y0 = (H - rh) / 2;
+  // Checkerboard: block size mirrors the editor's 8-art-px checker.
+  const cell = Math.max(2, (8 / p.w) * rw);
+  for (let y = 0; y * cell < rh; y++) {
+    for (let x = 0; x * cell < rw; x++) {
+      g.fillStyle = (x + y) % 2 ? '#4a4a52' : '#5a5a63';
+      g.fillRect(x0 + x * cell, y0 + y * cell,
+                 Math.min(cell, rw - x * cell), Math.min(cell, rh - y * cell));
+    }
+  }
+  if (mode === 'pixel') {
+    // A few accent art pixels on the art grid, when they're chunky enough
+    // to read (an L-ish mark two cells in from the top-left).
+    const px = rw / p.w;
+    if (px >= 4) {
+      g.fillStyle = '#41a6f6';
+      for (const [ax, ay] of [[2, 2], [2, 3], [2, 4], [3, 4], [4, 4]]) {
+        g.fillRect(x0 + ax * px, y0 + ay * px, px, px);
+      }
+    }
+  } else {
+    // A smooth S-stroke through the real vector renderer.
+    const proto = { color: '#41a6f6', w: rh * 0.22, pen: 'pen', pts: [] };
+    for (let i = 0; i <= 20; i++) {
+      const t = i / 20;
+      proto.pts.push([x0 + rw * (0.16 + 0.68 * t),
+                      y0 + rh / 2 + Math.sin(t * Math.PI * 2) * rh * 0.18,
+                      0.3 + 0.7 * Math.sin(t * Math.PI)]);
+    }
+    drawVecStroke(g, proto);
+  }
+  g.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+  g.strokeRect(x0 + 0.5, y0 + 0.5, rw - 1, rh - 1);
+}
+
+/** Create a project from the start screen (also syncs the File-menu
+ *  pickers so its state agrees with what was chosen). Print projects get
+ *  a white bottom "Paper" layer — paper doesn't do transparency — plus a
+ *  working layer on top (both perfectly ordinary layers). */
+function startProject(mode, w, h, extra) {
+  w = clamp(parseInt(w, 10) || 32, 1, MAX_W);
+  h = clamp(parseInt(h, 10) || 32, 1, MAX_H);
+  $('mode-pixel').checked = mode === 'pixel';
+  $('mode-free').checked = mode === 'free';
+  if (extra && extra.intent === 'print') {
+    newProject(w, h, null,
+      [{ name: 'Paper', visible: true }, { name: 'Layer 2', visible: true }],
+      null, null, mode, extra); // hides the start screen; top layer active
+    const f = state.frames[0];
+    const paper = f.layers[0];
+    paper.ctx.fillStyle = '#ffffff';
+    paper.ctx.fillRect(0, 0, w, h);
+    paper.touched = true;
+    recomposite(f);
+    updateThumb(f);
+    refreshLayerThumbs();
+    render();
+    return;
+  }
+  newProject(w, h, null, null, null, null, mode, extra); // hides the start screen
+}
+
+/** Print-tab creation: physical inches × DPI → pixels, cap-checked. */
+function startPrintProject(pw, ph) {
+  const dpi = startDpi();
+  const w = inchesToPx(pw, dpi);
+  const h = inchesToPx(ph, dpi);
+  if (w < 1 || h < 1 || w > MAX_W || h > MAX_H) {
+    alert(`That size needs ${w}×${h}px at ${dpi} DPI — the canvas caps at ` +
+          `${MAX_W}×${MAX_H}. Try a lower DPI or a smaller sheet.`);
+    return;
+  }
+  startProject('free', w, h, { intent: 'print', unit: startUnit(), dpi });
+}
+
+/** Rebuild the preset cards for the active tab. `reseed` also resets the
+ *  custom fields to the tab's defaults (tab/unit switches — where their
+ *  meaning changes — but not DPI tweaks, which shouldn't eat typed sizes). */
+function renderStartPresets(reseed) {
+  $('start-tab-pixel').classList.toggle('active', startTab === 'pixel');
+  $('start-tab-free').classList.toggle('active', startTab === 'free');
+  $('start-tab-print').classList.toggle('active', startTab === 'print');
+  $('start-print-opts').hidden = startTab !== 'print';
+  $('start-blurb').textContent = START_BLURBS[startTab];
+  const box = $('start-presets');
+  box.innerHTML = '';
+  for (const p of START_PRESETS[startTab]) {
+    const card = document.createElement('div');
+    card.className = 'start-preset';
+    const cv = document.createElement('canvas');
+    cv.width = 132;
+    cv.height = 84;
+    drawStartThumb(cv, p, startTab);
+    const name = document.createElement('b');
+    name.textContent = p.name;
+    const dims = document.createElement('span');
+    if (startTab === 'print') {
+      const dpi = startDpi();
+      const unit = startUnit();
+      dims.textContent = `${physLabel(p.pw, unit)} × ${physLabel(p.ph, unit)} · ` +
+                         `${inchesToPx(p.pw, dpi)}×${inchesToPx(p.ph, dpi)}px`;
+      card.addEventListener('click', () => startPrintProject(p.pw, p.ph));
+    } else {
+      dims.textContent = `${p.w} × ${p.h}`;
+      card.addEventListener('click', () => startProject(startTab, p.w, p.h));
+    }
+    card.append(cv, name, dims);
+    box.appendChild(card);
+  }
+  if (reseed) {
+    // The tab's everyday default (print: 5×7, in the chosen unit).
+    const seeds = { pixel: [32, 32], free: [1080, 1080],
+                    print: startUnit() === 'cm' ? [12.7, 17.8] : [5, 7] };
+    [$('start-w').value, $('start-h').value] = seeds[startTab];
+  }
+}
+
+$('start-tab-pixel').addEventListener('click', () => { startTab = 'pixel'; renderStartPresets(true); });
+$('start-tab-free').addEventListener('click', () => { startTab = 'free'; renderStartPresets(true); });
+$('start-tab-print').addEventListener('click', () => { startTab = 'print'; renderStartPresets(true); });
+$('start-unit').addEventListener('change', () => renderStartPresets(true));
+$('start-dpi').addEventListener('change', () => renderStartPresets(false));
+$('btn-start-create').addEventListener('click', () => {
+  if (startTab === 'print') {
+    const toIn = (v) => (startUnit() === 'cm' ? (parseFloat(v) || 0) / 2.54 : parseFloat(v) || 0);
+    startPrintProject(toIn($('start-w').value) || 5, toIn($('start-h').value) || 7);
+  } else {
+    startProject(startTab, $('start-w').value, $('start-h').value);
+  }
+});
+// Open-a-file reuses the File menu's input wholesale; a successful load or
+// import runs newProject, which dismisses the overlay (a rejected file
+// leaves it up — there's still nothing to fall back to).
+$('btn-start-load').addEventListener('click', () => $('inp-file').click());
+// Print soft-proof view toggle (Toggles menu; row CSS-hidden off-print).
+$('chk-proof').addEventListener('change', (e) => {
+  proofing = e.target.checked;
+  render();
+});
+
+/* ---- Ruler toggles (Toggles menu) + the per-ruler unit cycle buttons ---- */
+
+/** Keep the four corner unit-buttons and menu checkboxes honest. */
+function syncRulerUI() {
+  for (const side of ['top', 'bottom', 'left', 'right']) {
+    $(`ruler-unit-${side}`).hidden = !state.rulers[side];
+    $(`ruler-unit-${side}`).textContent = state.rulerUnit[side];
+    $(`chk-ruler-${side}`).checked = state.rulers[side];
+  }
+}
+
+for (const side of ['top', 'bottom', 'left', 'right']) {
+  $(`chk-ruler-${side}`).addEventListener('change', (e) => {
+    state.rulers[side] = e.target.checked;
+    syncRulerUI();
+    render();
+  });
+  $(`ruler-unit-${side}`).addEventListener('click', () => {
+    const order = ['px', 'in', 'cm'];
+    state.rulerUnit[side] = order[(order.indexOf(state.rulerUnit[side]) + 1) % order.length];
+    syncRulerUI();
+    render();
+  });
+}
+
 selectColor(state.color);
 selectTool('brush');
 loadOnionSettings(); // before the first render so ghosts use the stored look
@@ -3979,13 +6172,22 @@ newProject(state.width, state.height);
 renderBrushList();
 syncBrushUI();
 loadStoredBrushes(); // async; re-renders the list when imports arrive
+loadStoredPalettes(); // user palettes + Recents + the active row
+// Boot lands on the chooser, not a ready-made canvas: the default project
+// above keeps every subsystem live underneath while the user picks.
+renderStartPresets(true);
+$('start-screen').hidden = false;
 
 // Headless test hook: test-app.js defines window.__ssmTest to receive the
 // pure stroke-math and texture helpers for unit testing. Real browsers
 // never set this.
 if (typeof window.__ssmTest === 'function') {
   window.__ssmTest({ stampPositions, growRect, clampRect, tipOffsets, textureAlpha, makeRng, smudgeMix,
-                     rotVec, boxHandles, pointInBox, boxBounds, scaleBox, resizeCursor });
+                     rotVec, boxHandles, pointInBox, boxBounds, scaleBox, resizeCursor, pinchView,
+                     crispXY, strokeBounds, cloneStroke, vecRadius,
+                     strokeHit, vecDotIndices, makeVecSelection,
+                     vecBoxXform, xformStroke, splitStroke, rgbToCmyk, proofRgb,
+                     rulerStep, parseHexPalette, parseGplPalette, paletteToHexFile, movePalette });
 }
 
 })();

@@ -438,5 +438,30 @@ async function recordVideo(canvases, width, height, fps, smooth) {
   return { blob, ext: mime.startsWith('video/mp4') ? 'mp4' : 'webm' };
 }
 
-return { encodeGIF, encodeAPNG, encodeZIP, recordVideo };
+/**
+ * Splice a pHYs chunk (physical pixel density) into finished PNG bytes so
+ * print-project exports open and print at their true physical size. IHDR
+ * is always the first chunk and always 13 bytes, so the insertion point is
+ * fixed: 8 (signature) + 25 (IHDR chunk) = byte 33. Works on plain PNGs
+ * and on our APNGs alike (pHYs merely has to precede the first IDAT).
+ */
+function addPngDpi(png, dpi) {
+  const src = png instanceof Uint8Array ? png : new Uint8Array(png);
+  const ppm = Math.round(dpi / 0.0254); // pixels per metre, the PNG unit
+  const ch = new Uint8Array(21);        // 4 length + 4 "pHYs" + 9 data + 4 crc
+  const dv = new DataView(ch.buffer);
+  dv.setUint32(0, 9);
+  ch.set([0x70, 0x48, 0x59, 0x73], 4);  // "pHYs"
+  dv.setUint32(8, ppm);                 // x pixels per unit
+  dv.setUint32(12, ppm);                // y pixels per unit
+  ch[16] = 1;                           // unit specifier: metre
+  dv.setUint32(17, crc32(ch, 4, 17));
+  const out = new Uint8Array(src.length + ch.length);
+  out.set(src.subarray(0, 33), 0);
+  out.set(ch, 33);
+  out.set(src.subarray(33), 33 + ch.length);
+  return out;
+}
+
+return { encodeGIF, encodeAPNG, encodeZIP, recordVideo, addPngDpi };
 })();

@@ -15,9 +15,19 @@
   <div class="group" id="file-wrap">
     <button id="btn-file" title="New, save, and load projects">File &#9662;</button>
     <div id="file-menu" hidden>
-      <div class="menu-row" id="mode-row" title="Locked once the project is created. Pixel art: grid, palette, chunky pixels. Freeform: smooth painting (Phase 6, being built)">
+      <div class="menu-row" id="mode-row" title="Locked once the project is created. Pixel art: grid, palette, chunky pixels. Freeform: smooth painting. Print: freeform sized for paper, with CMYK feedback">
         <label><input type="radio" id="mode-pixel" name="new-mode" checked> Pixel art</label>
         <label><input type="radio" id="mode-free" name="new-mode"> Freeform</label>
+        <label><input type="radio" id="mode-print" name="new-mode"> Print</label>
+      </div>
+      <div class="menu-row" id="print-dpi-row" hidden>
+        <label title="Print resolution — 300 DPI is the photo-print standard">DPI
+          <select id="sel-print-dpi">
+            <option value="150">150</option>
+            <option value="300" selected>300</option>
+            <option value="600">600</option>
+          </select>
+        </label>
       </div>
       <select id="sel-preset" title="Common canvas sizes — picking one fills in W and H">
         <option value="">Size preset&hellip;</option>
@@ -64,6 +74,26 @@
       <input id="inp-file" type="file" accept=".json,application/json,image/png,image/jpeg" hidden>
     </div>
   </div>
+  <div class="group" id="toggles-wrap">
+    <button id="btn-toggles" title="Show or hide parts of the workspace">Toggles &#9662;</button>
+    <div id="toggles-menu" hidden>
+      <label title="The tool, brush &amp; color panel on the left"><input type="checkbox" id="chk-show-tools" checked> Tool panel</label>
+      <label title="The floating layers panel"><input type="checkbox" id="chk-show-layers" checked> Layers panel</label>
+      <label title="The frame strip along the bottom"><input type="checkbox" id="chk-show-anim" checked> Animation panel</label>
+      <label title="Small always-playing preview in a floating panel — the main canvas plays too"><input type="checkbox" id="chk-preview"> Preview popup</label>
+      <hr>
+      <label title="Ghost of the previous frame under the canvas (O)"><input type="checkbox" id="chk-onion-prev" checked> Ghost previous frame</label>
+      <label title="Ghost of the next frame too"><input type="checkbox" id="chk-onion-next"> Ghost next frame</label>
+      <button id="btn-onion-cfg" class="menu-item" title="Onion skin settings — how many frames to ghost, their opacity, and the prev/next tint colors">Onion settings&hellip;</button>
+      <label title="Crosshair guides through the canvas center (X)"><input type="checkbox" id="chk-origin" checked> Origin crosshair</label>
+      <label id="proof-row" title="Preview the canvas through a process-ink (CMYK) simulation — approximately how it will look printed"><input type="checkbox" id="chk-proof"> Print proof</label>
+      <hr>
+      <label title="Ruler along the top edge — the button at its corner switches px / inches / cm"><input type="checkbox" id="chk-ruler-top"> Top ruler</label>
+      <label title="Ruler along the bottom edge"><input type="checkbox" id="chk-ruler-bottom"> Bottom ruler</label>
+      <label title="Ruler along the left edge"><input type="checkbox" id="chk-ruler-left"> Left ruler</label>
+      <label title="Ruler along the right edge"><input type="checkbox" id="chk-ruler-right"> Right ruler</label>
+    </div>
+  </div>
   <div class="group">
     <button id="btn-undo" title="Undo (Ctrl+Z)" disabled>&#8617; Undo</button>
     <button id="btn-redo" title="Redo (Ctrl+Y)" disabled>&#8618; Redo</button>
@@ -83,7 +113,7 @@
     <button class="tool" data-tool="fill" title="Fill bucket (G)"><span class="icon">&#9639;</span> Fill</button>
     <button class="tool" data-tool="eyedropper" title="Eyedropper (I)"><span class="icon">&#128167;</span> Pick</button>
     <button class="tool" data-tool="select" title="Select a rectangle (S) — drag inside it to move; Ctrl+C/X/V copy/cut/paste onto any frame or layer"><span class="icon">&#9633;</span> Select</button>
-    <button class="tool" data-tool="pan" title="Drag the canvas around (H — or hold Space with any tool)"><span class="icon">&#9995;</span> Pan</button>
+    <button class="tool" data-tool="pan" title="Drag the canvas around (H — or hold Space or Enter with any tool)"><span class="icon">&#9995;</span> Pan</button>
     <hr>
     <div id="brush-box" title="Brush &amp; eraser size — [ and ] to adjust">
       <button id="btn-brush-lib" title="Open the brush library — pick a texture brush or import your own tip image">Brush: Round &#9662;</button>
@@ -116,10 +146,19 @@
     <label id="color-well" title="Current color">
       <input id="inp-color" type="color" value="#1a1c2c">
     </label>
-    <div id="palette" title="Left-click: select · Right-click: remove swatch"></div>
+    <div id="cmyk-readout"></div>
+    <div id="palette" title="Left-click: select · Double-click: edit · Drag: reorder · Right-click: remove"></div>
+    <!-- Invisible picker for editing a swatch in place (double-click). It sits
+         here so the native popup opens next to the strip it's editing. -->
+    <input id="inp-swatch-edit" type="color" tabindex="-1" aria-hidden="true">
+    <button id="btn-palette-lib" title="Open the palette library — switch, save, and import color palettes">Palettes &#9662;</button>
   </aside>
   <div id="canvas-wrap">
     <canvas id="view"></canvas>
+    <button id="ruler-unit-left" class="ruler-unit" hidden title="Left ruler units — click to cycle px / inches / cm">px</button>
+    <button id="ruler-unit-top" class="ruler-unit" hidden title="Top ruler units — click to cycle px / inches / cm">px</button>
+    <button id="ruler-unit-right" class="ruler-unit" hidden title="Right ruler units — click to cycle px / inches / cm">px</button>
+    <button id="ruler-unit-bottom" class="ruler-unit" hidden title="Bottom ruler units — click to cycle px / inches / cm">px</button>
     <div id="select-bar" hidden>
       <span id="sel-dims">
         <label title="Selection width in art pixels — type a value to set it exactly (resizes about the center)">W <input id="inp-sel-w" class="num" type="number" min="1" step="0.1"></label>
@@ -142,8 +181,26 @@
         <button id="btn-brush-import" title="Import a PNG or JPEG as a brush tip — white/opaque paints, black/transparent doesn't">+</button>
         <button id="btn-brush-close" title="Close the brush library">&#10005;</button>
       </div>
+      <div id="brush-tabs">
+        <button id="tab-bitmap" class="active" title="Bitmap brushes paint pixels">Bitmap</button>
+        <button id="tab-vector" title="Vector pens record editable strokes on vector layers">Vector</button>
+      </div>
       <div id="brush-list"></div>
       <input id="inp-brush-file" type="file" accept="image/png,image/jpeg" hidden>
+    </div>
+    <div id="palette-panel" hidden>
+      <div id="palette-head">
+        <span>Palettes</span>
+        <button id="btn-pal-import" title="Import a palette file — Lospec .hex (one hex color per line) or GIMP .gpl">+</button>
+        <button id="btn-pal-close" title="Close the palette library">&#10005;</button>
+      </div>
+      <div id="palette-list"></div>
+      <div id="palette-foot">
+        <button id="btn-pal-new" title="Start a new palette, seeded with the current color">+ New</button>
+        <button id="btn-pal-save" title="Save the current swatch strip as a new palette">Save as&#8230;</button>
+        <button id="btn-pal-export" title="Download the current strip as a Lospec .hex file">Export</button>
+      </div>
+      <input id="inp-pal-file" type="file" accept=".hex,.gpl,.txt,text/plain" hidden>
     </div>
     <div id="preview-panel" hidden>
       <div id="preview-head">
@@ -193,6 +250,7 @@
         <button id="btn-layer-del" title="Delete the current layer from every frame">&#128465;</button>
         <button id="btn-layer-up" title="Move the current layer up">&#9650;</button>
         <button id="btn-layer-down" title="Move the current layer down">&#9660;</button>
+        <button id="btn-layer-raster" title="Rasterize this vector layer — strokes become plain pixels on every frame (one-way; can't be undone)">&#9998;&#8594;&#9638;</button>
       </div>
     </div>
   </div>
@@ -210,20 +268,51 @@
     <button id="btn-frame-right" title="Move frame right">&#9654;</button>
   </div>
   <div id="frames"></div>
-  <div class="group toggles">
-    <label title="Ghost of the previous frame under the canvas (O)"><input type="checkbox" id="chk-onion-prev" checked> Ghost prev</label>
-    <label title="Ghost of the next frame too"><input type="checkbox" id="chk-onion-next"> Ghost next</label>
-    <button id="btn-onion-cfg" title="Onion skin settings — how many frames to ghost, their opacity, and the prev/next tint colors">Onion&hellip;</button>
-    <label title="Crosshair guides through the canvas center (X)"><input type="checkbox" id="chk-origin" checked> Origin</label>
-    <label title="Small always-playing preview in a floating panel — the main canvas plays too (P)"><input type="checkbox" id="chk-preview"> Preview</label>
-  </div>
 </div>
 <footer id="statusbar">
   <span id="st-coords">&mdash;</span>
   <span id="st-frame">frame 1/1</span>
   <span id="st-tool">brush</span>
-  <span id="st-hint">Wheel: zoom &middot; Space: pan &middot; Right-drag: erase &middot; [ ]: brush size &middot; Alt+click: pick &middot; S: select &middot; Ctrl+C/X/V: copy/cut/paste &middot; , / . : frames</span>
+  <span id="st-hint">Wheel: zoom &middot; Space/Enter: pan &middot; Right-drag: erase &middot; [ ]: brush size &middot; Alt+click: pick &middot; S: select &middot; Ctrl+C/X/V: copy/cut/paste &middot; , / . : frames</span>
 </footer>
+<!-- Start screen: shown on boot instead of dropping the user onto a ready-
+     made canvas. Picking a preset card (or Create / opening a file) makes
+     the project and dismisses it; the app machinery boots underneath. -->
+<div id="start-screen" hidden>
+  <div id="start-card">
+    <h1>Sprite Sheet Maker</h1>
+    <p id="start-sub">Start a new project</p>
+    <div id="start-tabs">
+      <button id="start-tab-pixel" class="active">Pixel art</button>
+      <button id="start-tab-free">Freeform</button>
+      <button id="start-tab-print">Print</button>
+    </div>
+    <p id="start-blurb"></p>
+    <div id="start-print-opts" hidden>
+      <label title="How sizes are entered and shown">Units
+        <select id="start-unit">
+          <option value="in">inches</option>
+          <option value="cm">cm</option>
+        </select>
+      </label>
+      <label title="Print resolution — 300 DPI is the standard for photo-quality prints">DPI
+        <select id="start-dpi">
+          <option value="150">150 draft</option>
+          <option value="300" selected>300 standard</option>
+          <option value="600">600 fine</option>
+        </select>
+      </label>
+    </div>
+    <div id="start-presets"></div>
+    <div id="start-custom">
+      <label>W <input id="start-w" type="number" min="1" max="7680"></label>
+      <span>&times;</span>
+      <label>H <input id="start-h" type="number" min="1" max="4320"></label>
+      <button id="btn-start-create">Create</button>
+      <button id="btn-start-load" title="Open a saved project (.json) or import a PNG / JPEG">Open a file&hellip;</button>
+    </div>
+  </div>
+</div>
 <script src="export.js"></script>
 <script src="app.js"></script>
 </body>
