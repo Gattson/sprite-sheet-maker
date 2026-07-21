@@ -3,317 +3,519 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sprite Sheet Maker</title>
-<!-- Inline SVG favicon (a tiny transparency checkerboard in the app's accent
-     color) — no extra file to deploy, and no 404 for /favicon.ico. -->
-<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="%231f1f28"/><rect width="8" height="8" fill="%2341a6f6"/><rect x="8" y="8" width="8" height="8" fill="%2341a6f6"/></svg>'>
-<link rel="stylesheet" href="style.css">
+<title>Enkava — by Motif</title>
+<meta name="description" content="Enkava is an accessible, affordable 2D paint, vector & animation studio that runs right in your browser. Free to start, everything for $1.99/mo.">
+<!-- Inline SVG favicon: a white brush stroke on the brand persimmon. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23FF5A2C'/><path d='M6 22 C12 10 20 10 26 20' stroke='white' stroke-width='4' fill='none' stroke-linecap='round'/></svg>">
+<style>
+  /* ============================================================
+     Enkava landing — design tokens
+     Neutrals are warm paper / plum-ink (picked, not defaulted).
+     Boldness lives in ONE accent (persimmon); the full pigment
+     set only appears where the product actually uses color — the
+     palette strip. Both themes are authored, not inverted.
+     ============================================================ */
+  :root {
+    --paper:      #FAF7F3;   /* warm paper ground            */
+    --paper-2:    #F2ECE3;   /* tinted band                  */
+    --card:       #FFFFFF;
+    --text:       #221C27;   /* plum-black body              */
+    --muted:      #6C6470;   /* warm-grey, biased to accent  */
+    --line:       rgba(34,28,39,.12);
+    --line-2:     rgba(34,28,39,.08);
+
+    --persimmon:  #FF5A2C;   /* the one bold accent          */
+    --persimmon-d:#E8451A;
+    --violet:     #6C4CE0;   /* secondary accent / links     */
+
+    /* pigment palette — used only in the swatch strip motif */
+    --pig-1:#FF5A2C; --pig-2:#FF9E2C; --pig-3:#FFD23F;
+    --pig-4:#2CC2A6; --pig-5:#6C4CE0; --pig-6:#F0468C;
+
+    --check:    #E7E1D8;     /* transparent-canvas checker   */
+    --check-bg: #FBF8F3;
+
+    --ink-band:   #1B1620;   /* dark pricing/CTA band        */
+    --ink-band-2: #2A2230;
+    --on-ink:     #F3EEF6;
+    --on-ink-mut: #A79FB0;
+
+    --font-display: system-ui, "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    --font-body:    system-ui, "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    --font-mono:    ui-monospace, "SFMono-Regular", "Cascadia Code", "Segoe UI Mono", Menlo, Consolas, monospace;
+
+    --wrap: 1120px;
+    --radius: 18px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:  #15111A; --paper-2: #1C1622; --card: #221B2A;
+      --text:   #F3EEF6; --muted:   #A79FB0;
+      --line:   rgba(255,255,255,.13); --line-2: rgba(255,255,255,.07);
+      --persimmon:#FF6E44; --persimmon-d:#FF8560; --violet:#9A82FF;
+      --check:#2A2330; --check-bg:#1E1826;
+      --ink-band:#0F0C13; --ink-band-2:#1C1622;
+    }
+  }
+  /* Viewer/OS theme toggle must win in both directions */
+  :root[data-theme="light"] {
+    --paper:#FAF7F3; --paper-2:#F2ECE3; --card:#FFFFFF;
+    --text:#221C27; --muted:#6C6470;
+    --line:rgba(34,28,39,.12); --line-2:rgba(34,28,39,.08);
+    --persimmon:#FF5A2C; --persimmon-d:#E8451A; --violet:#6C4CE0;
+    --check:#E7E1D8; --check-bg:#FBF8F3;
+    --ink-band:#1B1620; --ink-band-2:#2A2230;
+  }
+  :root[data-theme="dark"] {
+    --paper:#15111A; --paper-2:#1C1622; --card:#221B2A;
+    --text:#F3EEF6; --muted:#A79FB0;
+    --line:rgba(255,255,255,.13); --line-2:rgba(255,255,255,.07);
+    --persimmon:#FF6E44; --persimmon-d:#FF8560; --violet:#9A82FF;
+    --check:#2A2330; --check-bg:#1E1826;
+    --ink-band:#0F0C13; --ink-band-2:#1C1622;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  .wrap { width: 100%; max-width: var(--wrap); margin: 0 auto; padding: 0 24px; }
+  a { color: inherit; }
+  h1,h2,h3 { margin: 0; text-wrap: balance; letter-spacing: -0.02em; }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: .74rem;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* ---------- header ---------- */
+  .site-head {
+    position: sticky; top: 0; z-index: 20;
+    backdrop-filter: saturate(1.4) blur(10px);
+    background: color-mix(in srgb, var(--paper) 82%, transparent);
+    border-bottom: 1px solid var(--line-2);
+  }
+  .head-row { display: flex; align-items: center; justify-content: space-between; height: 66px; gap: 20px; }
+  .brand { display: flex; align-items: baseline; gap: 8px; font-weight: 800; letter-spacing: -0.01em; text-decoration: none; }
+  .brand .co { font-family: var(--font-mono); font-weight: 500; font-size: .82rem; letter-spacing: .12em; color: var(--muted); text-transform: uppercase; }
+  .brand .colon { color: var(--persimmon); font-weight: 800; }
+  .brand .pr { font-size: 1.28rem; }
+  .nav { display: flex; align-items: center; gap: 26px; }
+  .nav a.navlink { font-size: .94rem; text-decoration: none; color: var(--muted); font-weight: 500; }
+  .nav a.navlink:hover { color: var(--text); }
+  @media (max-width: 760px) { .nav a.navlink { display: none; } }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: .5em;
+    font-weight: 700; font-size: .96rem; text-decoration: none;
+    padding: .72em 1.15em; border-radius: 999px;
+    border: 1px solid transparent; cursor: pointer;
+    transition: transform .12s ease, box-shadow .2s ease, background .2s ease;
+  }
+  .btn-primary { background: var(--persimmon); color: #fff; box-shadow: 0 6px 20px color-mix(in srgb, var(--persimmon) 40%, transparent); }
+  .btn-primary:hover { background: var(--persimmon-d); transform: translateY(-2px); box-shadow: 0 10px 26px color-mix(in srgb, var(--persimmon) 48%, transparent); }
+  .btn-ghost { background: transparent; color: var(--text); border-color: var(--line); }
+  .btn-ghost:hover { border-color: var(--text); transform: translateY(-2px); }
+  .btn-sm { padding: .5em .95em; font-size: .88rem; }
+
+  /* ---------- hero ---------- */
+  .hero { padding: clamp(48px, 8vw, 96px) 0 clamp(40px, 6vw, 72px); }
+  .hero-grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: clamp(32px, 5vw, 64px); align-items: center; }
+  @media (max-width: 920px) { .hero-grid { grid-template-columns: 1fr; } }
+
+  .hero h1 {
+    font-family: var(--font-display);
+    font-weight: 900;
+    font-size: clamp(2.7rem, 7.2vw, 5.1rem);
+    line-height: .98;
+    letter-spacing: -0.035em;
+    margin: 18px 0 0;
+  }
+  .hero h1 .line2 { color: var(--persimmon); }
+
+  /* onion-skin ghost — literally the animation feature, on type */
+  .ghost { position: relative; display: inline-block; }
+  .ghost::before, .ghost::after {
+    content: attr(data-word);
+    position: absolute; left: 0; top: 0;
+    pointer-events: none; z-index: -1;
+  }
+  .ghost::before { color: var(--violet);  opacity: .28; transform: translate(-.09em, -.05em); }
+  .ghost::after  { color: var(--persimmon); opacity: .22; transform: translate(.10em, .05em); }
+  @media (prefers-reduced-motion: no-preference) {
+    .ghost::before { animation: onion-a 5.5s ease-in-out infinite; }
+    .ghost::after  { animation: onion-b 5.5s ease-in-out infinite; }
+  }
+  @keyframes onion-a { 0%,100%{ transform: translate(-.09em,-.05em);} 50%{ transform: translate(-.14em,-.08em);} }
+  @keyframes onion-b { 0%,100%{ transform: translate(.10em,.05em);} 50%{ transform: translate(.15em,.09em);} }
+
+  .lede { color: var(--muted); font-size: 1.16rem; line-height: 1.55; max-width: 46ch; margin: 22px 0 0; }
+  .lede strong { color: var(--text); font-weight: 700; }
+  .hero-cta { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 30px; align-items: center; }
+  .price-note { font-family: var(--font-mono); font-size: .82rem; color: var(--muted); }
+  .price-note b { color: var(--text); }
+
+  /* ---------- canvas demo ---------- */
+  .demo {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: 0 24px 60px -30px rgba(20,10,30,.5);
+    overflow: hidden;
+    transform: rotate(-1.1deg);
+    transition: transform .3s ease;
+  }
+  .demo:hover { transform: rotate(0deg); }
+  .demo-bar { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line-2); }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .demo-title { margin-left: 8px; font-family: var(--font-mono); font-size: .74rem; color: var(--muted); }
+  .stage {
+    position: relative; aspect-ratio: 4 / 3;
+    background-color: var(--check-bg);
+    background-image:
+      conic-gradient(var(--check) 25%, transparent 0 50%, var(--check) 0 75%, transparent 0);
+    background-size: 22px 22px;
+  }
+  .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .stroke-path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  @media (prefers-reduced-motion: no-preference) {
+    .stroke-path { stroke-dasharray: 1400; stroke-dashoffset: 1400; animation: paint 1.9s cubic-bezier(.5,.05,.2,1) .35s forwards; }
+    .stroke-path.p2 { animation-delay: 1.0s; animation-duration: 1.6s; }
+  }
+  @keyframes paint { to { stroke-dashoffset: 0; } }
+  .layer-chip {
+    position: absolute; right: 12px;
+    display: flex; align-items: center; gap: 7px;
+    background: color-mix(in srgb, var(--card) 88%, transparent);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 5px 9px; font-family: var(--font-mono); font-size: .68rem; color: var(--text);
+    backdrop-filter: blur(4px);
+  }
+  .layer-chip .sq { width: 10px; height: 10px; border-radius: 2px; }
+  .demo-palette { display: flex; align-items: center; gap: 0; padding: 12px 14px; border-top: 1px solid var(--line-2); }
+  .demo-palette .sw { flex: 1; height: 26px; }
+  .demo-palette .sw:first-child { border-radius: 6px 0 0 6px; }
+  .demo-palette .sw:last-child { border-radius: 0 6px 6px 0; }
+  .demo-palette .plus { font-family: var(--font-mono); color: var(--muted); font-size: .8rem; margin-left: 12px; }
+
+  /* ---------- palette marquee ---------- */
+  .marquee { border-top: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2); background: var(--paper-2); overflow: hidden; }
+  .marquee-track { display: flex; gap: 40px; width: max-content; padding: 14px 0; }
+  @media (prefers-reduced-motion: no-preference) { .marquee-track { animation: slide 34s linear infinite; } }
+  @keyframes slide { to { transform: translateX(-50%); } }
+  .pal { display: inline-flex; align-items: center; gap: 12px; white-space: nowrap; }
+  .pal .name { font-family: var(--font-mono); font-size: .8rem; letter-spacing: .05em; color: var(--muted); }
+  .pal .chips { display: inline-flex; }
+  .pal .chips i { width: 16px; height: 16px; display: block; }
+
+  /* ---------- section scaffold ---------- */
+  section.band { padding: clamp(56px, 9vw, 104px) 0; }
+  .sec-head { max-width: 40ch; margin-bottom: 44px; }
+  .sec-head h2 { font-family: var(--font-display); font-weight: 850; font-size: clamp(1.9rem, 4.2vw, 3rem); line-height: 1.04; margin-top: 12px; }
+  .sec-head p { color: var(--muted); font-size: 1.1rem; margin: 14px 0 0; }
+
+  /* ---------- feature grid ---------- */
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 880px) { .features { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 560px) { .features { grid-template-columns: 1fr; } }
+  .feat {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px 22px 24px;
+    transition: transform .16s ease, border-color .16s ease;
+  }
+  .feat:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--persimmon) 55%, var(--line)); }
+  .feat .tag { width: 30px; height: 6px; border-radius: 3px; display: block; margin-bottom: 16px; }
+  .feat h3 { font-size: 1.16rem; font-weight: 800; }
+  .feat p { color: var(--muted); font-size: .98rem; margin: 8px 0 0; }
+
+  /* ---------- pricing (dark band) ---------- */
+  .pricing-band { background: var(--ink-band); color: var(--on-ink); }
+  .pricing-band .eyebrow, .pricing-band .sec-head p { color: var(--on-ink-mut); }
+  .pricing-band .sec-head { margin-left: auto; margin-right: auto; text-align: center; max-width: 46ch; }
+  .plans { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 780px; margin: 0 auto; }
+  @media (max-width: 680px) { .plans { grid-template-columns: 1fr; } }
+  .plan { border-radius: var(--radius); padding: 30px 28px; background: var(--ink-band-2); border: 1px solid rgba(255,255,255,.1); }
+  .plan.pro { background: linear-gradient(160deg, color-mix(in srgb, var(--persimmon) 22%, var(--ink-band-2)), var(--ink-band-2)); border-color: var(--persimmon); position: relative; }
+  .plan .kicker { font-family: var(--font-mono); font-size: .74rem; letter-spacing: .18em; text-transform: uppercase; color: var(--on-ink-mut); }
+  .plan.pro .kicker { color: var(--persimmon); }
+  .plan .price { font-family: var(--font-display); font-weight: 900; font-size: 2.9rem; letter-spacing: -0.03em; margin: 10px 0 2px; display: flex; align-items: baseline; gap: 6px; }
+  .plan .price span { font-family: var(--font-mono); font-size: .9rem; font-weight: 500; color: var(--on-ink-mut); letter-spacing: 0; }
+  .plan .sub { color: var(--on-ink-mut); font-size: .92rem; font-family: var(--font-mono); }
+  .plan ul { list-style: none; padding: 0; margin: 22px 0 26px; display: flex; flex-direction: column; gap: 11px; }
+  .plan li { display: flex; gap: 10px; font-size: .98rem; align-items: flex-start; }
+  .plan li .mk { color: var(--persimmon); font-weight: 800; flex: none; }
+  .plan .btn { width: 100%; justify-content: center; }
+  .plan.free .btn { background: transparent; color: var(--on-ink); border-color: rgba(255,255,255,.28); }
+  .plan.free .btn:hover { border-color: var(--on-ink); }
+
+  /* ---------- community ---------- */
+  .community .wrap { display: grid; grid-template-columns: 1.1fr .9fr; gap: 48px; align-items: center; }
+  @media (max-width: 820px) { .community .wrap { grid-template-columns: 1fr; } }
+  .comm-copy h2 { font-family: var(--font-display); font-weight: 850; font-size: clamp(1.9rem, 4.2vw, 3rem); line-height: 1.04; margin-top: 12px; }
+  .comm-copy p { color: var(--muted); font-size: 1.1rem; margin: 16px 0 24px; max-width: 42ch; }
+  .comm-card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 30px; box-shadow: 0 18px 40px -28px rgba(20,10,30,.4);
+  }
+  .comm-card .row { display: flex; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line-2); }
+  .comm-card .row:last-child { border-bottom: 0; }
+  .avatar { width: 34px; height: 34px; border-radius: 50%; flex: none; }
+  .comm-card .who { font-weight: 700; font-size: .92rem; }
+  .comm-card .msg { color: var(--muted); font-size: .9rem; }
+
+  /* ---------- final CTA ---------- */
+  .final { text-align: center; }
+  .final h2 { font-family: var(--font-display); font-weight: 900; font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1.02; }
+  .final p { color: var(--muted); font-size: 1.12rem; margin: 16px auto 30px; max-width: 40ch; }
+
+  /* ---------- footer ---------- */
+  footer { border-top: 1px solid var(--line-2); padding: 36px 0 48px; }
+  .foot-row { display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .foot-row .fine { color: var(--muted); font-size: .84rem; font-family: var(--font-mono); }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; }
+  .foot-links a { color: var(--muted); text-decoration: none; font-size: .9rem; }
+  .foot-links a:hover { color: var(--text); }
+
+  a:focus-visible, .btn:focus-visible { outline: 3px solid var(--violet); outline-offset: 3px; border-radius: 6px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+    html { scroll-behavior: auto; }
+    .stroke-path { stroke-dashoffset: 0 !important; }
+  }
+</style>
 </head>
-<body>
-<header id="topbar">
-  <h1>Sprite Sheet Maker</h1>
-  <div class="group" id="file-wrap">
-    <button id="btn-file" title="New, save, and load projects">File &#9662;</button>
-    <div id="file-menu" hidden>
-      <div class="menu-row" id="mode-row" title="Locked once the project is created. Pixel art: grid, palette, chunky pixels. Freeform: smooth painting. Print: freeform sized for paper, with CMYK feedback">
-        <label><input type="radio" id="mode-pixel" name="new-mode" checked> Pixel art</label>
-        <label><input type="radio" id="mode-free" name="new-mode"> Freeform</label>
-        <label><input type="radio" id="mode-print" name="new-mode"> Print</label>
-      </div>
-      <div class="menu-row" id="print-dpi-row" hidden>
-        <label title="Print resolution — 300 DPI is the photo-print standard">DPI
-          <select id="sel-print-dpi">
-            <option value="150">150</option>
-            <option value="300" selected>300</option>
-            <option value="600">600</option>
-          </select>
-        </label>
-      </div>
-      <select id="sel-preset" title="Common canvas sizes — picking one fills in W and H">
-        <option value="">Size preset&hellip;</option>
-        <optgroup label="Sprites &amp; tiles">
-          <option value="8x8">8 × 8 — tiny sprite / tile</option>
-          <option value="16x16">16 × 16 — classic sprite</option>
-          <option value="32x32">32 × 32 — standard sprite</option>
-          <option value="64x64">64 × 64 — large sprite</option>
-          <option value="128x128">128 × 128 — XL sprite / portrait</option>
-        </optgroup>
-        <optgroup label="Retro screens">
-          <option value="160x144">160 × 144 — Game Boy</option>
-          <option value="240x160">240 × 160 — Game Boy Advance</option>
-          <option value="256x224">256 × 224 — SNES</option>
-          <option value="256x240">256 × 240 — NES</option>
-          <option value="320x240">320 × 240 — QVGA / early PC</option>
-        </optgroup>
-        <optgroup label="Modern &amp; HD">
-          <option value="320x180">320 × 180 — 16:9 pixel-art scene</option>
-          <option value="640x360">640 × 360 — 16:9 scene, large</option>
-          <option value="1280x720">1280 × 720 — HD</option>
-          <option value="1920x1080">1920 × 1080 — Full HD</option>
-          <option value="3840x2160">3840 × 2160 — 4K</option>
-          <option value="7680x4320">7680 × 4320 — 8K (max)</option>
-        </optgroup>
-      </select>
-      <div class="menu-row">
-        <label>W <input id="inp-w" type="number" min="1" max="7680" value="32"></label>
-        <label>H <input id="inp-h" type="number" min="1" max="4320" value="32"></label>
-        <button id="btn-new">New</button>
-      </div>
-      <hr>
-      <button id="btn-save" class="menu-item" title="Save project as a JSON file (Ctrl+S)">Save project</button>
-      <button id="btn-load" class="menu-item" title="Load a saved project, or import a PNG/JPEG to work from — the image becomes a new project in the mode picked above">Load / import image&hellip;</button>
-      <hr>
-      <div class="menu-row">
-        <button id="btn-export" class="menu-item" title="All frames as one PNG sprite sheet">Export sheet (PNG)</button>
-        <label title="Sheet layout: columns per row (0 = all frames in one strip)">Cols <input id="inp-cols" type="number" min="0" max="99" value="0"></label>
-      </div>
-      <button id="btn-export-gif" class="menu-item" title="Animated GIF at the preview FPS — plays anywhere, but caps at 256 colors with hard transparency (smooth freeform art will band; APNG is the lossless option)">Export GIF</button>
-      <button id="btn-export-apng" class="menu-item" title="Animated PNG at the preview FPS — lossless, keeps transparency">Export APNG</button>
-      <button id="btn-export-video" class="menu-item" title="Record to MP4 or WebM (whichever this browser encodes); transparency becomes dark gray">Export video</button>
-      <button id="btn-export-zip" class="menu-item" title="Each frame as its own PNG, zipped — for video editors and game engines">Export frames (ZIP)</button>
-      <input id="inp-file" type="file" accept=".json,application/json,image/png,image/jpeg" hidden>
-    </div>
-  </div>
-  <div class="group" id="toggles-wrap">
-    <button id="btn-toggles" title="Show or hide parts of the workspace">Toggles &#9662;</button>
-    <div id="toggles-menu" hidden>
-      <label title="The tool, brush &amp; color panel on the left"><input type="checkbox" id="chk-show-tools" checked> Tool panel</label>
-      <label title="The floating layers panel"><input type="checkbox" id="chk-show-layers" checked> Layers panel</label>
-      <label title="The frame strip along the bottom"><input type="checkbox" id="chk-show-anim" checked> Animation panel</label>
-      <label title="Small always-playing preview in a floating panel — the main canvas plays too"><input type="checkbox" id="chk-preview"> Preview popup</label>
-      <hr>
-      <label title="Ghost of the previous frame under the canvas (O)"><input type="checkbox" id="chk-onion-prev" checked> Ghost previous frame</label>
-      <label title="Ghost of the next frame too"><input type="checkbox" id="chk-onion-next"> Ghost next frame</label>
-      <button id="btn-onion-cfg" class="menu-item" title="Onion skin settings — how many frames to ghost, their opacity, and the prev/next tint colors">Onion settings&hellip;</button>
-      <label title="Crosshair guides through the canvas center (X)"><input type="checkbox" id="chk-origin" checked> Origin crosshair</label>
-      <label id="proof-row" title="Preview the canvas through a process-ink (CMYK) simulation — approximately how it will look printed"><input type="checkbox" id="chk-proof"> Print proof</label>
-      <hr>
-      <label title="Ruler along the top edge — the button at its corner switches px / inches / cm"><input type="checkbox" id="chk-ruler-top"> Top ruler</label>
-      <label title="Ruler along the bottom edge"><input type="checkbox" id="chk-ruler-bottom"> Bottom ruler</label>
-      <label title="Ruler along the left edge"><input type="checkbox" id="chk-ruler-left"> Left ruler</label>
-      <label title="Ruler along the right edge"><input type="checkbox" id="chk-ruler-right"> Right ruler</label>
-    </div>
-  </div>
-  <div class="group">
-    <button id="btn-undo" title="Undo (Ctrl+Z)" disabled>&#8617; Undo</button>
-    <button id="btn-redo" title="Redo (Ctrl+Y)" disabled>&#8618; Redo</button>
-  </div>
-  <div class="group">
-    <button id="btn-zoom-out" title="Zoom out (-)">&minus;</button>
-    <span id="zoom-label">16&times;</span>
-    <button id="btn-zoom-in" title="Zoom in (+)">+</button>
-    <button id="btn-fit" title="Fit canvas to view (0)">Fit</button>
+<body id="top">
+
+<header class="site-head">
+  <div class="wrap head-row">
+    <a class="brand" href="#top" aria-label="Motif : Enkava home">
+      <span class="co">Motif</span><span class="colon">:</span><span class="pr">Enkava</span>
+    </a>
+    <nav class="nav" aria-label="Primary">
+      <a class="navlink" href="#tools">Tools</a>
+      <a class="navlink" href="#pricing">Pricing</a>
+      <a class="navlink" href="#community">Community</a>
+      <a class="btn btn-primary btn-sm" href="app.html">Start a project</a>
+    </nav>
   </div>
 </header>
+
 <main>
-  <aside id="toolbar">
-    <button class="tool active" data-tool="brush" title="Brush (B)"><span class="icon">&#9998;</span> Brush</button>
-    <button class="tool" data-tool="eraser" title="Eraser (E)"><span class="icon">&#9003;</span> Eraser</button>
-    <button class="tool" data-tool="smudge" title="Smudge (U) — drags the colors already on the layer; the Strength slider sets how far they carry"><span class="icon">&#9757;</span> Smudge</button>
-    <button class="tool" data-tool="fill" title="Fill bucket (G)"><span class="icon">&#9639;</span> Fill</button>
-    <button class="tool" data-tool="eyedropper" title="Eyedropper (I)"><span class="icon">&#128167;</span> Pick</button>
-    <button class="tool" data-tool="select" title="Select a rectangle (S) — drag inside it to move; Ctrl+C/X/V copy/cut/paste onto any frame or layer"><span class="icon">&#9633;</span> Select</button>
-    <button class="tool" data-tool="pan" title="Drag the canvas around (H — or hold Space or Enter with any tool)"><span class="icon">&#9995;</span> Pan</button>
-    <hr>
-    <div id="brush-box" title="Brush &amp; eraser size — [ and ] to adjust">
-      <button id="btn-brush-lib" title="Open the brush library — pick a texture brush or import your own tip image">Brush: Round &#9662;</button>
-      <div id="brush-row">
-        <span>Size <input id="size-num" class="num" type="number" min="1" max="256" value="1"></span>
-        <span id="brush-shapes">
-          <button id="shape-square" class="shape active" title="Square tip">&#9632;</button>
-          <button id="shape-circle" class="shape" title="Round tip">&#9679;</button>
-        </span>
-      </div>
-      <input id="inp-brush-size" type="range" min="1" max="64" value="1">
-      <div class="brush-sub free-only" id="opacity-box" title="Stroke opacity — one stroke never builds up past this">
-        <span>Opacity <input id="opacity-num" class="num" type="number" min="1" max="100" value="100">%</span>
-        <input id="inp-brush-opacity" type="range" min="1" max="100" value="100">
-      </div>
-      <div class="brush-sub free-only" id="strength-box" hidden title="Smudge strength — how far color drags along the stroke; low is a gentle blur, high pulls a long smear">
-        <span>Strength <input id="strength-num" class="num" type="number" min="1" max="100" value="50">%</span>
-        <input id="inp-smudge-strength" type="range" min="1" max="100" value="50">
-      </div>
-      <div class="brush-sub free-only" id="hardness-box" title="Tip edge: 100% = hard round, low = soft airbrush (round brush only)">
-        <span>Hardness <input id="hardness-num" class="num" type="number" min="0" max="100" value="80">%</span>
-        <input id="inp-brush-hardness" type="range" min="0" max="100" value="80">
-      </div>
-      <div class="brush-sub free-only" title="Fill tolerance — how far a color may differ from the clicked one and still be filled over (raise it to flow past soft edges)">
-        <span>Fill tolerance <input id="tolerance-num" class="num" type="number" min="0" max="100" value="12">%</span>
-        <input id="inp-fill-tol" type="range" min="0" max="100" value="12">
-      </div>
-    </div>
-    <hr>
-    <label id="color-well" title="Current color">
-      <input id="inp-color" type="color" value="#1a1c2c">
-    </label>
-    <div id="cmyk-readout"></div>
-    <div id="palette" title="Left-click: select · Double-click: edit · Drag: reorder · Right-click: remove"></div>
-    <!-- Invisible picker for editing a swatch in place (double-click). It sits
-         here so the native popup opens next to the strip it's editing. -->
-    <input id="inp-swatch-edit" type="color" tabindex="-1" aria-hidden="true">
-    <button id="btn-palette-lib" title="Open the palette library — switch, save, and import color palettes">Palettes &#9662;</button>
-  </aside>
-  <div id="canvas-wrap">
-    <canvas id="view"></canvas>
-    <button id="ruler-unit-left" class="ruler-unit" hidden title="Left ruler units — click to cycle px / inches / cm">px</button>
-    <button id="ruler-unit-top" class="ruler-unit" hidden title="Top ruler units — click to cycle px / inches / cm">px</button>
-    <button id="ruler-unit-right" class="ruler-unit" hidden title="Right ruler units — click to cycle px / inches / cm">px</button>
-    <button id="ruler-unit-bottom" class="ruler-unit" hidden title="Bottom ruler units — click to cycle px / inches / cm">px</button>
-    <div id="select-bar" hidden>
-      <span id="sel-dims">
-        <label title="Selection width in art pixels — type a value to set it exactly (resizes about the center)">W <input id="inp-sel-w" class="num" type="number" min="1" step="0.1"></label>
-        <label title="Selection height in art pixels — type a value to set it exactly (resizes about the center)">H <input id="inp-sel-h" class="num" type="number" min="1" step="0.1"></label>
-        <label title="Rotation in degrees — updates live while the knob turns; type a value to set it exactly">&#8736; <input id="inp-sel-angle" class="num" type="number" step="1">&deg;</label>
-      </span>
-      <button id="btn-sel-rotl" title="Rotate 90&deg; counter-clockwise">&#8634;</button>
-      <button id="btn-sel-rotr" title="Rotate 90&deg; clockwise">&#8635;</button>
-      <button id="btn-sel-fliph" title="Flip horizontally">&#8596;</button>
-      <button id="btn-sel-flipv" title="Flip vertically">&#8597;</button>
-      <button id="btn-sel-copy" title="Copy (Ctrl+C)">Copy</button>
-      <button id="btn-sel-cut" title="Cut (Ctrl+X)">Cut</button>
-      <button id="btn-sel-del" title="Clear the selected pixels (Del)">Clear</button>
-      <button id="btn-sel-commit" title="Place the floating selection (Enter, or click outside it)">&#10003;</button>
-      <button id="btn-sel-cancel" title="Cancel / deselect (Esc or right-click)">&#10005;</button>
-    </div>
-    <div id="brush-panel" hidden>
-      <div id="brush-head">
-        <span>Brushes</span>
-        <button id="btn-brush-import" title="Import a PNG or JPEG as a brush tip — white/opaque paints, black/transparent doesn't">+</button>
-        <button id="btn-brush-close" title="Close the brush library">&#10005;</button>
-      </div>
-      <div id="brush-tabs">
-        <button id="tab-bitmap" class="active" title="Bitmap brushes paint pixels">Bitmap</button>
-        <button id="tab-vector" title="Vector pens record editable strokes on vector layers">Vector</button>
-      </div>
-      <div id="brush-list"></div>
-      <input id="inp-brush-file" type="file" accept="image/png,image/jpeg" hidden>
-    </div>
-    <div id="palette-panel" hidden>
-      <div id="palette-head">
-        <span>Palettes</span>
-        <button id="btn-pal-import" title="Import a palette file — Lospec .hex (one hex color per line) or GIMP .gpl">+</button>
-        <button id="btn-pal-close" title="Close the palette library">&#10005;</button>
-      </div>
-      <div id="palette-list"></div>
-      <div id="palette-foot">
-        <button id="btn-pal-new" title="Start a new palette, seeded with the current color">+ New</button>
-        <button id="btn-pal-save" title="Save the current swatch strip as a new palette">Save as&#8230;</button>
-        <button id="btn-pal-export" title="Download the current strip as a Lospec .hex file">Export</button>
-      </div>
-      <input id="inp-pal-file" type="file" accept=".hex,.gpl,.txt,text/plain" hidden>
-    </div>
-    <div id="preview-panel" hidden>
-      <div id="preview-head">
-        <span>Preview</span>
-        <button id="btn-preview-close" title="Close the preview panel">&#10005;</button>
-      </div>
-      <canvas id="preview"></canvas>
-    </div>
-    <div id="onion-panel" hidden>
-      <div class="onion-row" title="How many neighboring frames to ghost in each direction — farther frames fade progressively">
-        <span>Frames <input id="onion-frames-num" class="num" type="number" min="1" max="8" value="1"></span>
-        <input id="inp-onion-frames" type="range" min="1" max="8" value="1">
-      </div>
-      <div class="onion-row" title="How visible the nearest ghost is — farther frames fade down from here">
-        <span>Opacity <input id="onion-opacity-num" class="num" type="number" min="5" max="100" value="45">%</span>
-        <input id="inp-onion-opacity" type="range" min="5" max="100" value="45">
-      </div>
-      <div id="onion-colors">
-        <label title="Tint for frames BEFORE the current one">Prev <input id="inp-onion-prev-color" type="color" value="#ff5a5a"></label>
-        <label title="Tint for frames AFTER the current one">Next <input id="inp-onion-next-color" type="color" value="#5aaaff"></label>
-      </div>
-    </div>
-    <div id="layers-panel">
-      <div id="layers-head">
-        <span>Layers</span>
-        <button id="btn-layers-collapse" title="Collapse / expand the panel">&#9662;</button>
-        <button id="btn-layer-add" title="Add a layer above the current one">+</button>
-      </div>
-      <div id="layers"></div>
-      <div id="layer-adjust">
-        <label title="This layer's opacity — how strongly it shows over the layers below (all frames)">Opacity
-          <input id="inp-layer-opacity" type="range" min="0" max="100" value="100">
-          <input id="layer-opacity-num" class="num" type="number" min="0" max="100" value="100">%
-        </label>
-        <div id="layer-adjust-row">
-          <select id="sel-layer-blend" title="Blend mode — how this layer's colors mix with the layers below">
-            <option value="normal">Normal</option>
-            <option value="multiply">Multiply</option>
-            <option value="screen">Screen</option>
-            <option value="overlay">Overlay</option>
-          </select>
-          <button id="btn-layer-lock" title="Alpha lock — paint only lands where this layer already has pixels; transparency can't change">&#128274;</button>
+  <!-- ============ HERO ============ -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">Paint · Vector · Animate — in your browser</p>
+        <h1>
+          Make <span class="ghost" data-word="anything">anything</span>.<br>
+          <span class="line2">Spend almost nothing.</span>
+        </h1>
+        <p class="lede">
+          Enkava is a paint, vector, and animation studio that runs right in your browser.
+          Gentle enough for your first drawing, deep enough for your hundredth animation —
+          and <strong>a whole creative suite for the price of a coffee</strong>.
+        </p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="app.html">Start a project →</a>
+          <a class="btn btn-ghost" href="#tools">See what's inside</a>
+          <span class="price-note">Free to start · <b>$1.99/mo</b> for everything</span>
         </div>
       </div>
-      <div class="layer-controls">
-        <button id="btn-layer-dup" title="Duplicate the current layer">&#10697;</button>
-        <button id="btn-layer-del" title="Delete the current layer from every frame">&#128465;</button>
-        <button id="btn-layer-up" title="Move the current layer up">&#9650;</button>
-        <button id="btn-layer-down" title="Move the current layer down">&#9660;</button>
-        <button id="btn-layer-raster" title="Rasterize this vector layer — strokes become plain pixels on every frame (one-way; can't be undone)">&#9998;&#8594;&#9638;</button>
+
+      <!-- product window: checkerboard canvas + painted stroke + palette -->
+      <div class="demo" aria-hidden="true">
+        <div class="demo-bar">
+          <span class="dot" style="background:#FF6058"></span>
+          <span class="dot" style="background:#FEBC2E"></span>
+          <span class="dot" style="background:#2ACB42"></span>
+          <span class="demo-title">walk-cycle.enk — frame 4 / 8</span>
+        </div>
+        <div class="stage">
+          <svg viewBox="0 0 400 300" preserveAspectRatio="xMidYMid meet">
+            <path class="stroke-path" d="M40 210 C 90 120, 150 90, 200 150 S 320 230, 360 120"
+                  stroke="var(--persimmon)" stroke-width="30"></path>
+            <path class="stroke-path p2" d="M70 250 C 140 220, 250 210, 350 240"
+                  stroke="var(--violet)" stroke-width="14" opacity="0.9"></path>
+          </svg>
+          <div class="layer-chip" style="top:14px"><span class="sq" style="background:var(--persimmon)"></span>Brush · Freeform</div>
+          <div class="layer-chip" style="top:52px"><span class="sq" style="background:var(--violet)"></span>Vector · Ink</div>
+        </div>
+        <div class="demo-palette">
+          <span class="sw" style="background:var(--pig-1)"></span>
+          <span class="sw" style="background:var(--pig-2)"></span>
+          <span class="sw" style="background:var(--pig-3)"></span>
+          <span class="sw" style="background:var(--pig-4)"></span>
+          <span class="sw" style="background:var(--pig-5)"></span>
+          <span class="sw" style="background:var(--pig-6)"></span>
+          <span class="plus">+ palette</span>
+        </div>
       </div>
     </div>
+  </section>
+
+  <!-- ============ PALETTE MARQUEE ============ -->
+  <div class="marquee" aria-hidden="true">
+    <div class="marquee-track">
+      <!-- duplicated once for a seamless -50% loop -->
+      <span class="pal"><span class="name">Sweetie 16</span><span class="chips"><i style="background:#1a1c2c"></i><i style="background:#5d275d"></i><i style="background:#ef7d57"></i><i style="background:#ffcd75"></i><i style="background:#38b764"></i><i style="background:#41a6f6"></i></span></span>
+      <span class="pal"><span class="name">PICO-8</span><span class="chips"><i style="background:#000000"></i><i style="background:#1d2b53"></i><i style="background:#ff004d"></i><i style="background:#ffa300"></i><i style="background:#00e436"></i><i style="background:#29adff"></i></span></span>
+      <span class="pal"><span class="name">Game Boy</span><span class="chips"><i style="background:#0f380f"></i><i style="background:#306230"></i><i style="background:#8bac0f"></i><i style="background:#9bbc0f"></i></span></span>
+      <span class="pal"><span class="name">DawnBringer 32</span><span class="chips"><i style="background:#45283c"></i><i style="background:#d77bba"></i><i style="background:#8f563b"></i><i style="background:#df7126"></i><i style="background:#fbf236"></i><i style="background:#99e550"></i></span></span>
+      <span class="pal"><span class="name">Endesga 32</span><span class="chips"><i style="background:#be4a2f"></i><i style="background:#e8b796"></i><i style="background:#733e39"></i><i style="background:#a22633"></i><i style="background:#e43b44"></i><i style="background:#f77622"></i></span></span>
+      <span class="pal"><span class="name">Sweetie 16</span><span class="chips"><i style="background:#1a1c2c"></i><i style="background:#5d275d"></i><i style="background:#ef7d57"></i><i style="background:#ffcd75"></i><i style="background:#38b764"></i><i style="background:#41a6f6"></i></span></span>
+      <span class="pal"><span class="name">PICO-8</span><span class="chips"><i style="background:#000000"></i><i style="background:#1d2b53"></i><i style="background:#ff004d"></i><i style="background:#ffa300"></i><i style="background:#00e436"></i><i style="background:#29adff"></i></span></span>
+      <span class="pal"><span class="name">Game Boy</span><span class="chips"><i style="background:#0f380f"></i><i style="background:#306230"></i><i style="background:#8bac0f"></i><i style="background:#9bbc0f"></i></span></span>
+      <span class="pal"><span class="name">DawnBringer 32</span><span class="chips"><i style="background:#45283c"></i><i style="background:#d77bba"></i><i style="background:#8f563b"></i><i style="background:#df7126"></i><i style="background:#fbf236"></i><i style="background:#99e550"></i></span></span>
+      <span class="pal"><span class="name">Endesga 32</span><span class="chips"><i style="background:#be4a2f"></i><i style="background:#e8b796"></i><i style="background:#733e39"></i><i style="background:#a22633"></i><i style="background:#e43b44"></i><i style="background:#f77622"></i></span></span>
+    </div>
   </div>
+
+  <!-- ============ TOOLS ============ -->
+  <section class="band" id="tools">
+    <div class="wrap">
+      <div class="sec-head">
+        <p class="eyebrow">One canvas · the whole shelf</p>
+        <h2>Everything a 2D artist juggles apps for — in one place.</h2>
+        <p>No more switching between a painting app, a vector app, and an animation app. Enkava does all three, and hands the file straight to you.</p>
+      </div>
+      <div class="features">
+        <div class="feat">
+          <span class="tag" style="background:var(--pig-1)"></span>
+          <h3>Paint freely</h3>
+          <p>Pressure-sensitive brushes, textures, and smudge over full-color layers with blend modes. No grid, no limits.</p>
+        </div>
+        <div class="feat">
+          <span class="tag" style="background:var(--pig-3)"></span>
+          <h3>Or stay crisp</h3>
+          <p>A classic pixel mode with palettes, tidy grids, and pixel-perfect export for sprite work.</p>
+        </div>
+        <div class="feat">
+          <span class="tag" style="background:var(--pig-5)"></span>
+          <h3>Vector that bends</h3>
+          <p>Editable vector strokes you reshape point by point — the same lines built to move when rigging arrives.</p>
+        </div>
+        <div class="feat">
+          <span class="tag" style="background:var(--pig-4)"></span>
+          <h3>Bring it to life</h3>
+          <p>Frames, onion skinning, and in-canvas playback. Watch the walk cycle move before you ever export it.</p>
+        </div>
+        <div class="feat">
+          <span class="tag" style="background:var(--pig-2)"></span>
+          <h3>Export anywhere</h3>
+          <p>PNG sprite sheets, animated GIF or APNG, video, or a ZIP of frames. Print projects come out at true physical size.</p>
+        </div>
+        <div class="feat">
+          <span class="tag" style="background:var(--pig-6)"></span>
+          <h3>Yours to keep</h3>
+          <p>It all runs on your machine — your art never leaves it. Projects save as plain files you own outright.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ PRICING ============ -->
+  <section class="band pricing-band" id="pricing">
+    <div class="wrap">
+      <div class="sec-head">
+        <p class="eyebrow">Priced so you can just start</p>
+        <h2>Real tools shouldn't cost a fortune.</h2>
+        <p>The big suites want more per month than most artists spend on paint in a year. We went the other way.</p>
+      </div>
+      <div class="plans">
+        <div class="plan free">
+          <p class="kicker">Free</p>
+          <div class="price">$0<span>forever</span></div>
+          <p class="sub">Everything you need to make your first thing.</p>
+          <ul>
+            <li><span class="mk">✓</span> Pixel &amp; freeform painting</li>
+            <li><span class="mk">✓</span> Frames, onion skinning &amp; playback</li>
+            <li><span class="mk">✓</span> PNG, GIF &amp; ZIP export</li>
+            <li><span class="mk">✓</span> Projects saved on your device</li>
+          </ul>
+          <a class="btn" href="app.html">Open the editor</a>
+        </div>
+        <div class="plan pro">
+          <p class="kicker">Pro</p>
+          <div class="price">$1.99<span>/ month</span></div>
+          <p class="sub">— or $10.99 a year (about 92¢ a month).</p>
+          <ul>
+            <li><span class="mk">✓</span> Everything in Free, fully unlocked</li>
+            <li><span class="mk">✓</span> Cloud projects, synced across devices</li>
+            <li><span class="mk">✓</span> The complete pro toolset</li>
+            <li><span class="mk">✓</span> Subscriber Discord &amp; a say in what's next</li>
+          </ul>
+          <a class="btn btn-primary" href="app.html">Go Pro</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ COMMUNITY ============ -->
+  <section class="band community" id="community">
+    <div class="wrap">
+      <div class="comm-copy">
+        <p class="eyebrow">Built with the people who use it</p>
+        <h2>Your requests are the roadmap.</h2>
+        <p>
+          Enkava grows from what artists actually ask for. Subscribers get a Discord to swap work,
+          trade tips, and pitch the features that get built next — no forms, just a conversation.
+        </p>
+        <a class="btn btn-ghost" href="https://discord.gg/pxVc55C9fs" target="_blank" rel="noopener">Join the Discord</a>
+      </div>
+      <div class="comm-card" aria-hidden="true">
+        <div class="row">
+          <span class="avatar" style="background:var(--pig-5)"></span>
+          <div><div class="who">nova.draws</div><div class="msg">can we get a symmetry ruler for mandalas? 🙏</div></div>
+        </div>
+        <div class="row">
+          <span class="avatar" style="background:var(--pig-1)"></span>
+          <div><div class="who">pixelsmith</div><div class="msg">the onion skin tints are perfect for my run cycle</div></div>
+        </div>
+        <div class="row">
+          <span class="avatar" style="background:var(--pig-4)"></span>
+          <div><div class="who">mira_k</div><div class="msg">vector strokes + rigging is going to be huge</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FINAL CTA ============ -->
+  <section class="band final">
+    <div class="wrap">
+      <h2>Your first project is one click away.</h2>
+      <p>No download, no account needed to start. Open a canvas and make something.</p>
+      <a class="btn btn-primary" href="app.html" style="font-size:1.05rem; padding:.85em 1.5em;">Start a project →</a>
+    </div>
+  </section>
 </main>
-<div id="framebar">
-  <div class="group">
-    <button id="btn-play" title="Play / pause the animation in the canvas (P)">&#9654; Play</button>
-    <label class="fps" title="Playback speed, frames per second">FPS <input id="inp-fps" type="number" min="1" max="60" value="8"></label>
+
+<footer>
+  <div class="wrap foot-row">
+    <a class="brand" href="#top" style="text-decoration:none;">
+      <span class="co">Motif</span><span class="colon">:</span><span class="pr">Enkava</span>
+    </a>
+    <div class="foot-links">
+      <a href="#tools">Tools</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#community">Community</a>
+      <a href="app.html">Open editor</a>
+      <a href="https://discord.gg/pxVc55C9fs" target="_blank" rel="noopener">Discord</a>
+    </div>
+    <span class="fine">© 2026 Motif · All rights reserved</span>
   </div>
-  <div class="group">
-    <button id="btn-frame-add" title="Add blank frame after current (N)">+ Frame</button>
-    <button id="btn-frame-dup" title="Duplicate current frame (D)">&#10697; Dup</button>
-    <button id="btn-frame-del" title="Delete current frame (Del)">&#128465;</button>
-    <button id="btn-frame-left" title="Move frame left">&#9664;</button>
-    <button id="btn-frame-right" title="Move frame right">&#9654;</button>
-  </div>
-  <div id="frames"></div>
-</div>
-<footer id="statusbar">
-  <span id="st-coords">&mdash;</span>
-  <span id="st-frame">frame 1/1</span>
-  <span id="st-tool">brush</span>
-  <span id="st-hint">Wheel: zoom &middot; Space/Enter: pan &middot; Right-drag: erase &middot; [ ]: brush size &middot; Alt+click: pick &middot; S: select &middot; Ctrl+C/X/V: copy/cut/paste &middot; , / . : frames</span>
 </footer>
-<!-- Start screen: shown on boot instead of dropping the user onto a ready-
-     made canvas. Picking a preset card (or Create / opening a file) makes
-     the project and dismisses it; the app machinery boots underneath. -->
-<div id="start-screen" hidden>
-  <div id="start-card">
-    <h1>Sprite Sheet Maker</h1>
-    <p id="start-sub">Start a new project</p>
-    <div id="start-tabs">
-      <button id="start-tab-pixel" class="active">Pixel art</button>
-      <button id="start-tab-free">Freeform</button>
-      <button id="start-tab-print">Print</button>
-    </div>
-    <p id="start-blurb"></p>
-    <div id="start-print-opts" hidden>
-      <label title="How sizes are entered and shown">Units
-        <select id="start-unit">
-          <option value="in">inches</option>
-          <option value="cm">cm</option>
-        </select>
-      </label>
-      <label title="Print resolution — 300 DPI is the standard for photo-quality prints">DPI
-        <select id="start-dpi">
-          <option value="150">150 draft</option>
-          <option value="300" selected>300 standard</option>
-          <option value="600">600 fine</option>
-        </select>
-      </label>
-    </div>
-    <div id="start-presets"></div>
-    <div id="start-custom">
-      <label>W <input id="start-w" type="number" min="1" max="7680"></label>
-      <span>&times;</span>
-      <label>H <input id="start-h" type="number" min="1" max="4320"></label>
-      <button id="btn-start-create">Create</button>
-      <button id="btn-start-load" title="Open a saved project (.json) or import a PNG / JPEG">Open a file&hellip;</button>
-    </div>
-  </div>
-</div>
-<script src="export.js"></script>
-<script src="app.js"></script>
 </body>
 </html>

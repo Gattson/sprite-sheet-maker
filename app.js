@@ -1,5 +1,5 @@
 /*
- * Sprite Sheet Maker — pixel editor, frames & onion skinning,
+ * Enkava (by Motif) — pixel editor, frames & onion skinning,
  *                      animation preview, export & save/load
  * -----------------------------------------------------------------------
  * Plain JavaScript, no build step. See PROJECT_PLAN.md for the roadmap.
@@ -4866,7 +4866,7 @@ $('inp-file').addEventListener('change', async (e) => {
   }
   const proj = await parseProject(await file.text());
   if (!proj) {
-    alert('That file is not a Sprite Sheet Maker project.');
+    alert('That file is not an Enkava project.');
     return;
   }
   if (anyArt() && !confirm('Load project? Current frames will be replaced.')) return;

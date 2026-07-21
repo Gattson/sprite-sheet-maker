@@ -36,10 +36,21 @@ body {
 }
 
 #topbar h1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.4px;
   margin-right: 8px;
+}
+
+/* "For now" brand mark: the Enkava wave, shown as a small rounded tile. */
+.brand-logo {
+  height: 24px;
+  width: auto;
+  border-radius: 5px;
+  display: block;
 }
 
 .group {
