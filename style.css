@@ -62,10 +62,10 @@ body {
 /* pushes this group (and everything after it) to the right edge */
 .group.push { margin-left: auto; }
 
-/* ---------- topbar dropdown menus (File, Toggles) ---------- */
-#file-wrap, #toggles-wrap { position: relative; }
+/* ---------- topbar dropdown menus (File, Settings, Toggles) ---------- */
+#file-wrap, #settings-wrap, #toggles-wrap { position: relative; }
 
-#file-menu, #toggles-menu {
+#file-menu, #settings-menu, #toggles-menu {
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
@@ -81,15 +81,15 @@ body {
   white-space: nowrap;
 }
 
-#file-menu[hidden], #toggles-menu[hidden] { display: none; }
+#file-menu[hidden], #settings-menu[hidden], #toggles-menu[hidden] { display: none; }
 
 #file-menu hr, #toggles-menu hr {
   border: none;
   border-top: 1px solid var(--panel-edge);
 }
 
-/* Toggles menu: one checkbox row per hideable panel / canvas guide. */
-#toggles-menu label {
+/* Toggles & Settings menus: one checkbox row per option. */
+#toggles-menu label, #settings-menu label {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -332,23 +332,36 @@ body.mode-free #brush-shapes { display: none; }
 #preview.smooth { image-rendering: auto; }
 
 /* ---------- selection action bar ---------- */
-#select-bar {
+/* The selection HUD is a vertical stack of pills, centered at the top: the
+   transform bar always, plus a second vector-stroke bar under it when strokes
+   are selected — so neither row has to overflow sideways under the panels. */
+#sel-bar-stack {
   position: absolute;
   top: 10px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  z-index: 5;
+}
+
+#select-bar, #vec-bar {
+  display: flex;
+  align-items: center;
   gap: 4px;
   padding: 6px 8px;
   background: rgba(31, 31, 40, 0.95);
   border: 1px solid var(--panel-edge);
   border-radius: 8px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
-  z-index: 5;
   white-space: nowrap;
 }
 
-#select-bar[hidden] { display: none; }
+#vec-bar { gap: 8px; }
+
+#select-bar[hidden], #vec-bar[hidden] { display: none; }
 
 #select-bar button {
   padding: 4px 8px;
@@ -391,6 +404,42 @@ input.num:focus {
   outline: none;
   border-color: var(--accent);
 }
+
+/* ---------- vector stroke style controls (caps / joins / dashes, 9a) --------
+   Two identical `.vec-style` groups: one inline in the select bar (shown when
+   vector strokes are selected), one as a row under the brush panel's Vector
+   tab (sets the default for new strokes). Buttons mirror the Procreate-blue
+   selected look used by the tabs and library cards. */
+.vec-style { display: flex; align-items: center; gap: 8px; }
+.vec-style[hidden] { display: none; }
+#vec-style-panel { flex-wrap: wrap; padding: 8px 8px 0; } /* its own panel row */
+.vs-grp { display: flex; align-items: center; gap: 3px; }
+.vs-label { font-size: 11px; color: var(--text-dim); margin-right: 1px; }
+.vs-btn {
+  width: 22px;
+  padding: 3px 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  color: var(--text);
+  background: #26262f;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.vs-btn:hover { background: #2a2a35; }
+.vs-btn.active {
+  background: rgba(65, 166, 246, 0.28);
+  border-color: var(--accent);
+}
+.vs-dash input.num { width: 40px; }
+
+/* Width-profile row (9b): taper/swell presets + the Width toggle. Same look
+   as the style buttons, but these carry text labels so they auto-size. */
+.vec-widths { display: flex; align-items: center; gap: 8px; }
+.vec-widths[hidden] { display: none; }
+.vw-preset, .vw-toggle { width: auto; padding: 3px 7px; }
+.vw-toggle.active { background: rgba(244, 160, 32, 0.30); border-color: #f4a020; }
 
 /* ---------- brush library panel (floating overlay, Procreate-style) ---------- */
 #brush-panel {

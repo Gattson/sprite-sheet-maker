@@ -79,12 +79,27 @@ const state = {
   brushOpacity: 1,                   // freeform stroke opacity (0..1]
   smudgeStrength: 0.5,               // smudge slider (0..1) — remapped to a stamp alpha by smudgeAlpha()
   brushHardness: 0.8,                // freeform tip edge: 1 = hard, 0 = airbrush (round brush only)
+  // Per-tool tip settings (Procreate model): each tip tool remembers its OWN
+  // size/opacity/hardness so switching brush↔eraser↔smudge doesn't carry them
+  // across. The three fields above are the live MIRROR that everything reads;
+  // selectTool() saves the outgoing tool's mirror here and loads the incoming
+  // tool's. Session-only, like the mirror (never persisted, never in projects).
+  toolSettings: {
+    brush:  { size: 1, opacity: 1, hardness: 0.8 },
+    eraser: { size: 1, opacity: 1, hardness: 0.8 },
+    smudge: { size: 1, opacity: 1, hardness: 0.8 },
+  },
   brush: 'round',                    // active freeform brush id (see PRESET_BRUSHES) — tool state, never saved in projects
   fillTolerance: 0.12,               // freeform fill: how far colors may differ (0..1)
   color: DEFAULT_PALETTE[0],
   palette: DEFAULT_PALETTE.slice(),
   undo: [],                          // stacks of {frame, pixels} snapshots
   redo: [],
+  // Undo/redo are LOCKED to the active layer+frame by default: a click only
+  // affects the plane being worked on, stepping over other planes' history.
+  // Settings → "Undo across layers/frames" flips this to the classic global
+  // LIFO. Persisted per browser (see loadSettings), never in project files.
+  undoAcrossLayers: false,
   onionPrev: true,                   // ghost the previous frame under the canvas
   onionNext: false,                  // ghost the next frame too (second tint)
   // Procreate-style Animation Assist knobs (Onion… popover in the framebar).
@@ -239,6 +254,7 @@ let selection = null;        // {x, y, w, h} marquee in art coords
 let floating = null;         // {pixels, w, h, x, y, canvas, liftEntry, angle, sw, sh}
 let selDrag = null;          // {x0, y0, vec?} marquee anchor while dragging one out
 let vecPointDrag = null;     // 8b: dragging one control point of a vector stroke
+let vecWidthMode = false;    // 9b: control dots edit WIDTH (drag ⟂), not position
 let vecErase = null;         // 8c: whole-stroke eraser gesture on a vector layer
 let floatDrag = null;        // {dx, dy} grab offset while moving the buffer
 let xformDrag = null;        // freeform handle drag — see the select pointerdown path
@@ -806,9 +822,33 @@ function render() {
         const s = sel.strokes[0];
         const hotIdx = vecPointDrag ? vecPointDrag.index : hoverDot;
         ctx.lineWidth = 1;
-        for (const i of vecDotIndices(s, zoom)) {
+        const dots = vecDotIndices(s, zoom);
+        // Width mode (9b): a perpendicular whisker at each grabbable point
+        // spans the stroke's CURRENT thickness there, so it reads as a
+        // fatten/thin handle rather than a move handle (amber, not white).
+        if (vecWidthMode) {
+          const pts = s.pts;
+          for (const i of dots) {
+            const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)];
+            const tx = b[0] - a[0], ty = b[1] - a[1];
+            const tl = Math.hypot(tx, ty) || 1;
+            const nx = -ty / tl, ny = tx / tl; // unit normal to the stroke
+            const r = vecRadius(s, pts[i][2]) * zoom;
+            const cx = panX + pts[i][0] * zoom, cy = panY + pts[i][1] * zoom;
+            for (const [lw, col] of [[3, 'rgba(0,0,0,0.6)'], [1.5, '#f4a020']]) {
+              ctx.lineWidth = lw;
+              ctx.strokeStyle = col;
+              ctx.beginPath();
+              ctx.moveTo(cx - nx * r, cy - ny * r);
+              ctx.lineTo(cx + nx * r, cy + ny * r);
+              ctx.stroke();
+            }
+          }
+          ctx.lineWidth = 1;
+        }
+        for (const i of dots) {
           const hot = i === hotIdx;
-          ctx.fillStyle = hot ? '#41a6f6' : '#ffffff';
+          ctx.fillStyle = hot ? '#41a6f6' : (vecWidthMode ? '#f4a020' : '#ffffff');
           ctx.strokeStyle = hot ? '#ffffff' : 'rgba(0, 0, 0, 0.8)';
           ctx.beginPath();
           ctx.arc(panX + s.pts[i][0] * zoom, panY + s.pts[i][1] * zoom,
@@ -1127,28 +1167,51 @@ function popUndoIfUnchanged() {
 }
 
 /**
- * Shared engine for undo and redo: pop entries off `from` until one refers to
- * a frame AND layer that still exist (deleting either orphans its history —
- * those entries are silently skipped), restore the plane's pixels, and jump
- * to that frame + layer so the user can see what changed.
+ * Shared engine for undo and redo. Scans `from` from the top for the first
+ * APPLICABLE entry, restores its plane, and (in global mode) jumps to that
+ * frame + layer so the user sees what changed.
+ *
+ * Two ways an entry can be passed over while scanning:
+ *   - DEAD: its frame or layer was deleted, or a vector layer it belongs to was
+ *     rasterized away. Dead entries are discarded (spliced out) in passing —
+ *     same as the old pop-and-skip.
+ *   - LOCKED-OUT: undo is locked to the active plane (the default — Settings →
+ *     "Undo across layers/frames" is off) and this entry belongs to a different
+ *     layer/frame. These are STEPPED OVER, left in the stack for when their
+ *     plane is active again.
+ * Per-plane strict LIFO is preserved because every entry is a self-contained
+ * before/after for its OWN plane (full pixel snapshot / absolute ImageData
+ * patch / identity-keyed stroke-list op), so skipping other planes never
+ * corrupts this one. Planes are unique per (frame, layer), so identity match
+ * on the plane object already pins both.
  */
 function applyHistory(from, to) {
   commitFloat(); // undoing while floating first lands it (so it's undoable too)
-  while (from.length) {
-    const entry = from.pop();
+  const locked = !state.undoAcrossLayers;
+  const activePlane = curLayer();
+  let entry = null;
+  for (let i = from.length - 1; i >= 0; i--) {
+    const e = from[i];
+    const fi = state.frames.indexOf(e.frame);
+    const li = fi === -1 ? -1 : e.frame.layers.indexOf(e.plane);
+    if (fi === -1 || li === -1 || (e.vec && !e.plane.strokes)) {
+      from.splice(i, 1); // dead entry — discard and keep scanning
+      continue;
+    }
+    if (locked && e.plane !== activePlane) continue; // another plane — leave it
+    entry = e;
+    from.splice(i, 1);
+    break;
+  }
+  if (entry) {
     const fi = state.frames.indexOf(entry.frame);
-    if (fi === -1) continue; // frame was deleted; its history is dead
     const li = entry.frame.layers.indexOf(entry.plane);
-    if (li === -1) continue; // layer was deleted; same deal
     if (entry.pixels) {
       // Pixel-mode entry: swap full pixel-array snapshots.
       to.push({ frame: entry.frame, plane: entry.plane, pixels: entry.plane.pixels });
       entry.plane.pixels = entry.pixels;
       repaintLayer(entry.plane);
     } else if (entry.vec) {
-      // Rasterized-away layers have no stroke list anymore — their vector
-      // history is dead, skipped like entries for deleted frames/layers.
-      if (!entry.plane.strokes) continue;
       // Vector entry: mutate the stroke LIST — the truth — then re-rasterize
       // the mirror from it. Three ops: 'add' (painting) removes on undo and
       // re-adds on redo; 'remove' (delete/discard) is its inverse, restoring
@@ -1184,10 +1247,7 @@ function applyHistory(from, to) {
       renderVectorPlane(entry.plane);
       // Any live vector selection may now box strokes that moved or no
       // longer exist — drop it rather than show a stale box.
-      if (selection && selection.strokes) {
-        selection = null;
-        syncSelectBar();
-      }
+      dropVecSelection();
       to.push(entry);
     } else {
       // Freeform entry: stamp the appropriate patch back onto the plane. The
@@ -1198,15 +1258,26 @@ function applyHistory(from, to) {
     }
     recomposite(entry.frame);
     updateThumb(entry.frame);
+    // In locked mode these are already the active frame/layer (no-ops); in
+    // global mode they jump so the user sees what changed.
     selectFrame(fi);
     selectLayer(li);
-    break;
   }
   updateUI();
 }
 
 const undo = () => applyHistory(state.undo, state.redo);
 const redo = () => applyHistory(state.redo, state.undo);
+
+/** Is there an entry the current settings would actually apply? Locked mode
+ *  only counts entries for the active plane, so the Undo/Redo buttons disable
+ *  when a click would do nothing on the layer/frame being worked on. */
+function hasHistory(stack) {
+  if (!stack.length) return false;
+  if (state.undoAcrossLayers) return true;
+  const p = curLayer();
+  return stack.some((e) => e.plane === p);
+}
 
 /* ======================================================================
  * Tools
@@ -1622,26 +1693,187 @@ function crispXY(x, y, di) {
  * overlapping capsules at alpha 1 can't darken, so a stroke never builds
  * past its own opacity (the same trick as the bitmap stroke buffer). ---- */
 
-/** Per-point radius: Pen follows pressure, Marker is a uniform ribbon. */
-const vecRadius = (s, pressure) =>
-  (s.w / 2) * (s.pen === 'pen' ? Math.max(pressure, 0.05) : 1);
+/* Stroke STYLE (Phase 9a): caps, joins, dashes. `cap`/`join`/`dash` are
+ * ADDITIVE fields on a stroke — absent (old files) or the round/round/null
+ * defaults render exactly like 8a, so v4 files are unaffected and serialize
+ * byte-identical. `vecStyle` holds the pending style for NEW strokes: tool
+ * state, persisted in localStorage, never saved into a project (like the
+ * selected brush). The same controls also edit the SELECTED strokes. */
+const MITER_LIMIT = 4; // miter length / radius past this falls back to bevel
+                       // (SVG defaults to 10; 4 keeps art corners from growing
+                       // needle spikes at sharp joints)
+let vecStyle = { cap: 'round', join: 'round', dash: null, curve: false };
+
+/* Curve rendering (2026-07-22): a stroke's `pts` are its editable NODES; by
+ * default they're joined by straight capsules, so sparse nodes look faceted.
+ * With `curve` set, the SAME nodes are rendered as a smooth interpolating
+ * spline that passes THROUGH every node — centripetal Catmull-Rom (α=0.5,
+ * which avoids the cusps/loops uniform Catmull-Rom gets on uneven spacing).
+ * The stored data never changes (still a plain node array → rig-friendly and
+ * editable); only the rasterization densifies. `curve` is an additive boolean
+ * (absent = false = today's straight look), so it stays save-format v4. */
+
+/* Width profile (Phase 9b): `pts[i][2]` is now an editable WIDTH MULTIPLIER,
+ * not raw pressure — the base radius `s.w/2` times this per point, so a stroke
+ * can taper to a near-point (WIDTH_MIN) or SWELL past its base width up to
+ * WIDTH_MAX. At DRAW time Pen seeds the multiplier from stylus pressure and
+ * Marker seeds a flat 1 (see vecSeed); after that the multiplier is edited by
+ * the width handles / taper presets, never re-derived. cleanStroke widened its
+ * clamp and normalizes old Marker files (which stored raw pressure) to 1 — all
+ * backward-tolerant, so this stays save-format v4. */
+const WIDTH_MIN = 0.01; // thinnest a point may taper to (0 would vanish)
+const WIDTH_MAX = 3;    // swell ceiling: 3× the base radius (owner call)
+
+/** Per-point radius: the base half-width scaled by the point's width
+ *  multiplier. Producers keep the multiplier in [WIDTH_MIN, WIDTH_MAX]. */
+const vecRadius = (s, m) => (s.w / 2) * m;
+
+/** The width multiplier a NEW point is born with: Pen tapers from pressure
+ *  (floored so the lightest touch still shows), Marker is uniform. */
+const vecSeed = (pen, pressure) => (pen === 'pen' ? Math.max(pressure, 0.05) : 1);
 
 /** Deep-copy a stroke so planes never share point arrays (dup frame/layer). */
 const cloneStroke = (s) => ({
   color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
+  cap: s.cap || 'round', join: s.join || 'round',
+  dash: s.dash ? s.dash.slice() : null, curve: !!s.curve,
   pts: s.pts.map((p) => p.slice()),
 });
+
+/** The point list a curved stroke actually rasterizes to: its nodes densified
+ *  into a centripetal Catmull-Rom spline through them (x, y AND the width
+ *  multiplier). Straight strokes (or <3 nodes) return their nodes unchanged.
+ *  Phantom end nodes are reflected so the ends keep a natural tangent. PURE
+ *  (unit-tested via __ssmTest). */
+function vecCurvePoints(s) {
+  const p = s.pts;
+  if (!s.curve || p.length < 3) return p;
+  const n = p.length;
+  const at = (i) =>
+    i < 0 ? [2 * p[0][0] - p[1][0], 2 * p[0][1] - p[1][1], p[0][2]]
+    : i >= n ? [2 * p[n - 1][0] - p[n - 2][0], 2 * p[n - 1][1] - p[n - 2][1], p[n - 1][2]]
+    : p[i];
+  const out = [p[0].slice()];
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+    const dt = (a, b) => Math.max(Math.pow(Math.hypot(b[0] - a[0], b[1] - a[1]), 0.5), 1e-4);
+    const t0 = 0, t1 = t0 + dt(p0, p1), t2 = t1 + dt(p1, p2), t3 = t2 + dt(p2, p3);
+    const segLen = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+    const steps = clamp(Math.ceil(segLen / 3), 1, 32); // ~3 art-px per sample
+    for (let k = 1; k <= steps; k++) {
+      const t = t1 + (t2 - t1) * (k / steps);
+      const lerp = (u, av, bv, ta, tb) => ((tb - u) / (tb - ta)) * av + ((u - ta) / (tb - ta)) * bv;
+      const a1x = lerp(t, p0[0], p1[0], t0, t1), a1y = lerp(t, p0[1], p1[1], t0, t1);
+      const a2x = lerp(t, p1[0], p2[0], t1, t2), a2y = lerp(t, p1[1], p2[1], t1, t2);
+      const a3x = lerp(t, p2[0], p3[0], t2, t3), a3y = lerp(t, p2[1], p3[1], t2, t3);
+      const b1x = lerp(t, a1x, a2x, t0, t2), b1y = lerp(t, a1y, a2y, t0, t2);
+      const b2x = lerp(t, a2x, a3x, t1, t3), b2y = lerp(t, a2y, a3y, t1, t3);
+      out.push([
+        lerp(t, b1x, b2x, t1, t2),
+        lerp(t, b1y, b2y, t1, t2),
+        p1[2] + (p2[2] - p1[2]) * (k / steps), // width: linear across the span
+      ]);
+    }
+  }
+  return out;
+}
 
 /** A stroke's dirty rect {x0,y0,x1,y1} in float art px (feed to clampRect):
  *  point bounds padded by the largest radius + 1px of anti-aliasing. PURE. */
 function strokeBounds(s) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, r = 0;
-  for (const p of s.pts) {
+  for (const p of vecCurvePoints(s)) { // spline samples so the box covers the curve
     x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]);
     y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]);
     r = Math.max(r, vecRadius(s, p[2]));
   }
-  return { x0: x0 - r - 1, y0: y0 - r - 1, x1: x1 + r + 1, y1: y1 + r + 1 };
+  // Round caps/joins reach exactly r; square caps reach a corner at r·√2;
+  // miter joins can spike out to MITER_LIMIT·r. Pad by the widest of these
+  // (a safe superset — an over-generous dirty rect only costs a little blit).
+  let f = 1;
+  if ((s.cap || 'round') === 'square') f = Math.max(f, Math.SQRT2);
+  if ((s.join || 'round') === 'miter') f = Math.max(f, MITER_LIMIT);
+  const pad = r * f + 1; // +1 for the anti-aliased rim
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+
+/** Overwrite a stroke's per-point width multipliers with a taper/swell
+ *  profile keyed on arc-length fraction t∈[0,1]. Presets reach at most the
+ *  base width (multiplier 1) — going FATTER than base is the width handles'
+ *  job. Mutates the stroke's own points; callers wrap it in
+ *  editSelectedStrokes for undo. PURE (unit-tested via __ssmTest). */
+function applyWidthProfile(s, kind) {
+  const pts = s.pts;
+  const n = pts.length;
+  if (n === 1) { pts[0][2] = 1; return; }
+  const cum = [0]; // cumulative arc length so taper follows real distance
+  for (let i = 1; i < n; i++) {
+    cum[i] = cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+  }
+  const total = cum[n - 1] || 1;
+  for (let i = 0; i < n; i++) {
+    const t = cum[i] / total;
+    let m;
+    if (kind === 'in') m = t;                    // thin start → full end
+    else if (kind === 'out') m = 1 - t;          // full start → thin end
+    else if (kind === 'both') m = Math.sin(Math.PI * t); // thin ends, full middle
+    else m = 1;                                  // uniform
+    pts[i][2] = clamp(m, WIDTH_MIN, 1);
+  }
+}
+
+/* --- Path cleanup (Phase 9c): smooth de-jitters, simplify decimates. Both
+ * are POLYLINE ops (no bezier — the point array stays rig-friendly) and both
+ * carry the width multiplier [2] through. Pure, hook-exported, unit-tested;
+ * callers wrap them in editSelectedStrokes for undo. --- */
+
+/** One pass of a 3-tap [¼,½,¼] moving average — pulls jittery interior points
+ *  toward their neighbours (x, y AND the width multiplier), endpoints pinned.
+ *  Point count is unchanged, so repeated presses smooth progressively and the
+ *  path never grows. Returns NEW point arrays. */
+function smoothStroke(pts) {
+  const n = pts.length;
+  if (n <= 2) return pts.map((p) => p.slice());
+  const out = [pts[0].slice()];
+  for (let i = 1; i < n - 1; i++) {
+    const a = pts[i - 1], b = pts[i], c = pts[i + 1];
+    out.push([
+      0.25 * a[0] + 0.5 * b[0] + 0.25 * c[0],
+      0.25 * a[1] + 0.5 * b[1] + 0.25 * c[1],
+      0.25 * a[2] + 0.5 * b[2] + 0.25 * c[2],
+    ]);
+  }
+  out.push(pts[n - 1].slice());
+  return out;
+}
+
+/** Douglas–Peucker reduction: drop points that sit within `tol` art-px of the
+ *  straightened path, KEEPING the ones that carry the shape (and their width
+ *  multipliers — DP selects a subset, it never resamples). Iterative so a
+ *  long path can't blow the stack. Returns NEW point arrays. */
+function simplifyStroke(pts, tol) {
+  const n = pts.length;
+  if (n <= 2 || !(tol > 0)) return pts.map((p) => p.slice());
+  const keep = new Uint8Array(n);
+  keep[0] = keep[n - 1] = 1;
+  const tol2 = tol * tol;
+  const stack = [[0, n - 1]];
+  while (stack.length) {
+    const [lo, hi] = stack.pop();
+    if (hi - lo < 2) continue;
+    let maxD = -1, idx = -1;
+    for (let i = lo + 1; i < hi; i++) {
+      const d = segDist2(pts[i][0], pts[i][1], pts[lo][0], pts[lo][1], pts[hi][0], pts[hi][1]);
+      if (d > maxD) { maxD = d; idx = i; }
+    }
+    if (maxD > tol2 && idx !== -1) {
+      keep[idx] = 1;
+      stack.push([lo, idx], [idx, hi]);
+    }
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(pts[i].slice());
+  return out;
 }
 
 /** Draw a whole stroke into ctx `g` at full alpha as ONE path filled ONCE:
@@ -1654,30 +1886,182 @@ function strokeBounds(s) {
 function drawVecStroke(g, s) {
   g.fillStyle = s.color;
   g.beginPath();
-  const pts = s.pts;
-  for (let i = 0; i < pts.length; i++) {
-    const [x, y, p] = pts[i];
-    const r = vecRadius(s, p);
-    g.moveTo(x + r, y); // each subpath starts fresh — no connecting lines
-    g.arc(x, y, r, 0, Math.PI * 2); // anticlockwise=false = clockwise on screen
-    if (i) {
-      const [x0, y0, p0] = pts[i - 1];
-      const r0 = vecRadius(s, p0);
-      const dx = x - x0, dy = y - y0;
-      const len = Math.hypot(dx, dy);
-      if (len > 1e-6) {
-        const nx = -dy / len, ny = dx / len; // left normal to the segment
-        // p0−n·r0 → p1−n·r1 → p1+n·r1 → p0+n·r0 walks clockwise (y-down
-        // screen coords), matching arc()'s orientation above.
-        g.moveTo(x0 - nx * r0, y0 - ny * r0);
-        g.lineTo(x - nx * r, y - ny * r);
-        g.lineTo(x + nx * r, y + ny * r);
-        g.lineTo(x0 + nx * r0, y0 + ny * r0);
-        g.closePath();
-      }
+  const cap = s.cap || 'round';
+  const join = s.join || 'round';
+  // Precompute per-point radius: dashing cuts BETWEEN points and interpolates
+  // it linearly, and the geometry below never re-derives it. Each sample is
+  // [x, y, r] in art coords. Curved strokes densify to a spline first.
+  const samples = vecCurvePoints(s).map((p) => [p[0], p[1], vecRadius(s, p[2])]);
+  const runs = s.dash ? dashRuns(samples, s.dash) : [samples];
+  for (const run of runs) buildRunPath(g, run, cap, join);
+  g.fill();
+}
+
+/** Emit `poly` (an array of [x,y]) as ONE clockwise-wound (screen y-down)
+ *  subpath, so the nonzero fill UNIONS it with everything else rather than
+ *  punching a hole. Winding is normalized by signed area, so callers build
+ *  join/cap shapes without reasoning about turn direction. The existing body
+ *  quads wind with POSITIVE shoelace area (their known-good CW), so we keep
+ *  that orientation and reverse only when area is negative. Degenerate polys
+ *  (near-zero area) are skipped. */
+function fillPolyCW(g, poly) {
+  let area = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    area += a[0] * b[1] - b[0] * a[1];
+  }
+  if (Math.abs(area) < 1e-9) return;
+  const order = area < 0 ? poly.slice().reverse() : poly;
+  g.moveTo(order[0][0], order[0][1]);
+  for (let i = 1; i < order.length; i++) g.lineTo(order[i][0], order[i][1]);
+  g.closePath();
+}
+
+/** A full-circle subpath, wound to match fillPolyCW / the old arc winding. */
+function addCircle(g, x, y, r) {
+  if (r < 1e-6) return;
+  g.moveTo(x + r, y);
+  g.arc(x, y, r, 0, Math.PI * 2); // anticlockwise=false = clockwise on screen
+}
+
+/** The body trapezoid between two samples a,b = [x,y,r] (round bulges at the
+ *  ends come from the joins/caps, not here). */
+function addSegQuad(g, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return;
+  const nx = -dy / len, ny = dx / len; // left normal
+  fillPolyCW(g, [
+    [a[0] - nx * a[2], a[1] - ny * a[2]],
+    [b[0] - nx * b[2], b[1] - ny * b[2]],
+    [b[0] + nx * b[2], b[1] + ny * b[2]],
+    [a[0] + nx * a[2], a[1] + ny * a[2]],
+  ]);
+}
+
+/** Intersection of line (px,py)+t·(dx,dy) with (qx,qy)+u·(ex,ey), or null if
+ *  parallel. Used to find a miter apex. */
+function lineIntersect(px, py, dx, dy, qx, qy, ex, ey) {
+  const denom = dx * ey - dy * ex;
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = ((qx - px) * ey - (qy - py) * ex) / denom;
+  return [px + dx * t, py + dy * t];
+}
+
+/** Fill the OUTER corner at an interior vertex `v` (=[x,y,r]) between the
+ *  segments prev→v and v→next, per join style. Round draws a circle; bevel a
+ *  triangle across the outer gap; miter extends the two outer edges to their
+ *  apex (falling back to bevel past MITER_LIMIT). The inner side is already
+ *  covered by the overlapping body quads. */
+function addJoin(g, prev, v, next, join) {
+  const r = v[2];
+  if (join === 'round' || r < 1e-6) { addCircle(g, v[0], v[1], r); return; }
+  let ix = v[0] - prev[0], iy = v[1] - prev[1];
+  let ox = next[0] - v[0], oy = next[1] - v[1];
+  const il = Math.hypot(ix, iy), ol = Math.hypot(ox, oy);
+  if (il < 1e-6 || ol < 1e-6) { addCircle(g, v[0], v[1], r); return; }
+  ix /= il; iy /= il; ox /= ol; oy /= ol;
+  const turn = ix * oy - iy * ox; // screen y-down cross product
+  if (Math.abs(turn) < 1e-6) return; // collinear — no corner gap to fill
+  const sgn = turn < 0 ? 1 : -1;     // pick the convex (outer) side
+  const ninx = -iy * sgn, niny = ix * sgn;   // incoming outward normal
+  const noutx = -oy * sgn, nouty = ox * sgn; // outgoing outward normal
+  const A = [v[0] + ninx * r, v[1] + niny * r];   // incoming outer corner
+  const C = [v[0] + noutx * r, v[1] + nouty * r]; // outgoing outer corner
+  if (join === 'miter') {
+    const apex = lineIntersect(A[0], A[1], ix, iy, C[0], C[1], ox, oy);
+    if (apex &&
+        Math.hypot(apex[0] - v[0], apex[1] - v[1]) <= MITER_LIMIT * r) {
+      fillPolyCW(g, [[v[0], v[1]], A, apex, C]);
+      return;
     }
   }
-  g.fill();
+  fillPolyCW(g, [[v[0], v[1]], A, C]); // bevel (also the miter-limit fallback)
+}
+
+/** Cap the endpoint `end` (=[x,y,r]) of a run; `neighbor` is the adjacent
+ *  sample, so end−neighbor points OUTWARD. Round = half-disc (a full circle,
+ *  the body hides the inner half); butt = nothing (the body quad ends flat);
+ *  square = a flat cap pushed out by r. */
+function addCap(g, end, neighbor, cap) {
+  const r = end[2];
+  if (r < 1e-6) return;
+  if (cap === 'round') { addCircle(g, end[0], end[1], r); return; }
+  if (cap === 'butt') return;
+  // square:
+  let tx = end[0] - neighbor[0], ty = end[1] - neighbor[1];
+  const l = Math.hypot(tx, ty);
+  if (l < 1e-6) { addCapDot(g, end, 'square'); return; }
+  tx /= l; ty /= l;
+  const nx = -ty, ny = tx;
+  const ex = end[0] + tx * r, ey = end[1] + ty * r; // extended flat edge
+  fillPolyCW(g, [
+    [end[0] - nx * r, end[1] - ny * r],
+    [ex - nx * r, ey - ny * r],
+    [ex + nx * r, ey + ny * r],
+    [end[0] + nx * r, end[1] + ny * r],
+  ]);
+}
+
+/** A single-sample run (a click, or a lone dash cell): draw the isolated dot
+ *  per cap style. Butt caps have no length, so the dot is invisible. */
+function addCapDot(g, pt, cap) {
+  const [x, y, r] = pt;
+  if (r < 1e-6 || cap === 'butt') return;
+  if (cap === 'square') {
+    fillPolyCW(g, [[x - r, y - r], [x + r, y - r], [x + r, y + r], [x - r, y + r]]);
+  } else {
+    addCircle(g, x, y, r);
+  }
+}
+
+/** Build one contiguous run's subpaths: body quads, interior joins, end caps.
+ *  `run` is an array of [x,y,r] samples. */
+function buildRunPath(g, run, cap, join) {
+  const n = run.length;
+  if (n === 0) return;
+  if (n === 1) { addCapDot(g, run[0], cap); return; }
+  for (let i = 1; i < n; i++) addSegQuad(g, run[i - 1], run[i]);
+  for (let i = 1; i < n - 1; i++) addJoin(g, run[i - 1], run[i], run[i + 1], join);
+  addCap(g, run[0], run[1], cap);
+  addCap(g, run[n - 1], run[n - 2], cap);
+}
+
+/** Split a sample polyline into its "on" runs for a dash pattern. `samples`
+ *  are [x,y,r] triples; `dash` is [on, off] in art px. Walks by arc length
+ *  from the start (which begins "on"), interpolating x/y/r at each on↔off
+ *  boundary, and returns an array of runs (each an [x,y,r] array). Invalid or
+ *  degenerate patterns fall back to one solid run. PURE — unit-tested. */
+function dashRuns(samples, dash) {
+  const on = dash && dash[0];
+  const off = dash && dash.length > 1 ? dash[1] : 0;
+  if (!(on > 0) || !(on + off > 1e-6) || samples.length < 2) return [samples];
+  const lerp = (a, b, t) => [
+    a[0] + (b[0] - a[0]) * t,
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t,
+  ];
+  const runs = [];
+  let penOn = true;
+  let remain = on;                       // length left in the current cell
+  let run = [samples[0].slice()];        // the open "on" run collects points
+  for (let i = 1; i < samples.length; i++) {
+    const a = samples[i - 1], b = samples[i];
+    const segLen = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    let pos = 0;                          // distance consumed along [a,b]
+    while (segLen - pos > remain + 1e-9) {
+      pos += remain;
+      const cut = lerp(a, b, pos / segLen);
+      if (penOn) { run.push(cut); runs.push(run); run = null; }
+      else { run = [cut]; }
+      penOn = !penOn;
+      remain = penOn ? on : off;
+    }
+    remain -= segLen - pos;
+    if (penOn) run.push(b.slice());       // vertex inside an "on" cell
+  }
+  if (penOn && run && run.length) runs.push(run);
+  return runs.length ? runs : [samples];
 }
 
 // Shared full-alpha scratch for vector rendering, rebuilt when the project
@@ -1725,12 +2109,20 @@ function renderVectorPlane(plane, exclude) {
  * only commitFloat() applies it to the points, so editing is always exact. */
 
 /** Snapshot the editable fields of a stroke (for undo edits / drag cancel). */
-const snapVec = (s) => ({ color: s.color, w: s.w, pts: s.pts.map((p) => p.slice()) });
+const snapVec = (s) => ({
+  color: s.color, w: s.w, cap: s.cap, join: s.join,
+  dash: s.dash ? s.dash.slice() : null, curve: !!s.curve,
+  pts: s.pts.map((p) => p.slice()),
+});
 
 /** Pour a snapshot back into the SAME stroke object (identity-keyed undo). */
 function applyVecSnap(s, snap) {
   s.color = snap.color;
   s.w = snap.w;
+  s.cap = snap.cap;
+  s.join = snap.join;
+  s.dash = snap.dash ? snap.dash.slice() : null;
+  s.curve = !!snap.curve;
   s.pts = snap.pts.map((p) => p.slice());
 }
 
@@ -1743,6 +2135,32 @@ function makeVecSelection(strokes) {
     b = growRect(b, sb.x0, sb.y0, sb.x1, sb.y1);
   }
   return { x: b.x0, y: b.y0, w: b.x1 - b.x0, h: b.y1 - b.y0, strokes };
+}
+
+/**
+ * Drop a vector selection (plain marquees are left alone).
+ *
+ * A vector selection holds DIRECT REFERENCES to one plane's stroke objects,
+ * and planes never share them — makePlane deep-clones every stroke list. So
+ * the moment the edited plane changes underneath it (frame switch, layer
+ * switch), the box is aimed at strokes that aren't on screen any more, and
+ * every edit path that reads `selection.strokes` — the transform commit, the
+ * control-dot drag, the whole vector bar — would quietly rewrite the plane
+ * we just left while re-rendering the one we're looking at. That reads as
+ * "the transform does nothing" and silently corrupts the other frame.
+ *
+ * Dropping the box is the same call undo (applyHistory) and rasterizeLayer
+ * already make for the same reason. dupFrame is the one caller that wants
+ * the selection back afterwards — it re-establishes it against the
+ * duplicate's OWN clones rather than carrying the stale references over.
+ *
+ * A plain {x,y,w,h} marquee is layer- and frame-agnostic (it's just a rect),
+ * so it survives — only identity-bound selections are dropped.
+ */
+function dropVecSelection() {
+  if (!selection || !selection.strokes) return;
+  selection = null;
+  syncSelectBar();
 }
 
 /** The transform a vector float's box will apply at commit: scale (flips
@@ -1765,6 +2183,8 @@ function xformStroke(s, t) {
   const wScale = (Math.abs(t.sx) + Math.abs(t.sy)) / 2;
   return {
     color: s.color, opacity: s.opacity, pen: s.pen,
+    cap: s.cap, join: s.join, curve: s.curve, // ride unchanged
+    dash: s.dash ? s.dash.map((d) => d * wScale) : null, // px lengths scale
     w: clamp(s.w * wScale, 0.1, MAX_BRUSH_FREE),
     pts: s.pts.map((p) => {
       const v = rotVec((p[0] - t.ox) * t.sx, (p[1] - t.oy) * t.sy, t.angle);
@@ -1784,7 +2204,7 @@ function segDist2(px, py, x0, y0, x1, y1) {
 
 /** Does (x,y) land on the stroke's ink (+slack, all in art px)? PURE. */
 function strokeHit(s, x, y, slack) {
-  const pts = s.pts;
+  const pts = vecCurvePoints(s); // hit-test the rendered curve, not the node polygon
   if (pts.length === 1) {
     const r = vecRadius(s, pts[0][2]) + slack;
     return (x - pts[0][0]) ** 2 + (y - pts[0][1]) ** 2 <= r * r;
@@ -2047,7 +2467,8 @@ function beginStroke(x, y, pressure, erase, smudge, vector) {
     // pinned at stroke start. Present = this stroke records an editable
     // object instead of pixels; stamp() is bypassed (vecSeg draws capsules).
     vec: vector
-      ? { pen: curBrush().pen, w: state.brushSize, pts: [[x, y, pressure]] }
+      ? { pen: curBrush().pen, w: state.brushSize,
+          pts: [[x, y, vecSeed(curBrush().pen, pressure)]] }
       : null,
     // Alpha lock, pinned at stroke start: the buffer merges with source-atop
     // instead of source-over, so paint lands only where the plane already
@@ -2292,8 +2713,9 @@ function moveStroke(rx, ry, pressure) {
     const pts = stroke.vec.pts;
     const last = pts[pts.length - 1];
     if (Math.hypot(nx - last[0], ny - last[1]) >= 0.5) {
-      pts.push([nx, ny, pressure]);
-      vecRefresh(last[0], last[1], last[2], nx, ny, pressure);
+      const m = vecSeed(stroke.vec.pen, pressure);
+      pts.push([nx, ny, m]);
+      vecRefresh(last[0], last[1], last[2], nx, ny, m);
     }
     stroke.x = nx;
     stroke.y = ny;
@@ -2371,13 +2793,28 @@ function finishStroke() {
     // The undo entry carries the object, not pixels — undo removes it from
     // the list and re-rasterizes, so truth and mirror can never diverge.
     const obj = { color: s.color, w: s.vec.w, opacity: s.opacity,
-                  pen: s.vec.pen, pts: s.vec.pts };
+                  pen: s.vec.pen,
+                  // New strokes take the pending style (9a); undo/xform/clone
+                  // all thread these fields, so once set they stay consistent.
+                  cap: vecStyle.cap, join: vecStyle.join,
+                  dash: vecStyle.dash ? vecStyle.dash.slice() : null,
+                  curve: vecStyle.curve,
+                  pts: s.vec.pts };
     s.plane.strokes.push(obj);
-    s.plane.ctx.putImageData(s.prevCtx.getImageData(r.x, r.y, r.w, r.h), r.x, r.y);
+    // A curved stroke's spline differs from the straight incremental preview,
+    // so re-rasterize it from the node list and patch over the curve's own
+    // (possibly wider) bounds; straight strokes adopt the preview as before.
+    let dirty = r;
+    if (obj.curve) {
+      renderVectorPlane(s.plane);
+      dirty = clampRect(strokeBounds(obj)) || r;
+    } else {
+      s.plane.ctx.putImageData(s.prevCtx.getImageData(r.x, r.y, r.w, r.h), r.x, r.y);
+    }
     s.plane.touched = true;
-    pushFreeUndo({ frame: s.frame, plane: s.plane, rect: r,
+    pushFreeUndo({ frame: s.frame, plane: s.plane, rect: dirty,
                    vec: { op: 'add', stroke: obj } });
-    patchComposite(s.frame, r);
+    patchComposite(s.frame, dirty);
     updateThumb(s.frame);
     drawLayerThumb(state.layer);
     updateUI();
@@ -2409,6 +2846,14 @@ function finishStroke() {
 /** Show or hide the selection action bar. Call whenever selection/floating change. */
 function syncSelectBar() {
   $('select-bar').hidden = !(selection || floating);
+  // The vector bar (second row) only makes sense with strokes selected; keep
+  // the Width toggle button honest with the live mode.
+  const hasVec = !!(selection && selection.strokes);
+  $('vec-bar').hidden = !hasVec;
+  $('btn-vec-width').classList.toggle('active', vecWidthMode);
+  // Curve button reflects the selected stroke (single) or the new-stroke default.
+  const one = hasVec && selection.strokes.length === 1 ? selection.strokes[0] : null;
+  $('btn-vec-curve').classList.toggle('active', one ? !!one.curve : vecStyle.curve);
   updateSelReadout();
 }
 
@@ -3263,8 +3708,11 @@ view.addEventListener('pointerdown', (e) => {
       const q0 = screenToArtF(sx, sy);
       const di = vecDotAt(s0, q0.x, q0.y, state.zoom);
       if (di !== -1) {
+        // Width mode (toggle) or Alt held → drag ⟂ edits thickness (9b);
+        // otherwise the dot repositions the point (8b).
         vecPointDrag = { stroke: s0, index: di, before: snapVec(s0),
-                         plane: curLayer(), frame: cur(), moved: false };
+                         plane: curLayer(), frame: cur(), moved: false,
+                         width: vecWidthMode || e.altKey };
         view.setPointerCapture(e.pointerId);
         return;
       }
@@ -3548,17 +3996,32 @@ view.addEventListener('pointermove', (e) => {
     const d = vecPointDrag;
     const q = screenToArtF(sx, sy);
     const P0 = d.before.pts;
-    const dx = q.x - P0[d.index][0];
-    const dy = q.y - P0[d.index][1];
     const K = Math.max(2, Math.round(P0.length / 6));
     const pts = d.stroke.pts;
-    for (let j = Math.max(0, d.index - K); j <= Math.min(pts.length - 1, d.index + K); j++) {
-      const t = Math.abs(j - d.index) / K;
-      const w = 0.5 * (1 + Math.cos(Math.PI * t));
-      pts[j][0] = P0[j][0] + dx * w;
-      pts[j][1] = P0[j][1] + dy * w;
+    if (d.width) {
+      // Width edit (9b): the grabbed point's radius = the pointer's distance
+      // from the centerline; neighbors in the same cosine window ride the
+      // delta so the swell/pinch blends instead of spiking one point.
+      const targetR = Math.hypot(q.x - P0[d.index][0], q.y - P0[d.index][1]);
+      const targetM = clamp((targetR * 2) / d.stroke.w, WIDTH_MIN, WIDTH_MAX);
+      const dM = targetM - P0[d.index][2];
+      for (let j = Math.max(0, d.index - K); j <= Math.min(pts.length - 1, d.index + K); j++) {
+        const t = Math.abs(j - d.index) / K;
+        const w = 0.5 * (1 + Math.cos(Math.PI * t));
+        pts[j][2] = clamp(P0[j][2] + dM * w, WIDTH_MIN, WIDTH_MAX);
+      }
+      d.moved = d.moved || dM !== 0;
+    } else {
+      const dx = q.x - P0[d.index][0];
+      const dy = q.y - P0[d.index][1];
+      for (let j = Math.max(0, d.index - K); j <= Math.min(pts.length - 1, d.index + K); j++) {
+        const t = Math.abs(j - d.index) / K;
+        const w = 0.5 * (1 + Math.cos(Math.PI * t));
+        pts[j][0] = P0[j][0] + dx * w;
+        pts[j][1] = P0[j][1] + dy * w;
+      }
+      d.moved = d.moved || dx !== 0 || dy !== 0;
     }
-    d.moved = d.moved || dx !== 0 || dy !== 0;
     renderVectorPlane(d.plane);
     recomposite(d.frame);
     selection = makeVecSelection([d.stroke]); // the box tracks the reshape
@@ -3782,9 +4245,10 @@ wrap.addEventListener('wheel', (e) => {
 window.addEventListener('keydown', (e) => {
   // Escape closes the topbar menus — checked before the input guard so it
   // also works while focus is in the File menu's W/H fields.
-  if (e.code === 'Escape' && (!fileMenu.hidden || !togglesMenu.hidden)) {
+  if (e.code === 'Escape' && (!fileMenu.hidden || !togglesMenu.hidden || !settingsMenu.hidden)) {
     fileMenu.hidden = true;
     togglesMenu.hidden = true;
+    settingsMenu.hidden = true;
     return;
   }
   // Don't steal keystrokes from inputs, the animation textarea, or selects.
@@ -3903,12 +4367,14 @@ function selectFrame(i) {
   // undo's jump-to-frame, and frame ops all funnel through here.
   if (playing) setPlaying(false);
   commitFloat(); // a floating selection belongs to the frame it was lifted from
+  dropVecSelection(); // ...and so does a vector one — see the helper
   state.frame = clamp(i, 0, state.frames.length - 1);
   document.querySelectorAll('#frames .frame').forEach((el, n) => {
     el.classList.toggle('active', n === state.frame);
   });
   refreshLayerThumbs(); // layer panel thumbnails track the edited frame
   updateStatus();
+  updateUI(); // Undo/Redo availability is per-plane in locked mode
   render();
 }
 
@@ -3922,12 +4388,31 @@ function insertFrame(f) {
 const addFrame = () => insertFrame(makeFrame());
 
 /** Duplicate = the real animation workflow: copy the pose, then nudge it.
- *  (Freeform planes copy canvas-to-canvas via makePlane's drawImage path.) */
+ *  (Freeform planes copy canvas-to-canvas via makePlane's drawImage path.)
+ *
+ *  Dup-then-nudge is THE workflow, so a vector selection is carried over —
+ *  but by re-selecting the duplicate's own clones, never by keeping the old
+ *  frame's stroke references (see dropVecSelection for why that corrupts).
+ *  makePlane builds the copy with `src.map(cloneStroke)`, so list positions
+ *  are 1:1 and an index is a stable handle into the duplicate. */
 function dupFrame() {
   commitFloat(); // so the duplicate includes what's being moved
+  // Record WHICH strokes are selected before insertFrame's frame switch
+  // drops the box. Indices, not references — the references are about to
+  // become the wrong frame's.
+  const src = curLayer();
+  const picked = selection && selection.strokes && src.strokes
+    ? selection.strokes.map((s) => src.strokes.indexOf(s)).filter((i) => i !== -1)
+    : null;
   insertFrame(makeFrame(cur().layers.map(
     (l) => (l.strokes ? l.strokes                       // vector: makePlane clones
       : state.mode === 'free' ? l.canvas : l.pixels.slice()))));
+  if (picked && picked.length) {
+    const dst = curLayer(); // same layer index, now on the duplicate
+    selection = makeVecSelection(picked.map((i) => dst.strokes[i]));
+    syncSelectBar();
+    render();
+  }
 }
 
 function deleteFrame() {
@@ -4003,6 +4488,28 @@ function bindToggle(id, key, after) {
 bindToggle('chk-onion-prev', 'onionPrev');
 bindToggle('chk-onion-next', 'onionNext');
 bindToggle('chk-origin', 'showOrigin');
+
+/* --- Settings menu -------------------------------------------------------
+ * "Undo across layers/frames" unlocks undo/redo from the active plane. Off by
+ * default (undo stays local to the layer+frame being worked on). Persisted per
+ * browser, like the onion knobs — a workflow preference, never a project field.
+ * updateUI() after the flip re-evaluates the Undo/Redo buttons, whose
+ * availability now depends on this. */
+bindToggle('chk-undo-across', 'undoAcrossLayers', () => {
+  try { localStorage.setItem('ssm.undoAcross', state.undoAcrossLayers ? '1' : '0'); }
+  catch { /* storage blocked — the setting just won't survive reload */ }
+  updateUI();
+});
+
+/** Restore per-browser editor settings on boot. */
+function loadSettings() {
+  try {
+    if (localStorage.getItem('ssm.undoAcross') === '1') {
+      state.undoAcrossLayers = true;
+      $('chk-undo-across').checked = true;
+    }
+  } catch { /* storage blocked — defaults stand */ }
+}
 
 /** Show/hide whole workspace panels (the Toggles menu). Hiding the tool
  *  panel or the frame strip resizes the canvas area — the ResizeObserver
@@ -4095,9 +4602,12 @@ function loadOnionSettings() {
 /** Switch which layer is being edited and re-highlight the panel. */
 function selectLayer(i) {
   commitFloat(); // a floating selection belongs to the layer it was lifted from
+  dropVecSelection(); // ...and so does a vector one — see the helper
   state.layer = clamp(i, 0, state.layers.length - 1);
   renderLayers();
   updateStatus();
+  updateUI(); // Undo/Redo availability is per-plane in locked mode
+  render();   // the stroke box (if any) just went away
 }
 
 const LAYER_THUMB = 34; // max thumbnail edge in the panel, px
@@ -4292,10 +4802,7 @@ function rasterizeLayer() {
   }
   if (!confirm(`Rasterize layer "${m.name}" on every frame? Strokes become plain pixels — this can't be undone.`)) return;
   commitFloat();
-  if (selection && selection.strokes) {
-    selection = null;
-    syncSelectBar();
-  }
+  dropVecSelection(); // its strokes are about to stop existing
   for (const f of state.frames) delete f.layers[state.layer].strokes;
   m.kind = 'raster';
   renderLayers(); // the V badge goes away
@@ -4627,6 +5134,12 @@ function saveProject() {
       l.strokes
         ? { strokes: l.strokes.map((s) => ({
             color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
+            // Serialize style only when non-default, so existing v4 files stay
+            // byte-identical and no version bump is needed (like 6d in v3).
+            ...(s.cap && s.cap !== 'round' ? { cap: s.cap } : {}),
+            ...(s.join && s.join !== 'round' ? { join: s.join } : {}),
+            ...(s.dash ? { dash: s.dash.map(r2) } : {}),
+            ...(s.curve ? { curve: 1 } : {}),
             pts: s.pts.map((p) => [r2(p[0]), r2(p[1]), r2(p[2])]),
           })) }
         : state.mode === 'free' ? l.canvas.toDataURL('image/png') : l.pixels)),
@@ -4677,19 +5190,40 @@ async function parseProject(text) {
   // pixels become transparent" policy above.
   const cleanStroke = (s) => {
     if (!s || !Array.isArray(s.pts) || !s.pts.length) return null;
+    // pts[i][2] is a width multiplier (9b). Marker predates that — old files
+    // stored raw pressure there but rendered uniform, so normalize Marker to
+    // a flat 1 on load. Pen keeps its per-point value, clamped to the swell
+    // range (a v4-with-swell file opened in the OLD app clamps back to ≤1 —
+    // graceful: taper survives, only the bulge is lost — so no version bump).
+    const marker = s.pen === 'marker';
     const pts = [];
     for (const p of s.pts) {
       const x = Array.isArray(p) ? +p[0] : NaN;
       const y = Array.isArray(p) ? +p[1] : NaN;
       if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
       const pr = +p[2];
-      pts.push([x, y, Number.isFinite(pr) ? clamp(pr, 0.01, 1) : 1]);
+      const m = marker ? 1 : (Number.isFinite(pr) ? clamp(pr, WIDTH_MIN, WIDTH_MAX) : 1);
+      pts.push([x, y, m]);
+    }
+    // Style fields (9a) are additive: absent → the round/round/null defaults,
+    // so v3-and-older files (and unstyled v4 strokes) read exactly as before.
+    let dash = null;
+    if (Array.isArray(s.dash) && s.dash.length >= 1) {
+      const dn = +s.dash[0];
+      const gp = s.dash.length > 1 ? +s.dash[1] : 0;
+      if (Number.isFinite(dn) && dn > 0) {
+        dash = [dn, Number.isFinite(gp) && gp >= 0 ? gp : 0];
+      }
     }
     return {
       color: isColor(s.color) ? s.color.toLowerCase() : '#000000',
       w: clamp(+s.w || 1, 1, MAX_BRUSH_FREE),
       opacity: typeof s.opacity === 'number' ? clamp(s.opacity, 0.01, 1) : 1,
       pen: s.pen === 'marker' ? 'marker' : 'pen',
+      cap: s.cap === 'butt' || s.cap === 'square' ? s.cap : 'round',
+      join: s.join === 'miter' || s.join === 'bevel' ? s.join : 'round',
+      dash,
+      curve: s.curve === 1 || s.curve === true,
       pts,
     };
   };
@@ -5533,7 +6067,137 @@ function setBrushTab(tab) {
   $('tab-vector').classList.toggle('active', tab === 'vector');
   // Imports are bitmap masks; the + button means nothing on the vector tab.
   $('btn-brush-import').hidden = tab === 'vector';
+  // The stroke-style row (caps/joins/dashes) only applies to vector pens.
+  $('vec-style-panel').hidden = tab !== 'vector';
   renderBrushList();
+}
+
+/* --- Stroke style controls (9a): caps, joins, dashes. Two identical
+ * `.vec-style` control groups exist — one in the brush panel's Vector tab
+ * (always visible there, so it sets the default for NEW strokes) and one in
+ * the select bar (shown when vector strokes are selected). A change updates
+ * the pending `vecStyle` AND, if a vector selection is live, edits those
+ * strokes — the same dual-purpose pattern as recolor (selectColor) and
+ * re-width (setBrushSize). --- */
+
+function persistVecStyle() {
+  try { localStorage.setItem('ssm.vecStyle', JSON.stringify(vecStyle)); }
+  catch { /* storage blocked — the default just won't survive reload */ }
+}
+
+/** Restore the pending stroke style from localStorage (validated like a
+ *  loaded stroke — a stray value falls back to the round/round/null default). */
+function loadVecStyle() {
+  let v = null;
+  try { v = JSON.parse(localStorage.getItem('ssm.vecStyle') || 'null'); }
+  catch { return; }
+  if (!v || typeof v !== 'object') return;
+  vecStyle.cap = v.cap === 'butt' || v.cap === 'square' ? v.cap : 'round';
+  vecStyle.join = v.join === 'miter' || v.join === 'bevel' ? v.join : 'round';
+  vecStyle.dash = Array.isArray(v.dash) && +v.dash[0] > 0
+    ? [+v.dash[0], v.dash.length > 1 && +v.dash[1] >= 0 ? +v.dash[1] : 0]
+    : null;
+  vecStyle.curve = v.curve === true;
+}
+
+/** Read a group's two dash inputs into a [on, off] pair (or null = solid). */
+function readDashInputs(box) {
+  const on = parseFloat(box.querySelector('.vs-dash-on').value);
+  const off = parseFloat(box.querySelector('.vs-dash-off').value);
+  if (Number.isFinite(on) && on > 0) {
+    return [on, Number.isFinite(off) && off >= 0 ? off : 0];
+  }
+  return null;
+}
+
+/** Apply a style patch: set the pending default, persist, and (if a vector
+ *  selection is live) edit the selected strokes — one undo entry per field. */
+function applyVecStyle(patch) {
+  Object.assign(vecStyle, patch);
+  persistVecStyle();
+  if ('cap' in patch) editSelectedStrokes('cap', (s) => { s.cap = patch.cap; });
+  if ('join' in patch) editSelectedStrokes('join', (s) => { s.join = patch.join; });
+  if ('dash' in patch) {
+    editSelectedStrokes('dash', (s) => { s.dash = patch.dash ? patch.dash.slice() : null; });
+  }
+  syncVecStyleUI();
+}
+
+/** Push `vecStyle` into every `.vec-style` group (active button + dash boxes),
+ *  never clobbering a dash field the user is mid-edit. */
+function syncVecStyleUI() {
+  for (const box of document.querySelectorAll('.vec-style')) {
+    for (const b of box.querySelectorAll('.vs-btn')) {
+      b.classList.toggle('active', vecStyle[b.parentElement.dataset.kind] === b.dataset.val);
+    }
+    const on = box.querySelector('.vs-dash-on');
+    const off = box.querySelector('.vs-dash-off');
+    if (on && document.activeElement !== on) on.value = vecStyle.dash ? vecStyle.dash[0] : '';
+    if (off && document.activeElement !== off) off.value = vecStyle.dash ? vecStyle.dash[1] : '';
+  }
+}
+
+/** Wire clicks/edits for both `.vec-style` groups (delegated per group). */
+function wireVecStyle() {
+  for (const box of document.querySelectorAll('.vec-style')) {
+    box.addEventListener('click', (e) => {
+      const b = e.target.closest('.vs-btn');
+      if (!b || !box.contains(b)) return;
+      applyVecStyle({ [b.parentElement.dataset.kind]: b.dataset.val });
+    });
+    for (const inp of box.querySelectorAll('.vs-dash-on, .vs-dash-off')) {
+      inp.addEventListener('change', () => applyVecStyle({ dash: readDashInputs(box) }));
+    }
+  }
+}
+
+/* --- Width profile controls (9b): taper/swell presets + a Width toggle that
+ * turns the control dots into thickness handles. Presets route through
+ * editSelectedStrokes (one undo entry, every selected stroke). The toggle is
+ * transient editing state — never persisted, never saved into a project. --- */
+
+/** Apply a taper/swell preset to the selected strokes. */
+function setWidthProfile(kind) {
+  editSelectedStrokes('wprofile', (s) => applyWidthProfile(s, kind));
+}
+
+/** Smooth the selected strokes' paths (one moving-average pass per click). */
+function smoothSelectedStrokes() {
+  editSelectedStrokes('smooth', (s) => { s.pts = smoothStroke(s.pts); });
+}
+
+/** Simplify the selected strokes at the tolerance in the Tol box. */
+function simplifySelectedStrokes() {
+  const tol = clamp(parseFloat($('inp-vec-tol').value) || 2, 0.1, 100);
+  editSelectedStrokes('simplify', (s) => { s.pts = simplifyStroke(s.pts, tol); });
+}
+
+/** Toggle smooth-curve rendering: flips the new-stroke default AND sets it on
+ *  the selected strokes (nodes render as a spline through them, not straight
+ *  segments). */
+function toggleVecCurve() {
+  const on = !vecStyle.curve;
+  vecStyle.curve = on;
+  persistVecStyle();
+  editSelectedStrokes('curve', (s) => { s.curve = on; });
+  $('btn-vec-curve').classList.toggle('active', on);
+}
+
+/** Flip width-edit mode: control dots become thickness handles (drag ⟂). */
+function toggleWidthMode() {
+  vecWidthMode = !vecWidthMode;
+  $('btn-vec-width').classList.toggle('active', vecWidthMode);
+  render(); // dots redraw as width whiskers (or back to move dots)
+}
+
+function wireWidthControls() {
+  for (const b of document.querySelectorAll('#vec-width-sel .vw-preset')) {
+    b.addEventListener('click', () => setWidthProfile(b.dataset.profile));
+  }
+  $('btn-vec-width').addEventListener('click', toggleWidthMode);
+  $('btn-vec-smooth').addEventListener('click', smoothSelectedStrokes);
+  $('btn-vec-simplify').addEventListener('click', simplifySelectedStrokes);
+  $('btn-vec-curve').addEventListener('click', toggleVecCurve);
 }
 
 /** Rebuild the library list (small enough that full rebuilds are simplest). */
@@ -5665,7 +6329,13 @@ function selectTool(t) {
     syncSelectBar();
     render();
   }
+  // Per-tool tip settings: pocket the outgoing tool's live size/opacity/
+  // hardness, then restore the incoming tool's. Only the tip tools carry a
+  // record — fill/eyedropper/select/pan don't touch these sliders, so they
+  // leave the mirror (and thus the last tip tool's values) untouched.
+  if (state.toolSettings[state.tool]) saveToolSettings(state.tool);
   state.tool = t;
+  if (state.toolSettings[t]) loadToolSettings(t);
   document.querySelectorAll('#toolbar .tool').forEach((b) => {
     b.classList.toggle('active', b.dataset.tool === t);
   });
@@ -5711,6 +6381,43 @@ function setBrushSize(n) {
   const w = state.brushSize;
   editSelectedStrokes('width', (s) => { s.w = w; });
   render(); // the hover footprint changed size
+}
+
+// --- Per-tool tip settings (see state.toolSettings) -----------------------
+// Push the live mirror (state.brush{Size,Opacity,Hardness}) into the three
+// slider/number pairs. Used when a tool switch swaps the mirror out from under
+// the controls; setBrushSize/the slider callbacks handle the interactive path.
+function syncBrushControls() {
+  $('inp-brush-size').value = state.brushSize;
+  $('size-num').value = state.brushSize;
+  $('st-tool').textContent = toolLabel();
+  const op = Math.round(state.brushOpacity * 100);
+  $('inp-brush-opacity').value = op;
+  $('opacity-num').value = op;
+  const hd = Math.round(state.brushHardness * 100);
+  $('inp-brush-hardness').value = hd;
+  $('hardness-num').value = hd;
+}
+
+// Pocket the live mirror into the outgoing tool's record.
+function saveToolSettings(tool) {
+  const s = state.toolSettings[tool];
+  s.size = state.brushSize;
+  s.opacity = state.brushOpacity;
+  s.hardness = state.brushHardness;
+}
+
+// Restore the incoming tool's record into the live mirror + controls. Size is
+// re-clamped to the current mode's tip ceiling (a fat freeform eraser can't
+// survive into a pixel project). Set the mirror DIRECTLY, not via setBrushSize,
+// so a tool switch never re-widths a floating vector selection.
+function loadToolSettings(tool) {
+  const s = state.toolSettings[tool];
+  state.brushSize = clamp(s.size, 1, maxBrush());
+  state.brushOpacity = s.opacity;
+  state.brushHardness = s.hardness;
+  syncBrushControls();
+  if (state.frames.length) render(); // the hover footprint size changed (no-op pre-boot)
 }
 
 function setBrushShape(s) {
@@ -5783,8 +6490,8 @@ function flashHint(msg) {
 
 /** Refresh everything cheap outside the canvas: buttons, zoom label, status. */
 function updateUI() {
-  $('btn-undo').disabled = !state.undo.length;
-  $('btn-redo').disabled = !state.redo.length;
+  $('btn-undo').disabled = !hasHistory(state.undo);
+  $('btn-redo').disabled = !hasHistory(state.redo);
   // Below 1× a tenth isn't enough precision (0.03× would read as "0×").
   $('zoom-label').textContent = state.zoom < 1
     ? `${state.zoom.toFixed(2)}×`
@@ -5796,16 +6503,27 @@ function updateUI() {
 // next to it works the same way; opening either closes the other.
 const fileMenu = $('file-menu');
 const togglesMenu = $('toggles-menu');
+const settingsMenu = $('settings-menu');
+// Opening any of the three topbar dropdowns closes the other two.
 $('btn-file').addEventListener('click', (e) => {
   e.stopPropagation(); // or the document click handler below would re-close it
   e.currentTarget.blur(); // stopPropagation also skips the global blur handler
   togglesMenu.hidden = true;
+  settingsMenu.hidden = true;
   fileMenu.hidden = !fileMenu.hidden;
+});
+$('btn-settings').addEventListener('click', (e) => {
+  e.stopPropagation();
+  e.currentTarget.blur();
+  fileMenu.hidden = true;
+  togglesMenu.hidden = true;
+  settingsMenu.hidden = !settingsMenu.hidden;
 });
 $('btn-toggles').addEventListener('click', (e) => {
   e.stopPropagation();
   e.currentTarget.blur();
   fileMenu.hidden = true;
+  settingsMenu.hidden = true;
   togglesMenu.hidden = !togglesMenu.hidden;
 });
 // Clicking anywhere outside a menu closes it; clicking inside keeps it open
@@ -5814,6 +6532,7 @@ $('btn-toggles').addEventListener('click', (e) => {
 document.addEventListener('click', (e) => {
   if (!fileMenu.hidden && !fileMenu.contains(e.target)) fileMenu.hidden = true;
   if (!togglesMenu.hidden && !togglesMenu.contains(e.target)) togglesMenu.hidden = true;
+  if (!settingsMenu.hidden && !settingsMenu.contains(e.target)) settingsMenu.hidden = true;
 });
 for (const id of ['btn-new', 'btn-save', 'btn-load', 'btn-export',
                   'btn-export-gif', 'btn-export-apng', 'btn-export-video', 'btn-export-zip']) {
@@ -6168,9 +6887,14 @@ for (const side of ['top', 'bottom', 'left', 'right']) {
 selectColor(state.color);
 selectTool('brush');
 loadOnionSettings(); // before the first render so ghosts use the stored look
+loadSettings(); // restore per-browser editor prefs (undo scope) before boot render
 newProject(state.width, state.height);
 renderBrushList();
 syncBrushUI();
+loadVecStyle();   // restore the pending stroke style (caps/joins/dashes)
+wireVecStyle();
+wireWidthControls();
+syncVecStyleUI();
 loadStoredBrushes(); // async; re-renders the list when imports arrive
 loadStoredPalettes(); // user palettes + Recents + the active row
 // Boot lands on the chooser, not a ready-made canvas: the default project
@@ -6184,7 +6908,9 @@ $('start-screen').hidden = false;
 if (typeof window.__ssmTest === 'function') {
   window.__ssmTest({ stampPositions, growRect, clampRect, tipOffsets, textureAlpha, makeRng, smudgeMix,
                      rotVec, boxHandles, pointInBox, boxBounds, scaleBox, resizeCursor, pinchView,
-                     crispXY, strokeBounds, cloneStroke, vecRadius,
+                     crispXY, strokeBounds, cloneStroke, vecRadius, dashRuns,
+                     applyWidthProfile, vecSeed, smoothStroke, simplifyStroke,
+                     vecCurvePoints,
                      strokeHit, vecDotIndices, makeVecSelection,
                      vecBoxXform, xformStroke, splitStroke, rgbToCmyk, proofRgb,
                      rulerStep, parseHexPalette, parseGplPalette, paletteToHexFile, movePalette });

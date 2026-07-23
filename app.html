@@ -74,6 +74,12 @@
       <input id="inp-file" type="file" accept=".json,application/json,image/png,image/jpeg" hidden>
     </div>
   </div>
+  <div class="group" id="settings-wrap">
+    <button id="btn-settings" title="Editor preferences">Settings &#9662;</button>
+    <div id="settings-menu" hidden>
+      <label title="OFF (default): Undo/Redo only affect the layer and frame you're working on — each plane keeps its own history. ON: Undo/Redo step through your whole edit history across every layer and frame."><input type="checkbox" id="chk-undo-across"> Undo across layers/frames</label>
+    </div>
+  </div>
   <div class="group" id="toggles-wrap">
     <button id="btn-toggles" title="Show or hide parts of the workspace">Toggles &#9662;</button>
     <div id="toggles-menu" hidden>
@@ -159,21 +165,63 @@
     <button id="ruler-unit-top" class="ruler-unit" hidden title="Top ruler units — click to cycle px / inches / cm">px</button>
     <button id="ruler-unit-right" class="ruler-unit" hidden title="Right ruler units — click to cycle px / inches / cm">px</button>
     <button id="ruler-unit-bottom" class="ruler-unit" hidden title="Bottom ruler units — click to cycle px / inches / cm">px</button>
-    <div id="select-bar" hidden>
-      <span id="sel-dims">
-        <label title="Selection width in art pixels — type a value to set it exactly (resizes about the center)">W <input id="inp-sel-w" class="num" type="number" min="1" step="0.1"></label>
-        <label title="Selection height in art pixels — type a value to set it exactly (resizes about the center)">H <input id="inp-sel-h" class="num" type="number" min="1" step="0.1"></label>
-        <label title="Rotation in degrees — updates live while the knob turns; type a value to set it exactly">&#8736; <input id="inp-sel-angle" class="num" type="number" step="1">&deg;</label>
-      </span>
-      <button id="btn-sel-rotl" title="Rotate 90&deg; counter-clockwise">&#8634;</button>
-      <button id="btn-sel-rotr" title="Rotate 90&deg; clockwise">&#8635;</button>
-      <button id="btn-sel-fliph" title="Flip horizontally">&#8596;</button>
-      <button id="btn-sel-flipv" title="Flip vertically">&#8597;</button>
-      <button id="btn-sel-copy" title="Copy (Ctrl+C)">Copy</button>
-      <button id="btn-sel-cut" title="Cut (Ctrl+X)">Cut</button>
-      <button id="btn-sel-del" title="Clear the selected pixels (Del)">Clear</button>
-      <button id="btn-sel-commit" title="Place the floating selection (Enter, or click outside it)">&#10003;</button>
-      <button id="btn-sel-cancel" title="Cancel / deselect (Esc or right-click)">&#10005;</button>
+    <div id="sel-bar-stack">
+      <div id="select-bar" hidden>
+        <span id="sel-dims">
+          <label title="Selection width in art pixels — type a value to set it exactly (resizes about the center)">W <input id="inp-sel-w" class="num" type="number" min="1" step="0.1"></label>
+          <label title="Selection height in art pixels — type a value to set it exactly (resizes about the center)">H <input id="inp-sel-h" class="num" type="number" min="1" step="0.1"></label>
+          <label title="Rotation in degrees — updates live while the knob turns; type a value to set it exactly">&#8736; <input id="inp-sel-angle" class="num" type="number" step="1">&deg;</label>
+        </span>
+        <button id="btn-sel-rotl" title="Rotate 90&deg; counter-clockwise">&#8634;</button>
+        <button id="btn-sel-rotr" title="Rotate 90&deg; clockwise">&#8635;</button>
+        <button id="btn-sel-fliph" title="Flip horizontally">&#8596;</button>
+        <button id="btn-sel-flipv" title="Flip vertically">&#8597;</button>
+        <button id="btn-sel-copy" title="Copy (Ctrl+C)">Copy</button>
+        <button id="btn-sel-cut" title="Cut (Ctrl+X)">Cut</button>
+        <button id="btn-sel-del" title="Clear the selected pixels (Del)">Clear</button>
+        <button id="btn-sel-commit" title="Place the floating selection (Enter, or click outside it)">&#10003;</button>
+        <button id="btn-sel-cancel" title="Cancel / deselect (Esc or right-click)">&#10005;</button>
+      </div>
+      <!-- Second bar: vector-stroke controls, stacked under the transform bar
+           and shown only when vector strokes are selected (keeps each pill
+           narrow instead of one overflowing row). -->
+      <div id="vec-bar" hidden>
+        <span id="vec-style-sel" class="vec-style">
+          <span class="vs-grp" data-kind="cap"><span class="vs-label">Cap</span>
+            <button class="vs-btn" data-val="round" title="Round cap — a half-disc at each stroke end">R</button>
+            <button class="vs-btn" data-val="butt" title="Flat (butt) cap — flush with the end point">F</button>
+            <button class="vs-btn" data-val="square" title="Square cap — flat, extended past the end by the stroke radius">S</button>
+          </span>
+          <span class="vs-grp" data-kind="join"><span class="vs-label">Join</span>
+            <button class="vs-btn" data-val="round" title="Round join — corners rounded off">R</button>
+            <button class="vs-btn" data-val="miter" title="Miter join — sharp pointed corners">M</button>
+            <button class="vs-btn" data-val="bevel" title="Bevel join — corners flattened">B</button>
+          </span>
+          <span class="vs-grp vs-dash"><span class="vs-label">Dash</span>
+            <input class="vs-dash-on num" type="number" min="0" step="1" title="Dash length in pixels (blank or 0 = solid line)">
+            <input class="vs-dash-off num" type="number" min="0" step="1" title="Gap length in pixels between dashes">
+          </span>
+        </span>
+        <span id="vec-width-sel" class="vec-widths">
+          <span class="vs-grp"><span class="vs-label">Taper</span>
+            <button class="vs-btn vw-preset" data-profile="uniform" title="Uniform — flatten to the base thickness everywhere">Even</button>
+            <button class="vs-btn vw-preset" data-profile="in" title="Taper in — thin at the start, full at the end">In</button>
+            <button class="vs-btn vw-preset" data-profile="out" title="Taper out — full at the start, thin at the end">Out</button>
+            <button class="vs-btn vw-preset" data-profile="both" title="Swell — thin at both ends, full in the middle">Swell</button>
+          </span>
+          <button id="btn-vec-width" class="vs-btn vw-toggle" title="Width edit — turn the control dots into thickness handles: drag ⟂ to fatten or thin (or just hold Alt while dragging a dot)">Width</button>
+        </span>
+        <span id="vec-clean-sel" class="vec-widths">
+          <span class="vs-grp"><span class="vs-label">Path</span>
+            <button id="btn-vec-curve" class="vs-btn vw-toggle" title="Curve — render the stroke as a smooth spline through its nodes instead of straight segments">Curve</button>
+            <button id="btn-vec-smooth" class="vs-btn vw-preset" title="Smooth — average out jitter along the path (press again for more)">Smooth</button>
+            <button id="btn-vec-simplify" class="vs-btn vw-preset" title="Simplify — drop redundant points within the tolerance, keeping the shape">Simplify</button>
+          </span>
+          <span class="vs-grp"><span class="vs-label">Tol</span>
+            <input id="inp-vec-tol" class="num" type="number" min="0.1" step="0.5" value="2" title="Simplify tolerance in pixels — higher removes more points">
+          </span>
+        </span>
+      </div>
     </div>
     <div id="brush-panel" hidden>
       <div id="brush-head">
@@ -185,6 +233,22 @@
         <button id="tab-bitmap" class="active" title="Bitmap brushes paint pixels">Bitmap</button>
         <button id="tab-vector" title="Vector pens record editable strokes on vector layers">Vector</button>
       </div>
+      <span id="vec-style-panel" class="vec-style" hidden>
+        <span class="vs-grp" data-kind="cap"><span class="vs-label">Cap</span>
+          <button class="vs-btn" data-val="round" title="Round cap — a half-disc at each stroke end">R</button>
+          <button class="vs-btn" data-val="butt" title="Flat (butt) cap — flush with the end point">F</button>
+          <button class="vs-btn" data-val="square" title="Square cap — flat, extended past the end by the stroke radius">S</button>
+        </span>
+        <span class="vs-grp" data-kind="join"><span class="vs-label">Join</span>
+          <button class="vs-btn" data-val="round" title="Round join — corners rounded off">R</button>
+          <button class="vs-btn" data-val="miter" title="Miter join — sharp pointed corners">M</button>
+          <button class="vs-btn" data-val="bevel" title="Bevel join — corners flattened">B</button>
+        </span>
+        <span class="vs-grp vs-dash"><span class="vs-label">Dash</span>
+          <input class="vs-dash-on num" type="number" min="0" step="1" title="Dash length in pixels (blank or 0 = solid line)">
+          <input class="vs-dash-off num" type="number" min="0" step="1" title="Gap length in pixels between dashes">
+        </span>
+      </span>
       <div id="brush-list"></div>
       <input id="inp-brush-file" type="file" accept="image/png,image/jpeg" hidden>
     </div>
