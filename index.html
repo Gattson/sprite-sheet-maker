@@ -259,6 +259,16 @@
   .plan .btn { width: 100%; justify-content: center; }
   .plan.free .btn { background: transparent; color: var(--on-ink); border-color: rgba(255,255,255,.28); }
   .plan.free .btn:hover { border-color: var(--on-ink); }
+  .plan.pro .price { color: var(--persimmon); }
+  .plan .coming { position: absolute; top: 16px; right: 16px; font-family: var(--font-mono); font-size: .66rem; letter-spacing: .14em; text-transform: uppercase; color: var(--persimmon); border: 1px solid var(--persimmon); border-radius: 999px; padding: 3px 9px; }
+  .plan li .mk:not(:empty) { min-width: 1ch; }
+  /* Tip jar */
+  .tip-jar { max-width: 780px; margin: 22px auto 0; display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap;
+    border-radius: var(--radius); padding: 22px 26px; background: var(--ink-band-2); border: 1px dashed rgba(255,255,255,.22); }
+  .tip-copy { min-width: 240px; flex: 1; }
+  .tip-head { font-weight: 700; margin: 0 0 4px; }
+  .tip-sub { color: var(--on-ink-mut); font-size: .9rem; font-family: var(--font-mono); margin: 0; max-width: 52ch; }
+  .tip-btn { flex: none; white-space: nowrap; }
 
   /* ---------- community ---------- */
   .community .wrap { display: grid; grid-template-columns: 1.1fr .9fr; gap: 48px; align-items: center; }
@@ -430,15 +440,15 @@
   <section class="band pricing-band" id="pricing">
     <div class="wrap">
       <div class="sec-head">
-        <p class="eyebrow">Priced so you can just start</p>
+        <p class="eyebrow">Free to make, yours to own</p>
         <h2>Real tools shouldn't cost a fortune.</h2>
-        <p>The big suites want more per month than most artists spend on paint in a year. We went the other way.</p>
+        <p>The web editor is free forever. Own it outright on your desktop and phone — one payment, no subscription to draw. Cloud &amp; collaboration are the only things we'll ever ask a membership for.</p>
       </div>
       <div class="plans">
         <div class="plan free">
-          <p class="kicker">Free</p>
+          <p class="kicker">Web — Free</p>
           <div class="price">$0<span>forever</span></div>
-          <p class="sub">Everything you need to make your first thing.</p>
+          <p class="sub">The full editor, right in your browser.</p>
           <ul>
             <li><span class="mk">✓</span> Pixel &amp; freeform painting</li>
             <li><span class="mk">✓</span> Frames, onion skinning &amp; playback</li>
@@ -448,17 +458,27 @@
           <a class="btn" href="app.html">Open the editor</a>
         </div>
         <div class="plan pro">
-          <p class="kicker">Pro</p>
-          <div class="price">$1.99<span>/ month</span></div>
-          <p class="sub">— or $10.99 a year (about 92¢ a month).</p>
+          <span class="coming">Coming soon</span>
+          <p class="kicker">Apps &amp; Cloud</p>
+          <div class="price">Own it<span>buy once</span></div>
+          <p class="sub">Desktop &amp; mobile apps — plus an optional membership.</p>
           <ul>
-            <li><span class="mk">✓</span> Everything in Free, fully unlocked</li>
-            <li><span class="mk">✓</span> Cloud projects, synced across devices</li>
-            <li><span class="mk">✓</span> The complete pro toolset</li>
-            <li><span class="mk">✓</span> Subscriber Discord &amp; a say in what's next</li>
+            <li><span class="mk">✓</span> Buy the app once — yours forever, no sub</li>
+            <li><span class="mk">✓</span> Native desktop &amp; mobile (Pencil, offline)</li>
+            <li><span class="mk">★</span> Membership: cloud projects, synced anywhere</li>
+            <li><span class="mk">★</span> Membership: live collaboration</li>
           </ul>
-          <a class="btn btn-primary" href="app.html">Go Pro</a>
+          <a class="btn btn-ghost" href="https://discord.gg/pxVc55C9fs" target="_blank" rel="noopener">Get notified in Discord</a>
         </div>
+      </div>
+
+      <!-- ============ TIP JAR (Stripe Payment Link) ============ -->
+      <div class="tip-jar">
+        <div class="tip-copy">
+          <p class="tip-head">Enkava in browser is free — and staying that way.</p>
+          <p class="tip-sub">If it's saved you time or money, you can chip in to help build what's next. Totally optional, no perks, just fuel.</p>
+        </div>
+        <a class="btn btn-primary tip-btn" href="https://buy.stripe.com/5kQ4gA3OO9vE4T1dpl9k400" target="_blank" rel="noopener">Chip in ☕</a>
       </div>
     </div>
   </section>
@@ -470,7 +490,7 @@
         <p class="eyebrow">Built with the people who use it</p>
         <h2>Your requests are the roadmap.</h2>
         <p>
-          Enkava grows from what artists actually ask for. Subscribers get a Discord to swap work,
+          Enkava grows from what artists actually ask for. There's a Discord to swap work,
           trade tips, and pitch the features that get built next — no forms, just a conversation.
         </p>
         <a class="btn btn-ghost" href="https://discord.gg/pxVc55C9fs" target="_blank" rel="noopener">Join the Discord</a>
