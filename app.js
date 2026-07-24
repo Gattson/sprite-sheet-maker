@@ -1,5 +1,5 @@
 /*
- * Enkava (by Motif) — pixel editor, frames & onion skinning,
+ * Enkava (by Calivo LLC) — pixel editor, frames & onion skinning,
  *                      animation preview, export & save/load
  * -----------------------------------------------------------------------
  * Plain JavaScript, no build step. See PROJECT_PLAN.md for the roadmap.
