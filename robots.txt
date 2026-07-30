@@ -1,0 +1,8 @@
+# Enkava — https://enkava.com
+# Everything here is public marketing + a client-side app. Nothing to hide
+# from crawlers, so the policy is simply "index it all".
+
+User-agent: *
+Allow: /
+
+Sitemap: https://enkava.com/sitemap.xml

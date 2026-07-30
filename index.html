@@ -3,10 +3,104 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Enkava — 2D paint, vector & animation in your browser</title>
-<meta name="description" content="Enkava is an accessible 2D paint, vector & animation studio that runs right in your browser. Free to start — no download or account needed.">
+<!-- ============================================================
+     SEO / sharing head block.
+
+     Title + description are written for SERP click-through, not for
+     keyword stuffing: Google rewrites descriptions it thinks are spam,
+     and the honest phrasing ("free", "in your browser", "no download")
+     happens to BE the search language people actually use. Titles stay
+     under ~60 chars and descriptions under ~155 so neither truncates.
+
+     Deliberately NOT here: <meta name="keywords">, which every major
+     engine has ignored since ~2009 and which only advertises your
+     target terms to competitors.
+     ============================================================ -->
+<title>Enkava — Free Online Drawing &amp; Animation Software</title>
+<meta name="description" content="Free 2D art software that runs in your browser: paint, pixel art, vector drawing and frame-by-frame animation, with sprite sheet and GIF export. No download, no account.">
+<link rel="canonical" href="https://enkava.com/">
+<!-- max-image-preview:large lets Google show the big thumbnail in results
+     instead of a postage stamp; the rest are the permissive defaults, stated
+     explicitly so a future stray directive can't quietly de-index the site. -->
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+<meta name="theme-color" content="#FF5A2C">
+
+<!-- Open Graph (Discord, Facebook, LinkedIn, iMessage, Slack). og:image MUST
+     be an absolute URL — relative paths silently render no card at all, which
+     is the single most common reason a share looks bare. -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Enkava">
+<meta property="og:url" content="https://enkava.com/">
+<meta property="og:title" content="Enkava — Free Online Drawing &amp; Animation Software">
+<meta property="og:description" content="Paint, pixel art, vector drawing and frame-by-frame animation — free, in your browser. No download, no account.">
+<meta property="og:image" content="https://enkava.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Enkava — draw, animate, export. A free 2D paint, vector and animation studio in your browser.">
+<meta property="og:locale" content="en_US">
+
+<!-- Twitter/X. summary_large_image is what turns the link into a full-width
+     card rather than a thumbnail strip. -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Enkava — Free Online Drawing &amp; Animation Software">
+<meta name="twitter:description" content="Paint, pixel art, vector drawing and frame-by-frame animation — free, in your browser. No download, no account.">
+<meta name="twitter:image" content="https://enkava.com/og-image.png">
+<meta name="twitter:image:alt" content="Enkava — draw, animate, export.">
+
 <!-- Inline SVG favicon: a white brush stroke on the brand persimmon. -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23FF5A2C'/><path d='M6 22 C12 10 20 10 26 20' stroke='white' stroke-width='4' fill='none' stroke-linecap='round'/></svg>">
+<!-- ============================================================
+     Structured data (schema.org / JSON-LD).
+
+     Tells Google WHAT this page is rather than making it infer from prose:
+     a free web application in the design category. This is what makes a
+     result eligible to render with extra detail instead of as a plain link.
+
+     Note there is deliberately no aggregateRating block. Star ratings are a
+     tempting rich-result win, but inventing them is fabricating reviews —
+     it violates Google's structured-data policy (manual action = worse than
+     no markup) and it would be a lie. Add it for real once there are real
+     reviews to point at.
+     ============================================================ -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Enkava",
+  "url": "https://enkava.com/",
+  "applicationCategory": "DesignApplication",
+  "applicationSubCategory": "2D painting, vector drawing and animation",
+  "operatingSystem": "Any modern web browser (Chrome, Edge, Firefox, Safari)",
+  "browserRequirements": "Requires a browser with HTML5 canvas support",
+  "description": "Enkava is a free 2D art studio that runs entirely in the browser: freeform painting with pressure-sensitive brushes, a pixel-art editor, editable vector strokes, and frame-by-frame animation with onion skinning. Exports sprite sheets, GIF, APNG and video. Nothing is uploaded — your art stays on your machine.",
+  "image": "https://enkava.com/og-image.png",
+  "screenshot": "https://enkava.com/og-image.png",
+  "inLanguage": "en",
+  "isAccessibleForFree": true,
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD",
+    "description": "Free to start; a Pro subscription unlocks the full toolset."
+  },
+  "featureList": [
+    "Freeform painting with pressure-sensitive and textured brushes",
+    "Pixel-art editor with custom palettes",
+    "Editable vector strokes with width profiles and path smoothing",
+    "Layers with opacity, blend modes and alpha lock",
+    "Frame-by-frame animation with onion skinning and playback",
+    "Sprite sheet, GIF, APNG, video and ZIP export",
+    "Print projects with physical units, DPI and CMYK readout",
+    "Runs offline in the browser — no upload, no account"
+  ],
+  "publisher": {
+    "@type": "Organization",
+    "name": "Calivo LLC",
+    "url": "https://enkava.com/"
+  }
+}
+</script>
+
 <style>
   /* ============================================================
      Enkava landing — design tokens

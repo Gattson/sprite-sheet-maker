@@ -1,9 +1,9 @@
-# Enkava — by Motif
+# Enkava
 
 Enkava is a 2D paint, vector & animation studio that runs entirely in your
 browser — nothing is uploaded, your art stays on your machine.
 
-**Use it here: https://gattson.github.io/sprite-sheet-maker/**
+**Use it here: https://enkava.com**
 
 - Two project modes: a classic pixel editor (grid, palettes, crisp pixels) and
   freeform paint (pressure-sensitive brushes, textures, smudge, layers with
@@ -15,6 +15,6 @@ browser — nothing is uploaded, your art stays on your machine.
 
 Free to start; a Pro subscription unlocks the full toolset and cloud projects.
 
-© 2026 Motif. All rights reserved — see [LICENSE](LICENSE). This repository
+© 2026 Calivo LLC. All rights reserved — see [LICENSE](LICENSE). This repository
 contains the deployed application files only; it is published to run the app
 via GitHub Pages, not as an open-source project.
