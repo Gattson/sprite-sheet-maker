@@ -181,6 +181,70 @@ main {
   overflow-y: auto;
 }
 
+/* ---------- scrollable panels ---------- */
+/* Every panel that can overflow shares one custom scrollbar so the OS default
+   (an opaque white bar) never clashes with the dark UI. Applies to the tool
+   panel, brush/palette lists, the New-project card, the layers list, and the
+   horizontal frame strip. */
+
+/* Firefox: thin bar tinted to the panel edge over an invisible track. This is
+   guarded so it ONLY applies where ::-webkit-scrollbar is unsupported —
+   setting scrollbar-color/-width in Chromium/Edge silently disables the
+   ::-webkit-scrollbar styling below, which is the app's actual target. */
+@supports not selector(::-webkit-scrollbar) {
+  #toolbar, #brush-list, #palette-list, #start-card, #layers, #frames {
+    scrollbar-width: thin;
+    scrollbar-color: var(--panel-edge) transparent;
+  }
+}
+
+/* Chromium/Edge (the app's target): paint the scrollbar to match the panel.
+   Defining these pseudo-elements also opts out of the fade-out overlay bar in
+   favor of an always-visible one. The thumb is the panel-edge color; its 2px
+   border is TRANSPARENT (not a fixed panel color) with background-clip so each
+   container's own background shows through as inset padding — that keeps the
+   floating-pill look correct over panels of different shades AND the light
+   checkerboard frame strip. Brightens toward the dim-text tone on hover; the
+   track stays transparent so only the thumb shows. width+height cover both the
+   vertical panels and the horizontal frame strip in one rule. */
+#toolbar::-webkit-scrollbar,
+#brush-list::-webkit-scrollbar,
+#palette-list::-webkit-scrollbar,
+#start-card::-webkit-scrollbar,
+#layers::-webkit-scrollbar,
+#frames::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+#toolbar::-webkit-scrollbar-track,
+#brush-list::-webkit-scrollbar-track,
+#palette-list::-webkit-scrollbar-track,
+#start-card::-webkit-scrollbar-track,
+#layers::-webkit-scrollbar-track,
+#frames::-webkit-scrollbar-track {
+  background: transparent;
+}
+#toolbar::-webkit-scrollbar-thumb,
+#brush-list::-webkit-scrollbar-thumb,
+#palette-list::-webkit-scrollbar-thumb,
+#start-card::-webkit-scrollbar-thumb,
+#layers::-webkit-scrollbar-thumb,
+#frames::-webkit-scrollbar-thumb {
+  background: var(--panel-edge);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+#toolbar::-webkit-scrollbar-thumb:hover,
+#brush-list::-webkit-scrollbar-thumb:hover,
+#palette-list::-webkit-scrollbar-thumb:hover,
+#start-card::-webkit-scrollbar-thumb:hover,
+#layers::-webkit-scrollbar-thumb:hover,
+#frames::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+  background-clip: padding-box;
+}
+
 #toolbar hr {
   border: none;
   border-top: 1px solid var(--panel-edge);
