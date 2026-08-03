@@ -628,6 +628,27 @@ function screenToArt(sx, sy) {
  * Rendering
  * ==================================================================== */
 
+/**
+ * Coalesce viewport repaints to at most one per animation frame.
+ *
+ * Only the POINTER paths use this. A stylus reports up to 240 events/second —
+ * four times a 60 Hz display — and each one used to force a full repaint the
+ * screen then discarded, which is the most likely cause of the drawing lag
+ * reported on iPad (a mouse at 60-120 Hz never generates enough events to show
+ * it, which is why it doesn't reproduce on desktop). Everything outside the
+ * pointer handlers still calls render() directly, so no other behavior moves.
+ *
+ * Falls back to a synchronous render where requestAnimationFrame is missing —
+ * the headless test shim — keeping the suite's timing exactly as it was.
+ */
+let renderPending = false;
+function renderSoon() {
+  if (typeof requestAnimationFrame !== 'function') { render(); return; }
+  if (renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(() => { renderPending = false; render(); });
+}
+
 /** Redraw the whole viewport. Cheap at sprite scales; called on any change. */
 function render() {
   // Reset transform each frame; dpr scaling means we can think in CSS pixels.
@@ -1732,13 +1753,20 @@ const vecRadius = (s, m) => (s.w / 2) * m;
  *  (floored so the lightest touch still shows), Marker is uniform. */
 const vecSeed = (pen, pressure) => (pen === 'pen' ? Math.max(pressure, 0.05) : 1);
 
-/** Deep-copy a stroke so planes never share point arrays (dup frame/layer). */
-const cloneStroke = (s) => ({
+/** Every field that defines a stroke's LOOK, minus its points — the single
+ *  source of truth for "build a stroke that looks like this one". Any code
+ *  deriving a stroke from another MUST go through here: splitStroke used to
+ *  hand-copy the list and silently dropped cap/join/dash/curve, so erasing
+ *  part of a dashed or curved stroke reset it to plain round-solid-straight.
+ *  A new stroke attribute added here can no longer be forgotten downstream. */
+const strokeLook = (s) => ({
   color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
   cap: s.cap || 'round', join: s.join || 'round',
   dash: s.dash ? s.dash.slice() : null, curve: !!s.curve,
-  pts: s.pts.map((p) => p.slice()),
 });
+
+/** Deep-copy a stroke so planes never share point arrays (dup frame/layer). */
+const cloneStroke = (s) => ({ ...strokeLook(s), pts: s.pts.map((p) => p.slice()) });
 
 /** The point list a curved stroke actually rasterizes to: its nodes densified
  *  into a centripetal Catmull-Rom spline through them (x, y AND the width
@@ -2286,15 +2314,46 @@ function splitStroke(s, x, y, R) {
   // inserted points are exact geometry, pressure included) so the cut
   // granularity is bounded by the eraser size, not by drawing speed.
   const step = Math.max(R, 1);
+  // ...but ONLY over the stretch the eraser can actually reach. Subdividing
+  // the whole stroke made a small tip catastrophic: at R=1 a single 1400-art-px
+  // segment became 1378 points, the surviving pieces KEPT them (they are the
+  // new stroke), and a pass that crossed the centerline froze the tab for
+  // ~1.6s. A point further than `reach` from the eraser can never be marked
+  // touched below, so fine spacing out there buys nothing and costs everything.
+  // Cost is now bounded by the stroke's WIDTH, not by its length.
+  let maxR = 0;
+  for (const p of s.pts) maxR = Math.max(maxR, vecRadius(s, p[2]));
+  const reach = maxR + R;
   const pts = [];
   for (let i = 0; i < s.pts.length; i++) {
     if (i) {
       const a = s.pts[i - 1], b = s.pts[i];
-      const n = Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / step);
-      for (let k = 1; k < n; k++) {
-        const t = k / n;
-        pts.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
-                  a[2] + (b[2] - a[2]) * t]);
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const len = Math.hypot(dx, dy);
+      if (len > 0) {
+        // Where the eraser sits along a->b (px from a), and how far off the line.
+        const along = ((x - a[0]) * dx + (y - a[1]) * dy) / len;
+        const perp2 = Math.max(0, (x - a[0]) ** 2 + (y - a[1]) ** 2 - along * along);
+        if (perp2 < reach * reach) {
+          // Densify the in-reach window plus a THREE-step margin. Two reasons,
+          // both load-bearing: the coarse points bracketing the window must sit
+          // beyond `reach`, or the long un-subdivided remainder itself comes
+          // within reach and drags its far endpoint into the cut (the very
+          // over-biting subdivision exists to prevent); and the touched test
+          // marks BOTH ends of any segment reaching the eraser, so the first
+          // sample past `reach` is still consumed. Three steps leaves two
+          // clean samples per side — enough for the surviving run to keep the
+          // 2 points it needs to survive `flush()` instead of being dropped as
+          // debris. (A 2-step margin silently deleted the far half of a long
+          // sparse line; caught by the "does not over-bite" test.)
+          const half = Math.sqrt(reach * reach - perp2) + 3 * step;
+          const hi = Math.min(len, along + half);
+          for (let d = Math.max(step, Math.ceil((along - half) / step) * step); d <= hi; d += step) {
+            const t = d / len;
+            if (t <= 0 || t >= 1) continue;
+            pts.push([a[0] + dx * t, a[1] + dy * t, a[2] + (b[2] - a[2]) * t]);
+          }
+        }
       }
     }
     pts.push(s.pts[i].slice());
@@ -2309,9 +2368,7 @@ function splitStroke(s, x, y, R) {
   const out = [];
   let run = [];
   const flush = () => {
-    if (run.length >= 2) {
-      out.push({ color: s.color, w: s.w, opacity: s.opacity, pen: s.pen, pts: run });
-    }
+    if (run.length >= 2) out.push({ ...strokeLook(s), pts: run });
     run = [];
   };
   for (let i = 0; i < pts.length; i++) {
@@ -2340,11 +2397,17 @@ function vecEraseAt(x, y) {
       hit = true;
     }
   }
-  if (hit) {
-    renderVectorPlane(v.plane);
-    recomposite(v.frame);
-  }
   return hit;
+}
+
+/** Repaint the erase gesture's plane. Call this ONCE per pointer event, never
+ *  per sampled sub-step: the move handler walks the path between events every
+ *  `max(tip/2, 0.5)` art-px, so a fast flick with a small tip samples it dozens
+ *  of times, and renderVectorPlane redraws EVERY stroke on the plane each
+ *  call. Repainting per sub-step was a second multiplier on the erase freeze. */
+function vecEraseRepaint() {
+  renderVectorPlane(vecErase.plane);
+  recomposite(vecErase.frame);
 }
 
 /**
@@ -2741,7 +2804,7 @@ function moveStroke(rx, ry, pressure) {
  *  rect would wipe the smear, so they only patch and repaint. */
 function refreshStroke() {
   const r = clampRect(stroke.seg);
-  if (!r) { render(); return; }
+  if (!r) { renderSoon(); return; }
   if (!stroke.smudge) {
     const g = stroke.prevCtx;
     g.save();
@@ -2757,7 +2820,11 @@ function refreshStroke() {
     g.restore();
   }
   patchComposite(stroke.frame, r, stroke.preview);
-  render();
+  // Deferred to the next frame (see renderSoon): this runs once per pointer
+  // event during a live stroke, which on a 240 Hz stylus is up to 4x per
+  // displayed frame. finishStroke renders synchronously, so the committed
+  // stroke always lands immediately.
+  renderSoon();
 }
 
 /** Rebuild one rect of a frame's composite canvas. While a stroke is live,
@@ -3847,7 +3914,7 @@ view.addEventListener('pointerdown', (e) => {
       const q0 = screenToArtF(sx, sy);
       vecErase = { plane, frame: cur(), orig: plane.strokes.slice(),
                    changed: false, last: q0 };
-      vecEraseAt(q0.x, q0.y);
+      if (vecEraseAt(q0.x, q0.y)) vecEraseRepaint();
       view.setPointerCapture(e.pointerId);
       render();
       return;
@@ -3905,7 +3972,7 @@ view.addEventListener('pointermove', (e) => {
         state.panY = t.panY;
         gesture = now;
         updateUI();
-        render();
+        renderSoon();
       }
       return;
     }
@@ -3914,7 +3981,7 @@ view.addEventListener('pointermove', (e) => {
   if (panning) {
     state.panX = panAnchor.panX + (sx - panAnchor.sx);
     state.panY = panAnchor.panY + (sy - panAnchor.sy);
-    render();
+    renderSoon();
     return;
   }
 
@@ -3933,7 +4000,7 @@ view.addEventListener('pointermove', (e) => {
     };
     updateSelReadout(); // the W/H fields track the marquee as it grows
     updateStatus();
-    render();
+    renderSoon();
     return;
   }
   if (xformDrag && floating) {
@@ -3953,14 +4020,14 @@ view.addEventListener('pointermove', (e) => {
     }
     updateSelReadout(); // live W/H/∠ numbers while the handle drags
     updateStatus();
-    render();
+    renderSoon();
     return;
   }
   if (floatDrag) {
     floating.x = p.x - floatDrag.dx;
     floating.y = p.y - floatDrag.dy;
     updateStatus();
-    render();
+    renderSoon();
     return;
   }
 
@@ -3978,13 +4045,15 @@ view.addEventListener('pointermove', (e) => {
     const q = screenToArtF(sx, sy);
     const step = Math.max(state.brushSize / 2, 0.5);
     const dist = Math.hypot(q.x - vecErase.last.x, q.y - vecErase.last.y);
+    let hit = false;
     for (let t = step; t < dist; t += step) {
-      vecEraseAt(vecErase.last.x + ((q.x - vecErase.last.x) * t) / dist,
-                 vecErase.last.y + ((q.y - vecErase.last.y) * t) / dist);
+      hit = vecEraseAt(vecErase.last.x + ((q.x - vecErase.last.x) * t) / dist,
+                       vecErase.last.y + ((q.y - vecErase.last.y) * t) / dist) || hit;
     }
-    vecEraseAt(q.x, q.y);
+    hit = vecEraseAt(q.x, q.y) || hit;
+    if (hit) vecEraseRepaint(); // once per event, not once per sampled step
     vecErase.last = q;
-    render();
+    renderSoon();
     return;
   }
 
