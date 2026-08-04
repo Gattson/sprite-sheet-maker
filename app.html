@@ -369,6 +369,18 @@
   <div id="start-card">
     <h1>Enkava</h1>
     <p id="start-sub">Start a new project</p>
+    <!-- Crash recovery (Phase 11). Hidden unless the autosave store holds a
+         project from a previous session — a card here rather than a modal, so
+         it never gets in the way of someone who wanted a fresh canvas. -->
+    <div id="start-recover" hidden>
+      <img id="recover-thumb" alt="">
+      <div id="recover-text">
+        <strong>Continue where you left off</strong>
+        <span id="recover-meta"></span>
+      </div>
+      <button id="btn-recover">Continue</button>
+      <button id="btn-recover-discard" title="Discard the recovered work">&#10005;</button>
+    </div>
     <div id="start-tabs">
       <button id="start-tab-pixel" class="active">Pixel art</button>
       <button id="start-tab-free">Freeform</button>

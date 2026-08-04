@@ -140,6 +140,21 @@ const ctx = view.getContext('2d');
  * identity, so a plane lives for as long as its frame and layer both exist —
  * never clone one by spreading.
  */
+// Every plane gets a unique id at birth (Phase 11). Autosave keys its stored
+// PNG blobs on it, which is what lets "a plane the store has never seen" stand
+// in for a structural-change hook: a duplicated frame or a new layer arrives
+// with fresh ids, so it is written without anything having to notice that a
+// frame was duplicated. Planes are identified by OBJECT IDENTITY everywhere
+// else (§3 rule 7) — the id is for persistence only, never for lookup.
+// The session prefix is NOT decoration. A bare counter restarts at 0 on every
+// page load, so after a crash the new planes reuse the exact ids that orphaned
+// blobs still occupy in the store: the orphans then look "live" and survive
+// pruning forever, and a stale blob could be read as if it belonged to a new
+// plane. Scoping the id to the session makes plane keys globally unique.
+let planeSeq = 0;
+const PLANE_SESSION = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const tagPlane = (p) => { p.id = `${PLANE_SESSION}-${++planeSeq}`; return p; };
+
 function makePlane(src, vector) {
   const canvas = document.createElement('canvas');
   canvas.width = state.width;
@@ -158,17 +173,17 @@ function makePlane(src, vector) {
       renderVectorPlane(p);
       p.touched = true;
     }
-    return p;
+    return tagPlane(p);
   }
   if (state.mode === 'free') {
     if (src) c.drawImage(src, 0, 0);
-    return { pixels: null, ctx: c, canvas, touched: !!src };
+    return tagPlane({ pixels: null, ctx: c, canvas, touched: !!src });
   }
-  return {
+  return tagPlane({
     pixels: src || new Array(state.width * state.height).fill(null),
     ctx: c,
     canvas,
-  };
+  });
 }
 
 /**
@@ -385,6 +400,12 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode, extra) {
   renderFrames();
   fitView();
   updateUI();
+  // Phase 11: a new/loaded/imported/restored project is a document change.
+  // Its planes are brand new, so they carry ids the store has never seen and
+  // get written on their own; this schedules the manifest that describes them.
+  // No-op until boot arms autosave, which is what keeps the throwaway default
+  // project from overwriting a real recovery.
+  markDocDirty();
 }
 
 /* ---- Layer appearance (Phase 6d): opacity, blend modes, alpha lock ---- */
@@ -1172,6 +1193,12 @@ function pushUndo() {
   state.undo.push({ frame: cur(), plane: curLayer(), pixels: curLayer().pixels.slice() });
   trimHistory(state.undo);
   state.redo.length = 0;
+  // Phase 11: the undo seams are where autosave learns a plane changed. Every
+  // edit path already pushes history (§3 rule 7), so hooking here catches all
+  // of them at once instead of needing a mark per tool. Marking BEFORE the
+  // mutation is deliberate and harmless — a stroke that turns out to be a
+  // no-op just re-encodes an unchanged plane once.
+  markPlaneDirty(curLayer());
 }
 
 /** Record a finished freeform stroke (called by finishStroke). Clears redo. */
@@ -1180,6 +1207,7 @@ function pushFreeUndo(entry) {
   trimHistory(state.undo);
   state.redo.length = 0;
   strokeChanged = true; // for symmetry with pixel strokes (status/UI refresh)
+  markPlaneDirty(entry.plane); // see pushUndo
 }
 
 /** If the action turned out to be a no-op, drop its snapshot again. */
@@ -1279,6 +1307,10 @@ function applyHistory(from, to) {
     }
     recomposite(entry.frame);
     updateThumb(entry.frame);
+    // Undo/redo changes the plane just as much as the original edit did, and
+    // the entry names its own plane — which may not be the active one when
+    // undo is running in global mode.
+    markPlaneDirty(entry.plane);
     // In locked mode these are already the active frame/layer (no-ops); in
     // global mode they jump so the user sees what changed.
     selectFrame(fi);
@@ -4452,6 +4484,12 @@ function insertFrame(f) {
   state.frames.splice(state.frame + 1, 0, f);
   renderFrames();
   selectFrame(state.frame + 1);
+  // Structural changes carry NO undo entry, so the undo-seam hooks never see
+  // them and nothing would schedule a save. That matters most exactly here:
+  // dup-then-nudge is the animation workflow, so duplicated frames are the
+  // work a user is most likely to lose. The new planes already carry ids the
+  // store has never seen, so they get written as soon as this schedules a run.
+  markDocDirty();
 }
 
 const addFrame = () => insertFrame(makeFrame());
@@ -4492,6 +4530,7 @@ function deleteFrame() {
   if (!state.frames.length) state.frames.push(makeFrame()); // never zero frames
   renderFrames();
   selectFrame(Math.min(state.frame, state.frames.length - 1));
+  markDocDirty(); // no undo entry — see insertFrame
   updateUI(); // history entries for the deleted frame are skipped by applyHistory
 }
 
@@ -4504,6 +4543,7 @@ function moveFrame(dir) {
   [state.frames[i], state.frames[j]] = [state.frames[j], state.frames[i]];
   renderFrames();
   selectFrame(j);
+  markDocDirty(); // frame ORDER lives in the manifest — see insertFrame
 }
 
 /** Redraw one frame's strip thumbnail (call after any edit to that frame). */
@@ -4770,6 +4810,7 @@ function insertLayer(meta, planeFor) {
     f.layers.splice(at, 0, p);
   }
   state.layer = at;
+  markDocDirty(); // no undo entry — see insertFrame
   recompositeAll();
   renderLayers();
   updateStatus();
@@ -4835,6 +4876,7 @@ function deleteLayer() {
   state.layers.splice(li, 1);
   for (const f of state.frames) f.layers.splice(li, 1);
   state.layer = Math.min(li, state.layers.length - 1);
+  markDocDirty(); // no undo entry — see insertFrame
   recompositeAll(); // history entries for the deleted planes are skipped by applyHistory
   renderLayers();
   updateStatus();
@@ -4851,6 +4893,7 @@ function moveLayer(dir) {
     [f.layers[i], f.layers[j]] = [f.layers[j], f.layers[i]];
   }
   state.layer = j;
+  markDocDirty(); // layer ORDER lives in the manifest — see insertFrame
   recompositeAll();
   renderLayers();
 }
@@ -4874,6 +4917,10 @@ function rasterizeLayer() {
   dropVecSelection(); // its strokes are about to stop existing
   for (const f of state.frames) delete f.layers[state.layer].strokes;
   m.kind = 'raster';
+  // One of the few edits with no undo entry (it is deliberately one-way), so
+  // it marks itself: these planes just stopped being vector, and their pixels
+  // now have to be stored as PNG rather than as a stroke list.
+  for (const f of state.frames) markPlaneDirty(f.layers[state.layer]);
   renderLayers(); // the V badge goes away
   updateStatus();
   flashHint(`"${m.name}" is now a raster layer.`);
@@ -5166,6 +5213,30 @@ $('btn-export-zip').addEventListener('click', (e) => runExport(e.currentTarget, 
 }));
 
 /** Serialize the whole project (frames, layers, palette, size, fps) and download it. */
+// Coords round to 1/100 art px on save — invisible, and it keeps stroke JSON
+// from carrying 15 digits of pointer noise per point.
+const r2 = (v) => Math.round(v * 100) / 100;
+
+/**
+ * One vector stroke → its saved form. Shared by the manual .json save and by
+ * Phase 11's autosave manifest, so the two can never drift apart — the same
+ * reasoning behind `strokeLook` (2026-08-02): a stroke's field list must live
+ * in exactly one place or a later field gets silently dropped by whichever
+ * copy nobody updated.
+ * Style is serialized only when NON-DEFAULT, so existing v4 files stay
+ * byte-identical and no version bump is needed (like 6d riding along in v3).
+ */
+function serializeStroke(s) {
+  return {
+    color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
+    ...(s.cap && s.cap !== 'round' ? { cap: s.cap } : {}),
+    ...(s.join && s.join !== 'round' ? { join: s.join } : {}),
+    ...(s.dash ? { dash: s.dash.map(r2) } : {}),
+    ...(s.curve ? { curve: 1 } : {}),
+    pts: s.pts.map((p) => [r2(p[0]), r2(p[1]), r2(p[2])]),
+  };
+}
+
 function saveProject() {
   commitFloat(); // a floating selection should be in the saved pixels
   const anyVector = state.layers.some((m) => m.kind === 'vector');
@@ -5173,9 +5244,6 @@ function saveProject() {
   // files) — parseProject treats it as optional, so no version bump.
   const printMeta = state.intent === 'print'
     ? { intent: 'print', unit: state.unit, dpi: state.dpi } : {};
-  // Coords round to 1/100 art px on save — invisible, and it keeps stroke
-  // JSON from carrying 15 digits of pointer noise per point.
-  const r2 = (v) => Math.round(v * 100) / 100;
   const data = {
     app: 'sprite-sheet-maker', // marker so we can recognize our own files
     // A project with no vector layers still writes v3, so files stay
@@ -5201,20 +5269,13 @@ function saveProject() {
     // re-rasterize on load.
     frames: state.frames.map((f) => f.layers.map((l) =>
       l.strokes
-        ? { strokes: l.strokes.map((s) => ({
-            color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
-            // Serialize style only when non-default, so existing v4 files stay
-            // byte-identical and no version bump is needed (like 6d in v3).
-            ...(s.cap && s.cap !== 'round' ? { cap: s.cap } : {}),
-            ...(s.join && s.join !== 'round' ? { join: s.join } : {}),
-            ...(s.dash ? { dash: s.dash.map(r2) } : {}),
-            ...(s.curve ? { curve: 1 } : {}),
-            pts: s.pts.map((p) => [r2(p[0]), r2(p[1]), r2(p[2])]),
-          })) }
+        ? { strokes: l.strokes.map(serializeStroke) }
         : state.mode === 'free' ? l.canvas.toDataURL('image/png') : l.pixels)),
   };
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
   download(`sprite-project-${state.width}x${state.height}-${state.frames.length}f.json`, blob);
+  // The user now has a real file; nothing is at risk until the next edit.
+  unsavedWork = false;
 }
 
 /**
@@ -5451,6 +5512,320 @@ async function importImage(file) {
     frames.push(px);
   }
   newProject(frameW, ih, frames.map((px) => [px])); // one layer per frame
+}
+
+/* ======================================================================
+ * Phase 11 — Autosave & crash recovery (local, offline, account-less)
+ *
+ * WHY THIS SHAPE. saveProject() above is fully SYNCHRONOUS and encodes every
+ * plane with toDataURL. Measured 2026-08-03 in real Edge: ~10 ms per plane for
+ * light art, ~25 ms dense, and 388 ms for a single heavy-gradient HD plane —
+ * so one full save of a finished HD animation (48 planes) blocks the tab for
+ * 1.2 s to several seconds. Re-running that on a timer is unshippable. Two
+ * measurements make autosave viable instead:
+ *   • toBlob blocks the main thread 5.5 ms where toDataURL blocks 388 ms on
+ *     the SAME plane (~70x), because it encodes off-thread, and it stores raw
+ *     PNG bytes rather than base64 (measured 33.3% smaller).
+ *   • IndexedDB is nowhere near the bottleneck: 4.7 ms to write a 3 MB blob,
+ *     0.5 ms to read one back.
+ * So: ONE raw-PNG blob per plane, only DIRTY planes re-encoded, on stroke-end
+ * plus an idle debounce. Steady state is one plane ≈ 10 ms — invisible.
+ *
+ * The manual .json save path is deliberately UNCHANGED: rewriting it would be
+ * a file-format break and an interop risk for no user benefit.
+ *
+ * Phase 10b note: "raw PNG bytes, not base64" and "sync only what changed" are
+ * exactly what the cloud sync will require, so this store is its rehearsal.
+ * ==================================================================== */
+
+const AUTOSAVE_DB = 'enkava';
+const AUTOSAVE_STORE_V = 1;
+const AUTOSAVE_IDLE_MS = 1200; // quiet gap after the last edit before writing
+
+// Feature-detect once. The Node test shim has neither IndexedDB nor a real
+// canvas encoder, so every entry point below turns into a no-op there and the
+// headless suite is untouched — the same defensive shape renderSoon() uses for
+// a missing requestAnimationFrame.
+const autosaveOK = (() => {
+  try {
+    return typeof indexedDB !== 'undefined' && indexedDB !== null
+      && typeof document.createElement('canvas').toBlob === 'function';
+  } catch { return false; }
+})();
+
+let autosaveDB = null;
+let autosaveTimer = null;
+let autosaveRunning = false;
+let autosaveAgain = false;      // an edit landed while a write was in flight
+// Armed only once boot is past its throwaway default project — otherwise that
+// empty 32x32 would immediately overwrite a real recovery manifest.
+let autosaveArmed = false;
+const dirtyPlanes = new Set();  // plane OBJECTS whose pixels changed
+const storedPlanes = new Set(); // plane ids currently written to the store
+let unsavedWork = false;        // edits not yet in a .json file (for unload)
+
+function openAutosaveDB() {
+  if (autosaveDB) return Promise.resolve(autosaveDB);
+  return new Promise((resolve, reject) => {
+    const rq = indexedDB.open(AUTOSAVE_DB, AUTOSAVE_STORE_V);
+    rq.onupgradeneeded = () => {
+      const db = rq.result;
+      if (!db.objectStoreNames.contains('planes')) db.createObjectStore('planes');
+      if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
+    };
+    rq.onsuccess = () => {
+      const db = rq.result;
+      // A database can exist at our version WITHOUT our stores — anything else
+      // that opened this name first would leave it that way, and since
+      // onupgradeneeded only fires on a version CHANGE, we would then be stuck
+      // failing every write forever. Recreating is safe: this store holds only
+      // a recoverable copy, never the user's sole record of their work.
+      if (!db.objectStoreNames.contains('planes') || !db.objectStoreNames.contains('meta')) {
+        db.close();
+        const del = indexedDB.deleteDatabase(AUTOSAVE_DB);
+        const retry = () => { autosaveDB = null; openAutosaveDB().then(resolve, reject); };
+        del.onsuccess = retry;
+        del.onerror = () => reject(del.error);
+        del.onblocked = retry; // another tab holds it; the reopen still works
+        return;
+      }
+      autosaveDB = db;
+      resolve(db);
+    };
+    rq.onerror = () => reject(rq.error);
+  });
+}
+
+/**
+ * Run one store operation in its own transaction, resolving its result.
+ *
+ * `durability: 'strict'` on writes is deliberate. Chromium commits readwrite
+ * transactions with RELAXED durability by default: the transaction reports
+ * complete while the data may still be in memory, so a page that dies abruptly
+ * can lose its most recent writes. A tab crash is precisely the case this
+ * feature exists for, so a write has to actually reach disk before we call it
+ * saved. The writes here are small and already debounced, so the flush is
+ * affordable. Unknown dictionary members are ignored per WebIDL, so this stays
+ * safe on engines that don't implement the option.
+ */
+function idbTx(store, mode, run) {
+  return openAutosaveDB().then((db) => new Promise((resolve, reject) => {
+    const tx = mode === 'readwrite'
+      ? db.transaction(store, mode, { durability: 'strict' })
+      : db.transaction(store, mode);
+    const rq = run(tx.objectStore(store));
+    tx.oncomplete = () => resolve(rq ? rq.result : undefined);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  }));
+}
+const idbPut = (store, key, val) => idbTx(store, 'readwrite', (s) => s.put(val, key));
+const idbGet = (store, key) => idbTx(store, 'readonly', (s) => s.get(key));
+const idbDel = (store, key) => idbTx(store, 'readwrite', (s) => s.delete(key));
+
+/** A plane's pixels as a raw PNG Blob, encoded OFF the main thread. */
+function encodePlane(p) {
+  return new Promise((resolve) => {
+    try { p.canvas.toBlob((b) => resolve(b), 'image/png'); }
+    catch { resolve(null); }
+  });
+}
+
+/** Decode a stored PNG blob back into an Image makePlane() can stamp. */
+function blobToImage(blob) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+/**
+ * A decoded PNG back into a pixel-mode hex array. Exact, not approximate:
+ * repaintLayer() writes each art pixel as opaque #rrggbb via putImageData, so
+ * the round trip is lossless and alpha 0 means exactly "no pixel".
+ */
+function imageToPixels(img, w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  g.drawImage(img, 0, 0);
+  const d = g.getImageData(0, 0, w, h).data;
+  const out = new Array(w * h).fill(null);
+  const hex = (v) => v.toString(16).padStart(2, '0');
+  for (let i = 0; i < w * h; i++) {
+    const o = i * 4;
+    if (d[o + 3] > 0) out[i] = '#' + hex(d[o]) + hex(d[o + 1]) + hex(d[o + 2]);
+  }
+  return out;
+}
+
+/** A small preview of frame 1 for the recovery card. Tiny canvas, so the
+ *  toDataURL here costs nothing like a full-size plane encode would. */
+function autosaveThumb() {
+  try {
+    const f = state.frames[0];
+    const k = Math.min(160 / state.width, 160 / state.height, 1);
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(state.width * k));
+    c.height = Math.max(1, Math.round(state.height * k));
+    c.getContext('2d').drawImage(f.canvas, 0, 0, c.width, c.height);
+    return c.toDataURL('image/png');
+  } catch { return ''; }
+}
+
+/** The document's structure + metadata. Planes ride as ids; vector planes
+ *  carry their stroke lists inline, since those are the truth and are tiny. */
+function buildManifest() {
+  return {
+    v: 1,
+    savedAt: Date.now(),
+    width: state.width, height: state.height, mode: state.mode,
+    intent: state.intent, unit: state.unit, dpi: state.dpi,
+    fps: fps(), palette: state.palette.slice(),
+    layers: state.layers.map((m) => ({
+      name: m.name, visible: m.visible, opacity: m.opacity,
+      blend: m.blend, alphaLock: m.alphaLock, kind: m.kind,
+    })),
+    frames: state.frames.map((f) => f.layers.map((p) => (
+      p.strokes
+        ? { id: p.id, kind: 'vector', strokes: p.strokes.map(serializeStroke) }
+        : { id: p.id, kind: 'raster' }))),
+    thumb: autosaveThumb(),
+  };
+}
+
+/**
+ * Write everything that changed. A plane needs writing if it was explicitly
+ * dirtied OR if the store has never seen its id — the latter is how new
+ * layers, added frames and duplicated frames get picked up without a single
+ * structural hook, because makePlane() hands every new plane a fresh id.
+ */
+async function autosaveNow() {
+  if (!autosaveOK || !autosaveArmed) return;
+  if (autosaveRunning) { autosaveAgain = true; return; }
+  autosaveRunning = true;
+  try {
+    const live = new Set();
+    const writes = [];
+    for (const f of state.frames) {
+      for (const p of f.layers) {
+        live.add(p.id);
+        if (p.strokes) continue; // vector: stroke list rides in the manifest
+        if (dirtyPlanes.has(p) || !storedPlanes.has(p.id)) writes.push(p);
+      }
+    }
+    for (const p of writes) {
+      // Clear BEFORE encoding: an edit that lands during the await re-marks
+      // the plane, so a change can never be swallowed by its own save.
+      dirtyPlanes.delete(p);
+      const blob = await encodePlane(p);
+      if (!blob) continue;
+      await idbPut('planes', p.id, blob);
+      storedPlanes.add(p.id);
+    }
+    await idbPut('meta', 'manifest', buildManifest());
+    // Drop planes whose frame or layer has since been deleted. This asks the
+    // STORE what it holds rather than trusting `storedPlanes`, because that
+    // in-memory set is deliberately cleared on restore (the restored planes
+    // are new objects with new ids) — pruning from it would leak every blob
+    // written before a recovery, and would also miss debris left by a crash
+    // partway through a write.
+    const keys = await idbTx('planes', 'readonly', (s) => s.getAllKeys());
+    for (const id of keys || []) {
+      if (!live.has(id)) { await idbDel('planes', id); storedPlanes.delete(id); }
+    }
+  } catch (e) {
+    // Autosave must never take the editor down with it. A failed write just
+    // means the next one tries again.
+    console.warn('Autosave failed:', e);
+  }
+  autosaveRunning = false;
+  if (autosaveAgain) { autosaveAgain = false; autosaveSoon(); }
+}
+
+/** Coalesce edits into one write after the user pauses. A stroke touches one
+ *  plane, so the steady-state cost of this is a single ~10 ms encode+write. */
+function autosaveSoon() {
+  if (!autosaveOK || !autosaveArmed) return;
+  clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(autosaveNow, AUTOSAVE_IDLE_MS);
+}
+
+/** A plane's pixels changed. Called from the undo seams, which every edit
+ *  path already goes through (§3 rule 7), so this catches edits generically
+ *  rather than needing a hook per tool. */
+function markPlaneDirty(p) {
+  // Arming gates the unsaved-work flag too, so boot's throwaway default
+  // project can't make a freshly opened editor claim it has work at risk.
+  if (!autosaveArmed) return;
+  unsavedWork = true;
+  if (!autosaveOK || !p) return;
+  dirtyPlanes.add(p);
+  autosaveSoon();
+}
+
+/** Structure or metadata changed (layers, frames, palette, fps, size). */
+function markDocDirty() {
+  if (!autosaveArmed) return;
+  unsavedWork = true;
+  autosaveSoon();
+}
+
+/** The stored manifest, or null when there is nothing to recover. */
+async function loadRecovery() {
+  if (!autosaveOK) return null;
+  try {
+    const man = await idbGet('meta', 'manifest');
+    if (!man || !Array.isArray(man.frames) || !man.frames.length) return null;
+    return man;
+  } catch { return null; }
+}
+
+/** Rebuild a project from the store and hand it to newProject() in exactly
+ *  the shape the file-load path uses. */
+async function restoreProject(man) {
+  const frames = [];
+  for (const fr of man.frames) {
+    const row = [];
+    for (const ref of fr) {
+      if (ref.kind === 'vector') { row.push(ref.strokes || []); continue; }
+      let src = null;
+      try {
+        const blob = await idbGet('planes', ref.id);
+        if (blob) src = await blobToImage(blob);
+      } catch { src = null; }
+      // Pixel planes want a hex array, freeform planes want the Image itself.
+      row.push(src && man.mode !== 'free' ? imageToPixels(src, man.width, man.height) : src);
+    }
+    frames.push(row);
+  }
+  // The restored planes are NEW objects with NEW ids, so the store's old
+  // entries are orphans; clearing this set makes the next autosave rewrite
+  // every plane and prune the stale ids on its own.
+  storedPlanes.clear();
+  dirtyPlanes.clear();
+  // `man` doubles as the extra-metadata bag (intent/unit/dpi), same as a file.
+  newProject(man.width, man.height, frames, man.layers, man.palette, man.fps, man.mode, man);
+  unsavedWork = true; // recovered work still isn't in a .json file
+  markDocDirty();
+}
+
+/** Throw the recovery away (the ✕ on the card). */
+async function discardRecovery() {
+  storedPlanes.clear();
+  dirtyPlanes.clear();
+  try {
+    await idbDel('meta', 'manifest');
+    const db = await openAutosaveDB();
+    await new Promise((resolve) => {
+      const tx = db.transaction('planes', 'readwrite', { durability: 'strict' });
+      tx.objectStore('planes').clear();
+      tx.oncomplete = resolve; tx.onerror = resolve;
+    });
+  } catch { /* nothing recoverable either way */ }
 }
 
 $('btn-export').addEventListener('click', exportSheet);
@@ -6970,6 +7345,78 @@ loadStoredPalettes(); // user palettes + Recents + the active row
 // above keeps every subsystem live underneath while the user picks.
 renderStartPresets(true);
 $('start-screen').hidden = false;
+
+/* ---- Phase 11: arm autosave, then offer any recovered work ---- */
+
+// Everything above this line is boot scaffolding, including a throwaway 32x32
+// default project. Arming here is what stops that empty project from
+// overwriting a real recovery manifest before the user has picked anything.
+autosaveArmed = true;
+
+if (autosaveOK) {
+  // Without this, browsers may evict the store under disk pressure — which
+  // would silently defeat the whole feature. Best-effort: a refusal is fine.
+  if (navigator.storage && navigator.storage.persist) {
+    navigator.storage.persist().catch(() => {});
+  }
+
+  /** "3 minutes ago" / "yesterday" — a raw timestamp reads as noise here. */
+  const agoText = (ms) => {
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 90) return 'moments ago';
+    const m = Math.round(s / 60);
+    if (m < 60) return `${m} minute${m === 1 ? '' : 's'} ago`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `${h} hour${h === 1 ? '' : 's'} ago`;
+    const d = Math.round(h / 24);
+    return d === 1 ? 'yesterday' : `${d} days ago`;
+  };
+
+  loadRecovery().then((man) => {
+    if (!man) return;
+    const frames = man.frames.length;
+    const kind = man.mode === 'free'
+      ? (man.intent === 'print' ? 'Print' : 'Freeform') : 'Pixel art';
+    $('recover-meta').textContent =
+      `${kind} · ${man.width}×${man.height} · ${frames} frame${frames === 1 ? '' : 's'} · ${agoText(man.savedAt)}`;
+    if (man.thumb) $('recover-thumb').src = man.thumb;
+    $('start-recover').hidden = false;
+  }).catch(() => {}); // no recovery offered is the correct failure mode
+
+  $('btn-recover').addEventListener('click', async () => {
+    const btn = $('btn-recover');
+    btn.disabled = true;
+    btn.textContent = 'Restoring…';
+    const man = await loadRecovery();
+    // restoreProject dismisses the start screen by way of newProject().
+    if (man) await restoreProject(man);
+    else $('start-recover').hidden = true;
+    btn.disabled = false;
+    btn.textContent = 'Continue';
+  });
+
+  $('btn-recover-discard').addEventListener('click', async () => {
+    if (!confirm('Discard the recovered work? This cannot be undone.')) return;
+    $('start-recover').hidden = true;
+    await discardRecovery();
+  });
+
+  // A tab that gets backgrounded may never come back — mobile especially
+  // evicts hidden pages without ever firing beforeunload. Flush on the way out
+  // rather than waiting for the idle timer.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { clearTimeout(autosaveTimer); autosaveNow(); }
+  });
+}
+
+// Standard "you have unsaved work" guard. Autosave means the work is
+// recoverable either way, but the user's own .json file is the thing they
+// actually asked for, and browsers only honor this from a real interaction.
+window.addEventListener('beforeunload', (e) => {
+  if (!unsavedWork) return;
+  e.preventDefault();
+  e.returnValue = ''; // required by older Chromium to actually show the prompt
+});
 
 // Headless test hook: test-app.js defines window.__ssmTest to receive the
 // pure stroke-math and texture helpers for unit testing. Real browsers

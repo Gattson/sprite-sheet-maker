@@ -811,6 +811,61 @@ body.mode-free #btn-layer-raster { display: inline-block; }
   color: var(--text-dim);
 }
 
+/* ---- Crash recovery card (Phase 11) ----
+   Sits above the New-project tabs, accented so it reads as "your work is
+   safe" rather than as another preset. Hidden entirely when the autosave
+   store is empty, which is the common case. */
+/* `display: flex` is an author rule and would otherwise beat the UA's
+   [hidden] { display: none }, leaving an empty card on screen for the common
+   case of nothing to recover. */
+#start-recover[hidden] { display: none; }
+#start-recover {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 8px 10px;
+  text-align: left;
+  background: #26262f;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+}
+#recover-thumb {
+  width: 46px;
+  height: 46px;
+  object-fit: contain;
+  flex: none;
+  border-radius: 4px;
+  /* The art may be transparent or light, so give it the canvas checkerboard's
+     dark neutral rather than letting it vanish into the card. */
+  background: #1b1b22;
+}
+#recover-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+#recover-text strong { font-size: 13px; }
+#recover-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+#btn-recover {
+  flex: none;
+  padding: 5px 12px;
+  font-weight: 600;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+#btn-recover-discard {
+  flex: none;
+  padding: 5px 8px;
+  color: var(--text-dim);
+}
+
 #start-tabs {
   display: flex;
   gap: 6px;
