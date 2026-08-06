@@ -338,7 +338,7 @@
       <div id="layers-head">
         <span>Layers</span>
         <button id="btn-layers-collapse" title="Collapse / expand the panel">&#9662;</button>
-        <button id="btn-layer-add" title="Add a layer above the current one">+</button>
+        <button id="btn-layer-add" title="Add a layer below the current one — in a freeform project, pick raster or vector">+</button>
       </div>
       <div id="layers"></div>
       <div id="layer-adjust">
@@ -358,11 +358,24 @@
       </div>
       <div class="layer-controls">
         <button id="btn-layer-dup" title="Duplicate the current layer">&#10697;</button>
-        <button id="btn-layer-del" title="Delete the current layer from every frame">&#128465;</button>
-        <button id="btn-layer-up" title="Move the current layer up">&#9650;</button>
-        <button id="btn-layer-down" title="Move the current layer down">&#9660;</button>
+        <button id="btn-layer-del" title="Delete the current layer or group from every frame">&#128465;</button>
+        <button id="btn-layer-up" title="Move the current layer or group up">&#9650;</button>
+        <button id="btn-layer-down" title="Move the current layer or group down">&#9660;</button>
+        <button id="btn-layer-group" title="Group the current layer or group into a new folder">&#128193;</button>
+        <button id="btn-layer-ungroup" title="Ungroup the selected folder (its layers stay)">&#128194;</button>
         <button id="btn-layer-raster" title="Rasterize this vector layer — strokes become plain pixels on every frame (one-way; can't be undone)">&#9998;&#8594;&#9638;</button>
       </div>
+    </div>
+    <!-- The + button's dropdown: which KIND of layer to add (freeform projects
+         only — pixel projects have no vector layers, so + adds one directly).
+         Declared OUTSIDE #layers-panel on purpose: that panel is overflow:hidden
+         (it would clip the menu) and its header doubles as a drag handle, so a
+         pointerdown on the menu's own padding would start dragging the panel.
+         It is position:fixed and placed from the button's rect at open time —
+         the panel floats, so there is no fixed anchor to hang it off. -->
+    <div id="layer-add-menu" hidden>
+      <button id="btn-add-raster" class="menu-item" title="A normal painted layer — brushes, pixels, full RGBA">Layer</button>
+      <button id="btn-add-vector" class="menu-item" title="A vector layer — Pen and shape strokes stay editable and stay sharp at any zoom">Vector</button>
     </div>
   </div>
 </main>

@@ -71,6 +71,13 @@ const state = {
   // Index 0 is the BOTTOM layer; the panel displays top-first.
   layers: [{ name: 'Layer 1', visible: true, opacity: 1, blend: 'normal', alphaLock: false }],
   layer: 0,                          // index of the layer being edited
+  // Layer GROUPS: a forest OVER the flat `layers` leaves — see the tree helpers
+  // near recomposite(). Built by newProject(); a flat tree means no groups.
+  tree: [],
+  // The GROUP row selected in the panel (a group node), or null when a leaf
+  // layer is selected. `state.layer` is always the active leaf (paint target);
+  // selGroup only redirects the footer's opacity/blend controls to a group.
+  selGroup: null,
   zoom: 16,                          // screen px per art px
   panX: 0, panY: 0,                  // screen position of art pixel (0,0)
   tool: 'brush',                     // 'brush' | 'eraser' | 'fill' | 'eyedropper'
@@ -326,6 +333,8 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode, extra) {
   xformDrag = null;
   vecPointDrag = null;
   vecErase = null;
+  layerDrag = null;      // a drag can't outlive the project it started in
+  state.selGroup = null; // and neither can a selected-group reference
   syncSelectBar();
   state.mode = mode === 'free' ? 'free' : 'pixel';
   // Print intent (owner request): projects made "for print" carry their
@@ -359,6 +368,11 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode, extra) {
       kind: state.mode === 'free' && m.kind === 'vector' ? 'vector' : 'raster',
     }));
   state.layer = state.layers.length - 1; // start on the top layer
+  // Layer tree (groups): the loaded/restored structure if valid, else a flat
+  // tree over the leaves. Must be set BEFORE makeFrame — it composites through
+  // the tree. `extra` is the parseProject result or the autosave manifest.
+  state.tree = deserializeTree(extra && extra.tree, state.layers)
+    || flatTree(state.layers);
   state.frames = (frames || [null]).map((fp) => makeFrame(fp));
   state.frame = 0;
   state.undo = [];
@@ -419,7 +433,18 @@ const blendOp = (m) => (m.blend === 'normal' ? 'source-over' : m.blend);
  *  setPixel and the GIF flattener have exact fast paths that are only
  *  correct under this condition — undefined fields fail it safely. */
 const layersDefault = () =>
-  state.layers.every((m) => m.opacity === 1 && m.blend === 'normal');
+  state.layers.every((m) => m.opacity === 1 && m.blend === 'normal') &&
+  !treeAltersComposite(state.tree);
+
+/** Does any GROUP change the result vs. a flat stack? A styled or hidden group
+ *  makes the flat setPixel fast path (which ignores the tree) wrong; a default
+ *  group (visible, opacity 1, normal blend) composites identically to no group,
+ *  so its mere presence doesn't disable the fast path. */
+function treeAltersComposite(nodes) {
+  return nodes.some((n) => n.type === 'group' &&
+    (!n.visible || n.opacity !== 1 || n.blend !== 'normal' ||
+     treeAltersComposite(n.children)));
+}
 
 // Bulk pixel operations (brush stamps, fills, selection stamps) would pay a
 // full rect recomposite PER PIXEL once a layer has opacity/blend. While
@@ -502,14 +527,31 @@ function setPixel(x, y, color, ignoreLock) {
   }
 }
 
+/** Flat indices of leaves that are hidden OR sit inside a hidden group — the
+ *  ones a display/eyedropper read must skip (the other pixel fast paths get
+ *  this via layersDefault(), which treeAltersComposite() fails for a hidden
+ *  group; pixelAt has no such guard, so it asks here). */
+function hiddenLeafSet() {
+  const set = new Set();
+  const walk = (nodes, parentHidden) => {
+    for (const n of nodes) {
+      if (n.type === 'group') walk(n.children, parentHidden || !n.visible);
+      else if (parentHidden || !n.layer.visible) set.add(state.layers.indexOf(n.layer));
+    }
+  };
+  walk(state.tree, false);
+  return set;
+}
+
 /** The color at (x,y): topmost visible layer that has a pixel there. With
  *  layer opacity/blend this is the STORED color, not the blended screen
  *  color — deliberate for the pixel-mode eyedropper, which should pick a
  *  color you can actually paint with, not a blend product. */
 function pixelAt(f, x, y) {
   const i = idx(x, y);
+  const hidden = hiddenLeafSet(); // also skips leaves inside a hidden group
   for (let li = state.layers.length - 1; li >= 0; li--) {
-    if (!state.layers[li].visible) continue;
+    if (hidden.has(li)) continue;
     const c = f.layers[li].pixels[i];
     if (c) return c;
   }
@@ -575,17 +617,192 @@ function repaintLayer(layer) {
 /** Rebuild a frame's composite canvas by stacking its visible layers, each
  *  at its own opacity and blend mode (both are native canvas compositing —
  *  the browser blends against everything stacked below, alpha included). */
+/* ======================================================================
+ * Layer tree (groups)
+ * ======================================================================
+ * The flat `state.layers` array and each frame's parallel `f.layers[]` planes
+ * stay exactly as they were — index i is the same leaf layer in every frame,
+ * which is why every editing, undo, and export-composite path is untouched by
+ * groups. `state.tree` sits OVER those flat leaves and describes only the
+ * grouping/nesting: a forest of nodes in composite order (bottom→top), each
+ * either a LEAF {type:'layer', layer:<the meta object in state.layers>} or a
+ * GROUP {type:'group', name, visible, opacity, blend, collapsed, isolated,
+ * children:[…]}. INVARIANT: flattening the tree depth-first yields the leaf
+ * metas in exactly state.layers order — groups are always a contiguous run of
+ * leaves, so tree order and flat plane order can never disagree.
+ */
+
+/** A flat tree — every leaf at the root, no groups (a group-less project). */
+const flatTree = (layers) => layers.map((m) => ({ type: 'layer', layer: m }));
+
+/** Any group present? (Any group has a group ancestor at the root level.) */
+const treeHasGroups = (nodes) => nodes.some((n) => n.type === 'group');
+
+/** Collect leaf nodes depth-first into `out` (composite order). */
+function flattenLeaves(nodes, out = []) {
+  for (const n of nodes) {
+    if (n.type === 'group') flattenLeaves(n.children, out);
+    else out.push(n);
+  }
+  return out;
+}
+
+// Offscreen buffers for ISOLATED group compositing, pooled one-per-nesting-
+// depth and reused across composites (resized with the project). A group
+// renders its children onto its own buffer so a child's blend/opacity can't
+// reach past the group; nesting needs a buffer per depth so an inner group
+// can't clobber the outer group still being built. Same shape as the PDF
+// export's transparency-group form XObjects and the crisp-zoom layer buffer.
+let groupBufs = [];
+function groupBuf(depth) {
+  let b = groupBufs[depth];
+  if (!b || b.canvas.width !== state.width || b.canvas.height !== state.height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = state.width;
+    canvas.height = state.height;
+    b = { canvas, ctx: canvas.getContext('2d') };
+    groupBufs[depth] = b;
+  }
+  return b;
+}
+
+/**
+ * Composite a forest of tree nodes onto `dst`, bottom→top. Shared by the full
+ * recomposite and the incremental patchComposite:
+ * - `override` (or null): stands in for the ACTIVE leaf's plane — the live
+ *   in-progress stroke buffer — so a drawing preview shows without merging.
+ * - `rect` (or null): clips ALL work to a dirty region (patchComposite's hot
+ *   path); null composites the whole frame.
+ * A group is drawn by compositing its children onto a depth-pooled buffer and
+ * blitting that buffer with the group's own opacity + blend (isolated).
+ */
+function compositeForest(dst, nodes, f, override, rect, depth) {
+  for (const node of nodes) {
+    if (node.type === 'group') {
+      if (!node.visible) continue;
+      const buf = groupBuf(depth);
+      const bctx = buf.ctx;
+      bctx.save();
+      if (rect) {
+        bctx.beginPath();
+        bctx.rect(rect.x, rect.y, rect.w, rect.h);
+        bctx.clip();
+      }
+      bctx.clearRect(rect ? rect.x : 0, rect ? rect.y : 0,
+                     rect ? rect.w : state.width, rect ? rect.h : state.height);
+      compositeForest(bctx, node.children, f, override, rect, depth + 1);
+      bctx.restore(); // resets the buffer's alpha/composite op
+      // dst is clipped to `rect` by the caller (or the parent group), so
+      // blitting the whole buffer only touches the dirty region.
+      dst.globalAlpha = node.opacity;
+      dst.globalCompositeOperation = blendOp(node);
+      dst.drawImage(buf.canvas, 0, 0);
+    } else {
+      const m = node.layer;
+      if (!m.visible) continue;
+      const li = state.layers.indexOf(m);
+      const src = override && li === state.layer ? override : f.layers[li].canvas;
+      dst.globalAlpha = m.opacity;
+      dst.globalCompositeOperation = blendOp(m);
+      dst.drawImage(src, 0, 0);
+    }
+  }
+  dst.globalAlpha = 1;
+  dst.globalCompositeOperation = 'source-over';
+}
+
+/**
+ * Serialize the layer tree for save files and the autosave manifest. Leaves
+ * are stored as their flat index (a number); groups as {g:{…meta}, c:[…]}.
+ * Because the flat leaf order is kept in sync with the tree, indices always
+ * come out as 0,1,2,… in flatten order — which is what deserialize verifies.
+ */
+function serializeTree(nodes, layers = state.layers) {
+  return nodes.map((n) => n.type === 'group'
+    ? { g: { name: n.name, visible: n.visible, opacity: n.opacity, blend: n.blend,
+             collapsed: !!n.collapsed, isolated: n.isolated !== false },
+        c: serializeTree(n.children, layers) }
+    : layers.indexOf(n.layer));
+}
+
+/**
+ * Rebuild a tree from serializeTree() output against a freshly built `layers`
+ * array. Returns null (→ caller uses a flat tree) if the data is missing or
+ * malformed, or if its leaves are not exactly 0,1,…,n-1 in flatten order — the
+ * invariant the rest of the code relies on. Defensive because save files may be
+ * hand-edited or truncated, same policy as parseProject's per-field cleaning.
+ */
+function deserializeTree(raw, layers) {
+  if (!Array.isArray(raw)) return null;
+  let ok = true;
+  let expect = 0; // leaves must appear as 0,1,2,… in composite order
+  const walk = (nodes) => nodes.map((node) => {
+    if (typeof node === 'number') {
+      if (node !== expect++ || node >= layers.length) { ok = false; return null; }
+      return { type: 'layer', layer: layers[node] };
+    }
+    if (node && node.g && Array.isArray(node.c)) {
+      const g = node.g;
+      return { type: 'group',
+        name: typeof g.name === 'string' && g.name.trim() ? g.name.trim() : 'Group',
+        visible: g.visible !== false,
+        opacity: typeof g.opacity === 'number' ? clamp(g.opacity, 0, 1) : 1,
+        blend: BLEND_MODES.includes(g.blend) ? g.blend : 'normal',
+        collapsed: g.collapsed === true,
+        isolated: g.isolated !== false,
+        children: walk(node.c) };
+    }
+    ok = false; return null;
+  });
+  const tree = walk(raw);
+  if (!ok || expect !== layers.length) return null; // not a full 0..n-1 cover
+  return tree;
+}
+
+/* --- Tree navigation & flat-array resync (used by the structural ops) --- */
+
+/** The leaf NODE at flat index li (its position in flatten order). */
+const leafNodeAt = (li) => flattenLeaves(state.tree)[li];
+
+/** Locate a node: {siblings, index} — the array it lives in (state.tree or a
+ *  group's children) and its position there. null if not found. */
+function findParent(target, nodes = state.tree) {
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i] === target) return { siblings: nodes, index: i };
+    if (nodes[i].type === 'group') {
+      const hit = findParent(target, nodes[i].children);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+/** How many groups the tree holds (for default group names). */
+function groupCount(nodes = state.tree) {
+  let c = 0;
+  for (const n of nodes) if (n.type === 'group') c += 1 + groupCount(n.children);
+  return c;
+}
+
+/**
+ * Reorder the flat `state.layers` metas and every frame's parallel planes to
+ * match the tree's current flatten order — the invariant the compositor and
+ * save format rely on. Planes follow their meta by identity, and the active
+ * leaf stays selected. Called after any tree reordering (move, drag).
+ */
+function syncFlatToTree() {
+  const newMetas = flattenLeaves(state.tree).map((n) => n.layer);
+  const activeMeta = state.layers[state.layer];
+  const oldIndex = new Map(state.layers.map((m, i) => [m, i]));
+  for (const f of state.frames) f.layers = newMetas.map((m) => f.layers[oldIndex.get(m)]);
+  state.layers = newMetas;
+  state.layer = clamp(newMetas.indexOf(activeMeta), 0, newMetas.length - 1);
+}
+
 function recomposite(f) {
   compositeGen++; // the soft-proof cache keys on this
   f.ctx.clearRect(0, 0, state.width, state.height);
-  state.layers.forEach((m, li) => {
-    if (!m.visible) return;
-    f.ctx.globalAlpha = m.opacity;
-    f.ctx.globalCompositeOperation = blendOp(m);
-    f.ctx.drawImage(f.layers[li].canvas, 0, 0);
-  });
-  f.ctx.globalAlpha = 1;
-  f.ctx.globalCompositeOperation = 'source-over';
+  compositeForest(f.ctx, state.tree, f, null, null, 0);
   f.ghost = null;
 }
 
@@ -3283,6 +3500,12 @@ function crispCompose(f, idx) {
 function crispWanted(f, proofed) {
   if (state.mode !== 'free' || playing || proofed) return false;
   if (state.zoom <= 1) return false; // at 1:1 the mirror already IS screen res
+  // crispCompose composites leaves flat; a PLAIN group (opacity 1, normal
+  // blend, visible) is identical flattened, so crisp stays fully on for it.
+  // A STYLED or hidden group can't be reproduced by the flat screen-res walk,
+  // so fall back to the art-res mirror there — which recomposite() builds
+  // group-correctly. (Screen-res group buffers are a later refinement.)
+  if (treeAltersComposite(state.tree)) return false;
   return state.layers.some((m, li) => {
     const p = m.visible && f.layers[li];
     return p && p.strokes && p.strokes.length;
@@ -4197,13 +4420,10 @@ function patchComposite(f, r, override) {
   f.ctx.rect(r.x, r.y, r.w, r.h);
   f.ctx.clip();
   f.ctx.clearRect(r.x, r.y, r.w, r.h);
-  state.layers.forEach((m, li) => {
-    if (!m.visible) return;
-    const src = override && li === state.layer ? override : f.layers[li].canvas;
-    f.ctx.globalAlpha = m.opacity;
-    f.ctx.globalCompositeOperation = blendOp(m);
-    f.ctx.drawImage(src, 0, 0);
-  });
+  // Group-aware, clipped to the dirty rect: the same compositor the full
+  // recomposite uses, so a stroke on a leaf inside styled groups patches
+  // through those groups' opacity/blend exactly as a full rebuild would.
+  compositeForest(f.ctx, state.tree, f, override, r, 0);
   f.ctx.restore(); // also resets globalAlpha / composite op
   f.ghost = null;
 }
@@ -6079,10 +6299,12 @@ wrap.addEventListener('wheel', (e) => {
 window.addEventListener('keydown', (e) => {
   // Escape closes the topbar menus — checked before the input guard so it
   // also works while focus is in the File menu's W/H fields.
-  if (e.code === 'Escape' && (!fileMenu.hidden || !togglesMenu.hidden || !settingsMenu.hidden)) {
+  if (e.code === 'Escape' && (!fileMenu.hidden || !togglesMenu.hidden ||
+                              !settingsMenu.hidden || !layerAddMenu.hidden)) {
     fileMenu.hidden = true;
     togglesMenu.hidden = true;
     settingsMenu.hidden = true;
+    layerAddMenu.hidden = true;
     return;
   }
   // Don't steal keystrokes from inputs, the animation textarea, or selects.
@@ -6451,12 +6673,29 @@ function loadOnionSettings() {
 function selectLayer(i) {
   commitFloat(); // a floating selection belongs to the layer it was lifted from
   dropVecSelection(); // ...and so does a vector one — see the helper
+  state.selGroup = null; // a leaf is now selected, not a group
   state.layer = clamp(i, 0, state.layers.length - 1);
   renderLayers();
   updateStatus();
   updateUI(); // Undo/Redo availability is per-plane in locked mode
   render();   // the stroke box (if any) just went away
 }
+
+/** Select a GROUP row: the footer's opacity/blend now edit the group. The
+ *  active paint leaf (state.layer) is untouched — painting still targets it. */
+function selectGroup(node) {
+  commitFloat();
+  dropVecSelection();
+  state.selGroup = node;
+  renderLayers();
+  updateStatus();
+  updateUI();
+  render();
+}
+
+/** The meta the footer appearance controls edit: the selected group, else the
+ *  active leaf layer. Groups have no alphaLock, so the lock button ignores them. */
+const selMeta = () => state.selGroup || state.layers[state.layer];
 
 const LAYER_THUMB = 34; // max thumbnail edge in the panel, px
 
@@ -6476,15 +6715,35 @@ function refreshLayerThumbs() {
   for (let li = 0; li < state.layers.length; li++) drawLayerThumb(li);
 }
 
-/** Rebuild the layer list, top layer first (art-app convention). */
+/** Shared "opacity% / blend initial / lock" badge text for a leaf or group. */
+function appearanceBadges(m, isGroup) {
+  const parts = [];
+  if (!isGroup && m.kind === 'vector') parts.push('V');
+  if (m.opacity !== 1) parts.push(`${Math.round(m.opacity * 100)}%`);
+  if (m.blend !== 'normal') parts.push(m.blend[0].toUpperCase());
+  if (!isGroup && m.alphaLock) parts.push('\u{1F512}');
+  return parts.join(' ');
+}
+
+/**
+ * Rebuild the layer panel from the TREE, top-first (art-app convention). Groups
+ * render as a header row (collapse chevron + eye + name + badges) followed by
+ * their children indented one level; a collapsed group hides its children.
+ * Leaf rows carry the flat index they map to (their position in flatten order).
+ */
 function renderLayers() {
   const box = $('layers');
   box.innerHTML = '';
+  skipLayerClick = false; // fresh rows; no stale drag-click to swallow
   const scale = Math.min(LAYER_THUMB / state.width, LAYER_THUMB / state.height);
-  for (let i = state.layers.length - 1; i >= 0; i--) {
-    const m = state.layers[i];
+  const idxOf = new Map(flattenLeaves(state.tree).map((n, i) => [n, i]));
+
+  const leafRow = (node, depth) => {
+    const i = idxOf.get(node);
+    const m = node.layer;
     const row = document.createElement('div');
-    row.className = 'layer' + (i === state.layer ? ' active' : '');
+    row.className = 'layer' + (!state.selGroup && i === state.layer ? ' active' : '');
+    row.style.paddingLeft = `${6 + depth * 14}px`;
     const thumb = document.createElement('canvas');
     thumb.className = 'layer-thumb';
     thumb.width = Math.max(1, Math.round(state.width * scale));
@@ -6495,69 +6754,249 @@ function renderLayers() {
     eye.type = 'checkbox';
     eye.checked = m.visible;
     eye.title = 'Show / hide this layer (all frames)';
-    eye.addEventListener('click', (ev) => ev.stopPropagation()); // don't also select
-    eye.addEventListener('change', () => {
-      m.visible = eye.checked;
-      recompositeAll();
-    });
+    eye.addEventListener('click', (ev) => ev.stopPropagation());
+    eye.addEventListener('change', () => { m.visible = eye.checked; recompositeAll(); });
     const name = document.createElement('span');
     name.textContent = m.name;
     name.title = 'Click to select · double-click to rename';
-    // Non-default appearance at a glance: opacity %, blend initial, lock.
-    // (The controls themselves live in the panel footer and edit whichever
-    // layer is selected — rows just show that something is set.)
     const badges = document.createElement('span');
     badges.className = 'layer-badges';
-    const parts = [];
-    if (m.kind === 'vector') parts.push('V'); // vector layer, at a glance
-    if (m.opacity !== 1) parts.push(`${Math.round(m.opacity * 100)}%`);
-    if (m.blend !== 'normal') parts.push(m.blend[0].toUpperCase());
-    if (m.alphaLock) parts.push('\u{1F512}');
-    badges.textContent = parts.join(' ');
-    row.addEventListener('click', () => selectLayer(i));
+    badges.textContent = appearanceBadges(m, false);
+    row.__node = node; // for drag hit-testing (see startLayerDrag/dropSlotFor)
+    row.addEventListener('pointerdown', (e) => startLayerDrag(e, node, row));
+    row.addEventListener('click', () => {
+      if (skipLayerClick) { skipLayerClick = false; return; } // a drag just ended
+      selectLayer(i);
+    });
     row.addEventListener('dblclick', () => {
       const n = prompt('Layer name:', m.name);
-      if (n && n.trim()) {
-        m.name = n.trim();
-        renderLayers();
-        updateStatus();
-      }
+      if (n && n.trim()) { m.name = n.trim(); renderLayers(); updateStatus(); }
     });
     row.append(thumb, name, badges, eye);
     box.appendChild(row);
-  }
-  // The footer's appearance controls always show the SELECTED layer.
-  const sel = state.layers[state.layer];
+  };
+
+  const groupRow = (node, depth) => {
+    const row = document.createElement('div');
+    row.className = 'layer group-row' + (state.selGroup === node ? ' active' : '');
+    row.style.paddingLeft = `${6 + depth * 14}px`;
+    const twist = document.createElement('span');
+    twist.className = 'layer-twist';
+    twist.textContent = node.collapsed ? '▸' : '▾'; // ▸ / ▾
+    twist.title = node.collapsed ? 'Expand group' : 'Collapse group';
+    twist.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      node.collapsed = !node.collapsed;
+      renderLayers();
+    });
+    const folder = document.createElement('span');
+    folder.className = 'layer-folder';
+    folder.textContent = '\u{1F4C1}';
+    const name = document.createElement('span');
+    name.textContent = node.name;
+    name.title = 'Click to select · double-click to rename';
+    const badges = document.createElement('span');
+    badges.className = 'layer-badges';
+    badges.textContent = appearanceBadges(node, true);
+    const eye = document.createElement('input');
+    eye.type = 'checkbox';
+    eye.checked = node.visible;
+    eye.title = 'Show / hide this group (all frames)';
+    eye.addEventListener('click', (ev) => ev.stopPropagation());
+    eye.addEventListener('change', () => { node.visible = eye.checked; recompositeAll(); });
+    row.__node = node; // for drag hit-testing (see startLayerDrag/dropSlotFor)
+    row.addEventListener('pointerdown', (e) => startLayerDrag(e, node, row));
+    row.addEventListener('click', () => {
+      if (skipLayerClick) { skipLayerClick = false; return; } // a drag just ended
+      selectGroup(node);
+    });
+    row.addEventListener('dblclick', () => {
+      const n = prompt('Group name:', node.name);
+      if (n && n.trim()) { node.name = n.trim(); renderLayers(); updateStatus(); }
+    });
+    row.append(twist, folder, name, badges, eye);
+    box.appendChild(row);
+  };
+
+  const walk = (nodes, depth) => {
+    for (let k = nodes.length - 1; k >= 0; k--) { // top-first
+      const node = nodes[k];
+      if (node.type === 'group') {
+        groupRow(node, depth);
+        if (!node.collapsed) walk(node.children, depth + 1);
+      } else {
+        leafRow(node, depth);
+      }
+    }
+  };
+  walk(state.tree, 0);
+
+  // The footer's appearance controls show the SELECTED node (group or leaf).
+  const sel = selMeta();
   $('inp-layer-opacity').value = Math.round(sel.opacity * 100);
   $('layer-opacity-num').value = Math.round(sel.opacity * 100);
   $('sel-layer-blend').value = sel.blend;
   $('btn-layer-lock').classList.toggle('active', sel.alphaLock === true);
+  $('btn-layer-lock').disabled = !!state.selGroup; // groups have no alpha lock
+  $('btn-layer-ungroup').disabled = !state.selGroup; // only a group can be ungrouped
 }
 
-/** Insert a (possibly duplicated) layer directly above the current one. */
-function insertLayer(meta, planeFor) {
+/* --- Layer/group drag-and-drop reorg (pointer-based, like the float drags) ---
+ * Dragging a panel row relocates its tree node: reorder among siblings, or drop
+ * into/out of a group. The drop slot is computed from the rows' on-screen
+ * geometry; a coloured line (drop-above/below) or a group outline (drop-into)
+ * previews it. On release the node moves and syncFlatToTree() re-derives the
+ * flat plane order — so undo history (keyed by plane identity) survives. */
+let layerDrag = null;      // { node, row, startY, moved, slot } while dragging
+let skipLayerClick = false; // suppress the click that trails a real drag
+
+/** Rendered panel rows (leaf + group), top-to-bottom (DOM order). */
+const layerRows = () =>
+  [...$('layers').children].filter((el) => el.classList && el.classList.contains('layer'));
+
+/** Is `arr` the children array of `group` or of a group nested inside it?
+ *  (Prevents dropping a group into itself or its own descendants.) */
+function arrInside(group, arr) {
+  if (group.children === arr) return true;
+  return group.children.some((c) => c.type === 'group' && arrInside(c, arr));
+}
+
+/** Which drop slot the pointer is over: {siblings, index, row, where}. `where`
+ *  is 'above' | 'below' | 'into' (drives the indicator). null = no valid slot. */
+function dropSlotFor(clientY) {
+  const rows = layerRows();
+  if (!rows.length) return null;
+  if (clientY <= rows[0].getBoundingClientRect().top) {
+    return { siblings: state.tree, index: state.tree.length, row: rows[0], where: 'above' };
+  }
+  for (const row of rows) {
+    const r = row.getBoundingClientRect();
+    if (clientY > r.bottom) continue;
+    const target = row.__node;
+    const loc = findParent(target);
+    if (target.type === 'group') {
+      // Top sliver = drop above the group; the rest = drop INTO it (as top
+      // child), which also covers a collapsed or empty group.
+      if (clientY < r.top + r.height * 0.45) {
+        return { siblings: loc.siblings, index: loc.index + 1, row, where: 'above' };
+      }
+      return { siblings: target.children, index: target.children.length, row, where: 'into' };
+    }
+    return clientY < r.top + r.height / 2
+      ? { siblings: loc.siblings, index: loc.index + 1, row, where: 'above' }
+      : { siblings: loc.siblings, index: loc.index, row, where: 'below' };
+  }
+  const last = rows[rows.length - 1]; // below everything
+  const loc = findParent(last.__node);
+  return { siblings: loc.siblings, index: loc.index, row: last, where: 'below' };
+}
+
+/** Relocate `node` to `siblings[index]`, adjusting for its own removal when the
+ *  move is within the same array, then re-derive the flat plane order. */
+function moveLayerNode(node, siblings, index) {
+  const from = findParent(node);
+  from.siblings.splice(from.index, 1);
+  if (from.siblings === siblings && from.index < index) index--;
+  siblings.splice(index, 0, node);
+  syncFlatToTree();
+}
+
+function startLayerDrag(e, node, row) {
+  if (e.button !== 0) return;
+  if (e.target.closest && e.target.closest('input, button, .layer-twist')) return; // eye/twist aren't handles
+  layerDrag = { node, row, startY: e.clientY, moved: false, slot: null };
+  window.addEventListener('pointermove', onLayerDragMove);
+  window.addEventListener('pointerup', onLayerDragUp);
+}
+
+const clearDropMarks = () => {
+  for (const el of layerRows()) el.classList.remove('drop-above', 'drop-below', 'drop-into');
+};
+
+function onLayerDragMove(e) {
+  if (!layerDrag) return;
+  if (!layerDrag.moved) {
+    if (Math.abs(e.clientY - layerDrag.startY) < 4) return; // a click, not a drag, so far
+    layerDrag.moved = true;
+    layerDrag.row.classList.add('dragging');
+  }
+  clearDropMarks();
+  const slot = dropSlotFor(e.clientY);
+  // Reject dropping a group into its own subtree.
+  layerDrag.slot = slot && !(layerDrag.node.type === 'group' && arrInside(layerDrag.node, slot.siblings))
+    ? slot : null;
+  if (layerDrag.slot) layerDrag.slot.row.classList.add('drop-' + layerDrag.slot.where);
+}
+
+function onLayerDragUp() {
+  window.removeEventListener('pointermove', onLayerDragMove);
+  window.removeEventListener('pointerup', onLayerDragUp);
+  const drag = layerDrag;
+  layerDrag = null;
+  clearDropMarks();
+  if (drag && drag.row) drag.row.classList.remove('dragging');
+  if (!drag || !drag.moved) return; // a plain click — the row's own handler selects
+  skipLayerClick = true;            // swallow the trailing click (invalid-drop case)
+  if (!drag.slot) return;           // released on no valid slot — leave the tree alone
+  commitFloat();
+  moveLayerNode(drag.node, drag.slot.siblings, drag.slot.index);
+  if (drag.node.type === 'group') state.selGroup = drag.node; // keep the group selected
+  markDocDirty();
+  recompositeAll();
+  renderLayers();
+  updateStatus();
+}
+
+/** Insert a (possibly duplicated) layer next to the current one — in the same
+ *  group as the active leaf, so "add layer" while working inside a group adds
+ *  to that group. Flat splice at `at` and the tree insert stay in step: the new
+ *  node sits immediately before/after the active leaf's node, whose flatten
+ *  position is exactly `state.layer`.
+ *
+ *  `above` picks the side (owner decision 2026-08-06). NEW, EMPTY layers go
+ *  BELOW the active one — that is the requested default, and it suits drawing
+ *  over existing art. Layers that arrive already holding art pass `above: true`
+ *  (duplicate, SVG import): dropped below an opaque neighbour they would be
+ *  invisible, which reads as the action having failed. Index 0 is the BOTTOM of
+ *  the stack (compositeForest draws in array order), so "below" = the lower
+ *  index — the active layer shifts up to make room. */
+function insertLayer(meta, planeFor, above) {
   commitFloat();
   if (state.layers.length >= MAX_LAYERS) {
     alert(`Projects support up to ${MAX_LAYERS} layers.`);
     return;
   }
-  const at = state.layer + 1;
+  const activeLeaf = leafNodeAt(state.layer); // capture BEFORE the flat splice shifts indices
+  const loc = findParent(activeLeaf);
+  const at = above ? state.layer + 1 : state.layer;
   state.layers.splice(at, 0, meta);
   for (const f of state.frames) {
+    // planeFor() reads f.layers[state.layer] and MUST run before this frame's
+    // splice, or an insert below would shift the index out from under it.
     const p = makePlane(planeFor ? planeFor(f) : null, meta.kind === 'vector');
     if (planeFor && state.mode === 'pixel') repaintLayer(p); // free: drawn by makePlane
     f.layers.splice(at, 0, p);
   }
-  state.layer = at;
+  loc.siblings.splice(above ? loc.index + 1 : loc.index, 0, { type: 'layer', layer: meta });
+  state.layer = at; // the new layer is at `at` either way — select it
+  state.selGroup = null;
   markDocDirty(); // no undo entry — see insertFrame
   recompositeAll();
   renderLayers();
   updateStatus();
 }
 
-const addLayer = () =>
-  insertLayer({ name: `Layer ${state.layers.length + 1}`, visible: true,
-                opacity: 1, blend: 'normal', alphaLock: false, kind: 'raster' });
+/** Add an empty layer below the active one. `kind` comes from the + button's
+ *  dropdown ('raster' | 'vector'); vector layers exist only in freeform
+ *  projects, so anything else normalizes to raster — the same rule startProject
+ *  applies when loading a file. Called with no argument (tests, older paths) it
+ *  means a plain raster layer. */
+const addLayer = (kind) => {
+  const k = state.mode === 'free' && kind === 'vector' ? 'vector' : 'raster';
+  const n = state.layers.length + 1;
+  insertLayer({ name: k === 'vector' ? `Vector ${n}` : `Layer ${n}`, visible: true,
+                opacity: 1, blend: 'normal', alphaLock: false, kind: k });
+};
 
 /**
  * Make the active layer match the paint engine (8a, owner decision): hop to
@@ -6597,8 +7036,16 @@ const dupLayer = () => {
                 kind: m.kind },
               (f) => (m.kind === 'vector' ? f.layers[li].strokes
                 : state.mode === 'free' ? f.layers[li].canvas
-                : f.layers[li].pixels.slice()));
+                : f.layers[li].pixels.slice()),
+              true); // ABOVE: a copy hidden behind its opaque original looks like a no-op
 };
+
+/** Delete the selection: a whole group (with its layers) if one is selected,
+ *  else the active leaf. Wired to the panel's trash button. */
+function deleteSelection() {
+  if (state.selGroup) deleteGroup();
+  else deleteLayer();
+}
 
 function deleteLayer() {
   commitFloat();
@@ -6612,29 +7059,92 @@ function deleteLayer() {
       !confirm(`Delete layer "${state.layers[li].name}" from every frame? This can't be undone.`)) {
     return;
   }
+  const loc = findParent(leafNodeAt(li));
   state.layers.splice(li, 1);
   for (const f of state.frames) f.layers.splice(li, 1);
+  loc.siblings.splice(loc.index, 1); // may leave an empty group — that's fine
   state.layer = Math.min(li, state.layers.length - 1);
+  state.selGroup = null;
   markDocDirty(); // no undo entry — see insertFrame
   recompositeAll(); // history entries for the deleted planes are skipped by applyHistory
   renderLayers();
   updateStatus();
 }
 
-/** Swap the current layer with a neighbor (dir: +1 = up/toward viewer). */
+/** Delete a group and every layer inside it (all frames). */
+function deleteGroup() {
+  commitFloat();
+  const g = state.selGroup;
+  const leaves = flattenLeaves([g]);
+  if (leaves.length >= state.layers.length) { alert('This would delete every layer.'); return; }
+  const doomed = new Set(leaves.map((n) => n.layer));
+  const hasArt = leaves.some((n) => {
+    const li = state.layers.indexOf(n.layer);
+    return state.frames.some((f) => planeHasArt(f.layers[li]));
+  });
+  if (leaves.length && hasArt &&
+      !confirm(`Delete group "${g.name}" and its ${leaves.length} layer(s) from every frame? This can't be undone.`)) {
+    return;
+  }
+  const loc = findParent(g);
+  loc.siblings.splice(loc.index, 1);
+  const keep = state.layers.map((m, i) => i).filter((i) => !doomed.has(state.layers[i]));
+  for (const f of state.frames) f.layers = keep.map((i) => f.layers[i]);
+  state.layers = keep.map((i) => state.layers[i]);
+  state.selGroup = null;
+  state.layer = clamp(state.layer, 0, state.layers.length - 1);
+  markDocDirty();
+  recompositeAll();
+  renderLayers();
+  updateStatus();
+}
+
+/** Move the selection up/down (dir: +1 = toward viewer). Operates on TREE
+ *  siblings within the node's own group; a leaf next to a group jumps over the
+ *  whole group. Crossing INTO/OUT of a group is drag-and-drop (Slice 3). */
 function moveLayer(dir) {
   commitFloat();
-  const i = state.layer;
-  const j = i + dir;
-  if (j < 0 || j >= state.layers.length) return;
-  [state.layers[i], state.layers[j]] = [state.layers[j], state.layers[i]];
-  for (const f of state.frames) {
-    [f.layers[i], f.layers[j]] = [f.layers[j], f.layers[i]];
-  }
-  state.layer = j;
+  const node = state.selGroup || leafNodeAt(state.layer);
+  const loc = findParent(node);
+  const j = loc.index + dir;
+  if (j < 0 || j >= loc.siblings.length) return; // at a group boundary
+  [loc.siblings[loc.index], loc.siblings[j]] = [loc.siblings[j], loc.siblings[loc.index]];
+  syncFlatToTree();
   markDocDirty(); // layer ORDER lives in the manifest — see insertFrame
   recompositeAll();
   renderLayers();
+}
+
+/** Wrap the current selection (a leaf, or a whole group to nest) in a new
+ *  group, in place — leaf order is unchanged, so no flat resync is needed. */
+function groupSelected() {
+  commitFloat();
+  const target = state.selGroup || leafNodeAt(state.layer);
+  const loc = findParent(target);
+  const group = { type: 'group', name: `Group ${groupCount() + 1}`, visible: true,
+                  opacity: 1, blend: 'normal', collapsed: false, isolated: true,
+                  children: [target] };
+  loc.siblings.splice(loc.index, 1, group);
+  state.selGroup = group;
+  markDocDirty();
+  recompositeAll();
+  renderLayers();
+  updateStatus();
+}
+
+/** Dissolve the selected group, splicing its children back into its parent at
+ *  the same spot (order preserved; the group's own opacity/blend is dropped). */
+function ungroupSelected() {
+  if (!state.selGroup) { flashHint('Select a group to ungroup.'); return; }
+  commitFloat();
+  const g = state.selGroup;
+  const loc = findParent(g);
+  loc.siblings.splice(loc.index, 1, ...g.children);
+  state.selGroup = null;
+  markDocDirty();
+  recompositeAll();
+  renderLayers();
+  updateStatus();
 }
 
 /**
@@ -6667,11 +7177,49 @@ function rasterizeLayer() {
 
 $('btn-layer-raster').addEventListener('click', rasterizeLayer);
 
-$('btn-layer-add').addEventListener('click', addLayer);
+/**
+ * The + button. A freeform project can hold raster AND vector layers, so +
+ * opens a dropdown to pick which (owner request 2026-08-06 — before this, the
+ * ONLY way to get a vector layer was the Pen's auto-hop, and that hops to the
+ * newest existing vector layer rather than making a second one, which is why
+ * all vector art ended up stacked on one layer). A pixel project has no vector
+ * layers at all, so there is nothing to choose and + just adds one.
+ */
+const layerAddMenu = $('layer-add-menu');
+
+function openLayerAddMenu(btn) {
+  layerAddMenu.hidden = false;
+  // Measured only once shown (a hidden element has no box). Right-aligned to
+  // the button and clamped into the viewport, because the layers panel can be
+  // dragged anywhere — including hard against an edge.
+  const r = btn.getBoundingClientRect();
+  const w = layerAddMenu.offsetWidth;
+  const h = layerAddMenu.offsetHeight;
+  layerAddMenu.style.left = clamp(r.right - w, 6, Math.max(6, window.innerWidth - w - 6)) + 'px';
+  layerAddMenu.style.top = clamp(r.bottom + 6, 6, Math.max(6, window.innerHeight - h - 6)) + 'px';
+}
+
+$('btn-layer-add').addEventListener('click', (e) => {
+  e.stopPropagation(); // or the document click handler would immediately re-close it
+  e.currentTarget.blur();
+  if (state.mode !== 'free') { addLayer('raster'); return; }
+  if (!layerAddMenu.hidden) { layerAddMenu.hidden = true; return; } // second click closes
+  openLayerAddMenu(e.currentTarget);
+});
+$('btn-add-raster').addEventListener('click', () => {
+  layerAddMenu.hidden = true;
+  addLayer('raster');
+});
+$('btn-add-vector').addEventListener('click', () => {
+  layerAddMenu.hidden = true;
+  addLayer('vector');
+});
 $('btn-layer-dup').addEventListener('click', dupLayer);
-$('btn-layer-del').addEventListener('click', deleteLayer);
+$('btn-layer-del').addEventListener('click', deleteSelection);
 $('btn-layer-up').addEventListener('click', () => moveLayer(1));
 $('btn-layer-down').addEventListener('click', () => moveLayer(-1));
+$('btn-layer-group').addEventListener('click', groupSelected);
+$('btn-layer-ungroup').addEventListener('click', ungroupSelected);
 
 // Appearance controls (Phase 6d) — they edit the SELECTED layer's meta.
 // Opacity previews live on just the edited frame while the slider drags
@@ -6679,7 +7227,7 @@ $('btn-layer-down').addEventListener('click', () => moveLayer(-1));
 // release ('change') so big multi-frame projects stay smooth under the drag.
 // A typed value fires 'change' only, so it gets both steps at once.
 bindSliderPair('inp-layer-opacity', 'layer-opacity-num', (v) => {
-  const m = state.layers[state.layer];
+  const m = selMeta(); // the selected group, or the active leaf
   m.opacity = clamp(v || 0, 0, 100) / 100;
   recomposite(cur());
   render();
@@ -6692,17 +7240,19 @@ for (const id of ['inp-layer-opacity', 'layer-opacity-num']) {
   });
 }
 $('sel-layer-blend').addEventListener('change', (e) => {
-  const m = state.layers[state.layer];
+  const m = selMeta(); // the selected group, or the active leaf
   m.blend = BLEND_MODES.includes(e.target.value) ? e.target.value : 'normal';
   recompositeAll();
   renderLayers();
 });
 $('btn-layer-lock').addEventListener('click', () => {
+  if (state.selGroup) return; // groups have no alpha lock
   const m = state.layers[state.layer];
   m.alphaLock = !m.alphaLock;
   renderLayers(); // no recomposite — the lock changes editing, not appearance
 });
 $('btn-layers-collapse').addEventListener('click', (e) => {
+  layerAddMenu.hidden = true; // it is position:fixed — it would hang under a collapsed panel
   const collapsed = $('layers-panel').classList.toggle('collapsed');
   e.currentTarget.innerHTML = collapsed ? '&#9656;' : '&#9662;';
 });
@@ -6714,6 +7264,7 @@ $('btn-layers-collapse').addEventListener('click', (e) => {
 function makePanelDraggable(panelId, headId) {
   $(headId).addEventListener('pointerdown', (e) => {
     if (e.target.closest('button')) return;
+    layerAddMenu.hidden = true; // a fixed menu doesn't travel with the panel
     const panel = $(panelId);
     const head = e.currentTarget;
     const start = panel.getBoundingClientRect();
@@ -6867,17 +7418,8 @@ function buildSVG(idx = state.frame) {
   const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
                               .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const r3 = (v) => +(+v).toFixed(3);
-  const parts = [
-    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" `
-    + `width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`,
-  ];
-  state.layers.forEach((m, li) => {
-    if (!m.visible) return;
-    const plane = f.layers[li];
-    if (!plane) return;
-    const attrs = [];
-    if (m.opacity < 1) attrs.push(`opacity="${r3(m.opacity)}"`);
-    if (m.blend && m.blend !== 'normal') attrs.push(`style="mix-blend-mode:${esc(m.blend)}"`);
+  // A leaf plane's drawable body (path/image strings), or [] if empty.
+  const leafBody = (plane) => {
     const body = [];
     if (plane.strokes) {
       for (const s of plane.strokes) {
@@ -6910,10 +7452,37 @@ function buildSVG(idx = state.frame) {
       body.push(`<image x="0" y="0" width="${W}" height="${H}" `
         + `image-rendering="pixelated" xlink:href="${plane.canvas.toDataURL('image/png')}"/>`);
     }
-    if (!body.length) return; // an empty layer earns no group
-    parts.push(attrs.length ? `<g ${attrs.join(' ')}>` : '<g>', ...body, '</g>');
-  });
-  parts.push('</svg>');
+    return body;
+  };
+
+  // Wrap children/body in a <g>, carrying opacity + blend (an SVG group is
+  // isolated when it has either — matching the compositor's group model). An
+  // empty node earns no group.
+  const wrap = (m, inner) => {
+    if (!inner.length) return '';
+    const attrs = [];
+    if (m.opacity < 1) attrs.push(`opacity="${r3(m.opacity)}"`);
+    if (m.blend && m.blend !== 'normal') attrs.push(`style="mix-blend-mode:${esc(m.blend)}"`);
+    return `${attrs.length ? `<g ${attrs.join(' ')}>` : '<g>'}\n${inner.join('\n')}\n</g>`;
+  };
+
+  const nodeSVG = (node) => {
+    if (node.type === 'group') {
+      if (!node.visible) return '';
+      return wrap(node, node.children.map(nodeSVG).filter(Boolean));
+    }
+    const m = node.layer;
+    if (!m.visible) return '';
+    const plane = f.layers[state.layers.indexOf(m)];
+    return plane ? wrap(m, leafBody(plane)) : '';
+  };
+
+  const parts = [
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" `
+    + `width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`,
+    ...state.tree.map(nodeSVG).filter(Boolean),
+    '</svg>',
+  ];
   return parts.join('\n');
 }
 
@@ -6937,61 +7506,71 @@ function pdfRGB(hex) {
  * The uniform-vs-variable width split is the same as SVG's, for the same
  * reason: PDF also has a single line width per path.
  */
+/** One visible leaf plane → a PDF export node (paths for vector, embedded image
+ *  for raster), or null if empty. */
+function pdfLeafNode(plane, m) {
+  if (plane.strokes) {
+    const paths = [];
+    for (const s of plane.strokes) {
+      if (!s.pts.length) continue;
+      if (strokeIsUniform(s)) {
+        paths.push({
+          subpaths: parsePathD(strokeCenterlineD(s)),
+          fill: s.fill ? pdfRGB(s.fill) : null,
+          stroke: s.noStroke ? null : pdfRGB(s.color),
+          w: vecRadius(s, s.pts[0][2]) * 2,
+          cap: s.cap || 'round', join: s.join || 'round',
+          dash: s.dash || null, opacity: s.opacity,
+        });
+      } else {
+        // Variable width: the outline becomes a filled path, exactly as in
+        // the SVG export, so the taper survives.
+        if (s.fill) {
+          paths.push({ subpaths: parsePathD(strokeCenterlineD(s)),
+                       fill: pdfRGB(s.fill), stroke: null, opacity: s.opacity });
+        }
+        if (!s.noStroke) {
+          paths.push({ subpaths: parsePathD(strokeOutlineD(s)),
+                       fill: pdfRGB(s.color), stroke: null, opacity: s.opacity });
+        }
+      }
+    }
+    return paths.length ? { opacity: m.opacity, blend: m.blend, paths } : null;
+  }
+  const img = plane.ctx.getImageData(0, 0, state.width, state.height);
+  const n = state.width * state.height;
+  const rgb = new Uint8Array(n * 3);
+  const alpha = new Uint8Array(n);
+  let anyAlpha = false;
+  for (let i = 0; i < n; i++) {
+    rgb[i * 3] = img.data[i * 4];
+    rgb[i * 3 + 1] = img.data[i * 4 + 1];
+    rgb[i * 3 + 2] = img.data[i * 4 + 2];
+    alpha[i] = img.data[i * 4 + 3];
+    if (alpha[i] !== 255) anyAlpha = true;
+  }
+  return { opacity: m.opacity, blend: m.blend,
+           image: { rgb, alpha: anyAlpha ? alpha : null, w: state.width, h: state.height } };
+}
+
 async function exportPDF() {
   commitFloat();
   const f = cur();
-  const layers = [];
-  for (let li = 0; li < state.layers.length; li++) {
-    const m = state.layers[li];
-    if (!m.visible) continue;
-    const plane = f.layers[li];
-    if (!plane || !planeHasArt(plane)) continue;
-    if (plane.strokes) {
-      const paths = [];
-      for (const s of plane.strokes) {
-        if (!s.pts.length) continue;
-        const uniform = strokeIsUniform(s);
-        if (uniform) {
-          paths.push({
-            subpaths: parsePathD(strokeCenterlineD(s)),
-            fill: s.fill ? pdfRGB(s.fill) : null,
-            stroke: s.noStroke ? null : pdfRGB(s.color),
-            w: vecRadius(s, s.pts[0][2]) * 2,
-            cap: s.cap || 'round', join: s.join || 'round',
-            dash: s.dash || null, opacity: s.opacity,
-          });
-        } else {
-          // Variable width: the outline becomes a filled path, exactly as in
-          // the SVG export, so the taper survives.
-          if (s.fill) {
-            paths.push({ subpaths: parsePathD(strokeCenterlineD(s)),
-                         fill: pdfRGB(s.fill), stroke: null, opacity: s.opacity });
-          }
-          if (!s.noStroke) {
-            paths.push({ subpaths: parsePathD(strokeOutlineD(s)),
-                         fill: pdfRGB(s.color), stroke: null, opacity: s.opacity });
-          }
-        }
-      }
-      if (paths.length) layers.push({ opacity: m.opacity, blend: m.blend, paths });
-    } else {
-      const img = plane.ctx.getImageData(0, 0, state.width, state.height);
-      const n = state.width * state.height;
-      const rgb = new Uint8Array(n * 3);
-      const alpha = new Uint8Array(n);
-      let anyAlpha = false;
-      for (let i = 0; i < n; i++) {
-        rgb[i * 3] = img.data[i * 4];
-        rgb[i * 3 + 1] = img.data[i * 4 + 1];
-        rgb[i * 3 + 2] = img.data[i * 4 + 2];
-        alpha[i] = img.data[i * 4 + 3];
-        if (alpha[i] !== 255) anyAlpha = true;
-      }
-      layers.push({ opacity: m.opacity, blend: m.blend,
-                    image: { rgb, alpha: anyAlpha ? alpha : null,
-                             w: state.width, h: state.height } });
+  // Walk the layer TREE so a group's opacity/blend survives as a nested PDF
+  // transparency group (empty/invisible nodes drop out).
+  const nodeFor = (node) => {
+    if (node.type === 'group') {
+      if (!node.visible) return null;
+      const children = node.children.map(nodeFor).filter(Boolean);
+      return children.length ? { opacity: node.opacity, blend: node.blend, children } : null;
     }
-  }
+    const m = node.layer;
+    if (!m.visible) return null;
+    const plane = f.layers[state.layers.indexOf(m)];
+    if (!plane || !planeHasArt(plane)) return null;
+    return pdfLeafNode(plane, m);
+  };
+  const layers = state.tree.map(nodeFor).filter(Boolean);
   if (!layers.length) { alert('Nothing to export — this frame is empty.'); return; }
   // Real deflate when the platform has it (CompressionStream is a web
   // standard, not a dependency); otherwise the writer falls back to stored
@@ -7204,7 +7783,8 @@ function importSVGText(text, label) {
     return false;
   }
   insertLayer({ name: (label || 'SVG').slice(0, 24), visible: true, opacity: 1,
-                blend: 'normal', alphaLock: false, kind: 'vector' });
+                blend: 'normal', alphaLock: false, kind: 'vector' },
+              null, true); // ABOVE: imported art must be visible, not tucked under a layer
   const plane = curLayer();
   plane.strokes = strokes;
   plane.touched = true;
@@ -7378,6 +7958,7 @@ function serializeStroke(s) {
 function saveProject() {
   commitFloat(); // a floating selection should be in the saved pixels
   const anyVector = state.layers.some((m) => m.kind === 'vector');
+  const hasGroups = treeHasGroups(state.tree);
   // Print metadata rides along additively (absent = digital, like pre-print
   // files) — parseProject treats it as optional, so no version bump.
   const printMeta = state.intent === 'print'
@@ -7385,8 +7966,10 @@ function saveProject() {
   const data = {
     app: 'sprite-sheet-maker', // marker so we can recognize our own files
     // A project with no vector layers still writes v3, so files stay
-    // loadable by the deployed pre-Phase-8 app until vector art appears.
-    version: anyVector ? PROJECT_VERSION : 3,
+    // loadable by the deployed pre-Phase-8 app until vector art appears; v4
+    // adds vector layers, v5 adds groups. Grouping is additive (a `tree`
+    // field, below), so a group-less v4/v3 file is byte-identical to before.
+    version: hasGroups ? 5 : anyVector ? PROJECT_VERSION : 3,
     ...printMeta,
     mode: state.mode,
     width: state.width,
@@ -7400,6 +7983,10 @@ function saveProject() {
       opacity: m.opacity, blend: m.blend, alphaLock: m.alphaLock,
       ...(m.kind === 'vector' ? { kind: 'vector' } : {}),
     })),
+    // Layer tree (v5): only written when groups exist, so group-less files stay
+    // byte-identical. Leaves are their flat index into `layers`; loaders that
+    // don't understand it (or its absence) fall back to a flat tree.
+    ...(hasGroups ? { tree: serializeTree(state.tree) } : {}),
     // Pixel planes save as hex arrays (diff-able, hand-fixable). Freeform
     // raster planes save as PNG data-URLs — the plane's canvas is the truth
     // there, and lossless PNG is hugely smaller than a per-pixel string
@@ -7585,6 +8172,9 @@ async function parseProject(text) {
   const palette = Array.isArray(d.palette) ? d.palette.filter(isColor).slice(0, MAX_PALETTE) : [];
   return {
     w, h, frames, layers, mode,
+    // Layer tree (v5, additive): passed to newProject as extra.tree, validated
+    // there against the built leaves; absent/invalid falls back to a flat tree.
+    tree: d.tree,
     palette: palette.length ? palette : null,
     fps: parseInt(d.fps, 10) || null,
     // Print metadata (optional, additive): absent or invalid = digital.
@@ -7867,6 +8457,9 @@ function buildManifest() {
       name: m.name, visible: m.visible, opacity: m.opacity,
       blend: m.blend, alphaLock: m.alphaLock, kind: m.kind,
     })),
+    // Group structure must survive a crash too (restoreProject passes this
+    // manifest as newProject's `extra`). Tiny — an array of leaf indices.
+    tree: serializeTree(state.tree),
     frames: state.frames.map((f) => f.layers.map((p) => (
       p.strokes
         ? { id: p.id, kind: 'vector', strokes: p.strokes.map(serializeStroke) }
@@ -9167,12 +9760,14 @@ function updateUI() {
 const fileMenu = $('file-menu');
 const togglesMenu = $('toggles-menu');
 const settingsMenu = $('settings-menu');
-// Opening any of the three topbar dropdowns closes the other two.
+// Opening any of the three topbar dropdowns closes the other two — and the
+// layers panel's + menu, which stopPropagation would otherwise leave open.
 $('btn-file').addEventListener('click', (e) => {
   e.stopPropagation(); // or the document click handler below would re-close it
   e.currentTarget.blur(); // stopPropagation also skips the global blur handler
   togglesMenu.hidden = true;
   settingsMenu.hidden = true;
+  layerAddMenu.hidden = true;
   fileMenu.hidden = !fileMenu.hidden;
 });
 $('btn-settings').addEventListener('click', (e) => {
@@ -9180,6 +9775,7 @@ $('btn-settings').addEventListener('click', (e) => {
   e.currentTarget.blur();
   fileMenu.hidden = true;
   togglesMenu.hidden = true;
+  layerAddMenu.hidden = true;
   settingsMenu.hidden = !settingsMenu.hidden;
 });
 $('btn-toggles').addEventListener('click', (e) => {
@@ -9187,6 +9783,7 @@ $('btn-toggles').addEventListener('click', (e) => {
   e.currentTarget.blur();
   fileMenu.hidden = true;
   settingsMenu.hidden = true;
+  layerAddMenu.hidden = true;
   togglesMenu.hidden = !togglesMenu.hidden;
 });
 // Clicking anywhere outside a menu closes it; clicking inside keeps it open
@@ -9196,6 +9793,7 @@ document.addEventListener('click', (e) => {
   if (!fileMenu.hidden && !fileMenu.contains(e.target)) fileMenu.hidden = true;
   if (!togglesMenu.hidden && !togglesMenu.contains(e.target)) togglesMenu.hidden = true;
   if (!settingsMenu.hidden && !settingsMenu.contains(e.target)) settingsMenu.hidden = true;
+  if (!layerAddMenu.hidden && !layerAddMenu.contains(e.target)) layerAddMenu.hidden = true;
 });
 for (const id of ['btn-new', 'btn-save', 'btn-load', 'btn-export',
                   'btn-export-gif', 'btn-export-apng', 'btn-export-video', 'btn-export-zip',
@@ -9657,6 +10255,11 @@ if (typeof window.__ssmTest === 'function') {
                      parsePathD, svgArcToCubics,
                      strokeHit, vecDotIndices, makeVecSelection,
                      vecBoxXform, xformStroke, splitStroke, rgbToCmyk, proofRgb,
+                     flatTree, treeHasGroups, flattenLeaves, treeAltersComposite,
+                     serializeTree, deserializeTree, leafNodeAt,
+                     selectLayer, selectGroup, addLayer, groupSelected,
+                     ungroupSelected, moveLayer, deleteSelection, moveLayerNode,
+                     findParent, state,
                      rulerStep, parseHexPalette, parseGplPalette, paletteToHexFile, movePalette });
 }
 

@@ -1102,6 +1102,27 @@ body.mode-free .brush-sub[hidden] { display: none; }
   line-height: 1.2;
 }
 
+/* The layers panel's + dropdown (raster vs vector). Same look as the topbar
+   menus, but position:fixed and placed by JS: the layers panel floats (it is
+   draggable) and clips its own overflow, so the menu cannot live inside it.
+   No ancestor carries a transform, so `fixed` really is viewport-relative. */
+#layer-add-menu {
+  position: fixed;
+  z-index: 20;          /* over the layers panel (5) and the topbar menus (10) */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 116px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+#layer-add-menu[hidden] { display: none; }
+#layer-add-menu .menu-item { text-align: left; }
+
 #layers-panel.collapsed #layers,
 #layers-panel.collapsed #layer-adjust,
 #layers-panel.collapsed .layer-controls { display: none; }
@@ -1154,6 +1175,34 @@ body.mode-free .brush-sub[hidden] { display: none; }
   flex: none;
   font-size: 10px;
   color: var(--text-dim);
+}
+
+/* Group (folder) rows: a twist-down chevron + folder glyph replace the thumb.
+   Both must NOT flex (the generic ".layer span" rule flexes the name only). */
+#layers .layer.group-row { background: rgba(255, 255, 255, 0.04); }
+#layers .layer.group-row:hover { background: #2a2a35; }
+#layers .layer.group-row.active {
+  background: rgba(65, 166, 246, 0.22);
+  border-color: var(--accent);
+}
+#layers .layer .layer-twist {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+#layers .layer .layer-folder { flex: none; }
+
+/* Drag-and-drop reorg: the dragged row dims; the drop slot shows as an accent
+   line above/below a row, or an outline when dropping INTO a group. */
+#layers .layer.dragging { opacity: 0.4; }
+#layers .layer.drop-above { box-shadow: inset 0 2px 0 0 var(--accent); }
+#layers .layer.drop-below { box-shadow: inset 0 -2px 0 0 var(--accent); }
+#layers .layer.drop-into {
+  border-color: var(--accent);
+  background: rgba(65, 166, 246, 0.15);
 }
 
 /* Appearance controls for the SELECTED layer (opacity / blend / alpha lock) */

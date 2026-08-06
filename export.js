@@ -575,9 +575,12 @@ function pdfLayerContent(layer, r) {
 
 /**
  * Assemble a one-page PDF. `doc` is
- *   { width, height, layers: [ { opacity, blend, paths[] } | { opacity, blend, image } ] }
- * where a path item is { subpaths, fill:[r,g,b]|null, stroke:[r,g,b]|null, w,
- * cap, join, dash, opacity } with colours 0..1, and an image is
+ *   { width, height, layers: [ node, … ] }
+ * where a node is a LEAF ({ opacity, blend, paths[] } or { opacity, blend,
+ * image }) or a GROUP ({ opacity, blend, children: [node, …] }) — groups nest
+ * arbitrarily and each becomes an isolated transparency-group form. A path item
+ * is { subpaths, fill:[r,g,b]|null, stroke:[r,g,b]|null, w, cap, join, dash,
+ * opacity } with colours 0..1, and an image is
  * { rgb: Uint8Array(w*h*3), alpha: Uint8Array(w*h)|null, w, h }.
  * `deflate` is an optional async (bytes) => zlib bytes; without it, streams
  * are stored uncompressed (valid, just larger).
@@ -617,17 +620,26 @@ async function encodePDF(doc, deflate) {
     return idx;
   };
 
-  // PASS 1 — build every layer's content stream and its image objects. No
-  // form objects yet: a form's /Resources must list the ExtGStates its paths
-  // reference, and that list isn't final until all layers have been walked.
-  // (Writing the forms first and string-patching their dictionaries
-  // afterwards was the first attempt; building in dependency order is the
-  // version that doesn't rely on a fragile substring replace.)
-  const pending = [];
-  for (const layer of doc.layers) {
+  // PASS 1 — build a PENDING TREE mirroring doc.layers: a leaf carries its
+  // content stream + any image object + its gs; a GROUP (node.children) carries
+  // its pending children + its gs. No form objects yet — a form's /Resources
+  // must list the ExtGStates its paths reference, and that list isn't final
+  // until every node has been walked. (Building in dependency order is what
+  // avoids the fragile substring-patch the first attempt used.)
+  let imgCount = 0;
+  const buildPending = async (node) => {
+    const gs = needGS(node.opacity === undefined ? 1 : node.opacity, node.blend || 'normal');
+    if (node.children) {
+      // An isolated group: a Form XObject whose content invokes its children's
+      // forms, so the group's alpha/blend applies to the flattened children as
+      // a unit — exactly the compositor's isolated-group model.
+      const kids = [];
+      for (const c of node.children) { const k = await buildPending(c); if (k) kids.push(k); }
+      return kids.length ? { kids, gs } : null;
+    }
     let stream, imgRef = null;
-    if (layer.image) {
-      const im = layer.image;
+    if (node.image) {
+      const im = node.image;
       const rgbZ = await zip(im.rgb);
       let smaskRef = null;
       if (im.alpha) {
@@ -642,44 +654,61 @@ async function encodePDF(doc, deflate) {
         + `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter ${rgbZ.filter} `
         + (smaskRef ? `/SMask ${smaskRef} 0 R ` : '')
         + `/Length ${rgbZ.data.length} >>\nstream\n`), rgbZ.data, enc('\nendstream')));
-      imgRef = { name: `Im${pending.length}`, obj: iObj };
+      imgRef = { name: `Im${imgCount++}`, obj: iObj };
       // A PDF image fills the unit square with its FIRST ROW at the top of
       // that square — which is upside down once the page space is y-down.
       stream = `q ${r(W)} 0 0 ${r(-H)} 0 ${r(H)} cm /${imgRef.name} Do Q\n`;
     } else {
-      for (const it of layer.paths || []) {
+      for (const it of node.paths || []) {
         if (it.opacity !== undefined && it.opacity < 1) it.gsAlpha = needGS(it.opacity, 'normal');
       }
-      stream = pdfLayerContent(layer, r);
+      stream = pdfLayerContent(node, r);
     }
-    if (!stream.trim()) continue;
-    pending.push({ stream, imgRef, gs: needGS(layer.opacity === undefined ? 1 : layer.opacity,
-                                              layer.blend || 'normal') });
-  }
+    return stream.trim() ? { stream, imgRef, gs } : null;
+  };
+  const pendingTop = [];
+  for (const node of doc.layers) { const p = await buildPending(node); if (p) pendingTop.push(p); }
 
   // PASS 2 — ExtGStates, now that every alpha/blend pair is known.
   const gsObjs = gsList.map((d) => addDict(d));
   const gsResStr = gsObjs.map((o, i) => `/GA${i} ${o} 0 R`).join(' ');
 
-  // PASS 3 — one Form XObject per layer, with correct resources.
-  const forms = [];
-  for (const p of pending) {
-    const z = await zip(enc(p.stream));
-    const name = `Fm${forms.length}`;
+  // PASS 3 — write Form XObjects post-order (a group form references its child
+  // forms by object number AND name, so children must be built and named
+  // first). The name is assigned AFTER the children so every form's name is
+  // globally unique — a name reused across nested /Resources scopes renders,
+  // but is a trap not worth leaving.
+  let formCount = 0;
+  const writeForm = async (p) => {
+    let xobjEntries = '', stream;
+    if (p.kids) {
+      const childRefs = [];
+      for (const k of p.kids) childRefs.push(await writeForm(k));
+      stream = childRefs.map((cr) => `q /GA${cr.gs} gs /${cr.name} Do Q`).join('\n') + '\n';
+      xobjEntries = childRefs.map((cr) => `/${cr.name} ${cr.obj} 0 R`).join(' ');
+    } else {
+      stream = p.stream;
+      if (p.imgRef) xobjEntries = `/${p.imgRef.name} ${p.imgRef.obj} 0 R`;
+    }
+    const name = `Fm${formCount++}`;
+    const z = await zip(enc(stream));
     const obj = add(concatBytes(enc(
       `<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 ${r(W)} ${r(H)}] `
       + `/Group << /S /Transparency /CS /DeviceRGB /I true >> `
       + `/Resources << /ExtGState << ${gsResStr} >> `
-      + (p.imgRef ? `/XObject << /${p.imgRef.name} ${p.imgRef.obj} 0 R >> ` : '')
+      + (xobjEntries ? `/XObject << ${xobjEntries} >> ` : '')
       + `>> /Filter ${z.filter} /Length ${z.data.length} >>\nstream\n`),
       z.data, enc('\nendstream')));
-    forms.push({ name, obj, gs: p.gs });
-  }
+    return { name, obj, gs: p.gs };
+  };
+  const topForms = [];
+  for (const p of pendingTop) topForms.push(await writeForm(p));
 
   // Page content: flip into art space (top-left origin, y down), then invoke
-  // each layer form under its opacity/blend state.
+  // each TOP-LEVEL form under its opacity/blend state (child forms are invoked
+  // from inside their group's form).
   let page = `q 1 0 0 -1 0 ${r(H)} cm\n`;
-  for (const f of forms) page += `q /GA${f.gs} gs /${f.name} Do Q\n`;
+  for (const f of topForms) page += `q /GA${f.gs} gs /${f.name} Do Q\n`;
   page += 'Q\n';
   const pz = await zip(enc(page));
   objs[CONTENT - 1] = concatBytes(
@@ -692,7 +721,7 @@ async function encodePDF(doc, deflate) {
     `<< /Type /Page /Parent ${PAGES} 0 R /MediaBox [0 0 ${r(W)} ${r(H)}] `
     + `/Group << /S /Transparency /CS /DeviceRGB /I true >> `
     + `/Resources << /ExtGState << ${gsResStr} >> /XObject << `
-    + forms.map((f) => `/${f.name} ${f.obj} 0 R`).join(' ')
+    + topForms.map((f) => `/${f.name} ${f.obj} 0 R`).join(' ')
     + ` >> >> /Contents ${CONTENT} 0 R >>`);
 
   // Serialize with a cross-reference table.
