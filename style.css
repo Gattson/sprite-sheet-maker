@@ -505,6 +505,29 @@ input.num:focus {
 .vw-preset, .vw-toggle { width: auto; padding: 3px 7px; }
 .vw-toggle.active { background: rgba(244, 160, 32, 0.30); border-color: #f4a020; }
 
+/* Fill controls (12b): a colour swatch (background = the fill, a red slash =
+   no fill) that opens a native colour picker, plus None / Stroke toggles. */
+.vs-swatch {
+  width: 22px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid #555;
+  border-radius: 5px;
+  cursor: pointer;
+  position: relative;
+  background: #808080;
+  vertical-align: middle;
+}
+.vs-swatch.no-fill { background: #33333c; }
+.vs-swatch.no-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 4px;
+  background: linear-gradient(to top right, transparent 45%, #e04545 45%, #e04545 55%, transparent 55%);
+}
+.vs-fill-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
 /* ---------- brush library panel (floating overlay, Procreate-style) ---------- */
 #brush-panel {
   position: absolute;
@@ -1010,8 +1033,29 @@ body.intent-print #toggles-menu #proof-row { display: flex; }
 
 #btn-start-load { margin-left: 10px; }
 
-/* The smudge tool only exists in freeform mode. */
-body:not(.mode-free) .tool[data-tool="smudge"] { display: none; }
+/* The smudge, pen and shape tools only exist in freeform mode. */
+body:not(.mode-free) .tool[data-tool="smudge"],
+body:not(.mode-free) .tool[data-tool="pen"],
+body:not(.mode-free) .tool[data-tool="shape"] { display: none; }
+
+/* Shape-tool controls (12b): type row + per-kind parameter inputs. */
+#shape-box { display: flex; flex-direction: column; gap: 6px; }
+#shape-box[hidden] { display: none; }
+#shape-types { display: flex; gap: 3px; }
+.shape-type {
+  flex: 1;
+  padding: 4px 0;
+  font-size: 14px;
+  color: var(--text);
+  background: #26262f;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.shape-type:hover { background: #2a2a35; }
+.shape-type.active { background: rgba(65, 166, 246, 0.28); border-color: var(--accent); }
+.shape-param { font-size: 12px; color: var(--text-dim); }
+.shape-param input.num { width: 46px; }
 
 /* JS hides the hardness slider for texture brushes; without this the
    body.mode-free display rule would win over the hidden attribute. */

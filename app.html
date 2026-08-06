@@ -94,7 +94,9 @@
       <button id="btn-export-apng" class="menu-item" title="Animated PNG at the preview FPS — lossless, keeps transparency">Export APNG</button>
       <button id="btn-export-video" class="menu-item" title="Record to MP4 or WebM (whichever this browser encodes); transparency becomes dark gray">Export video</button>
       <button id="btn-export-zip" class="menu-item" title="Each frame as its own PNG, zipped — for video editors and game engines">Export frames (ZIP)</button>
-      <input id="inp-file" type="file" accept=".json,application/json,image/png,image/jpeg" hidden>
+      <button id="btn-export-svg" class="menu-item" title="This frame as SVG — vector layers stay real editable paths (Illustrator, Affinity, Figma, Inkscape); raster layers ride along as embedded PNGs">Export frame (SVG)</button>
+      <button id="btn-export-pdf" class="menu-item" title="This frame as print-ready PDF — vector layers stay real paths, so it prints at the press's resolution rather than the canvas's">Export frame (PDF)</button>
+      <input id="inp-file" type="file" accept=".json,application/json,image/png,image/jpeg,.svg,image/svg+xml" hidden>
     </div>
   </div>
   <div class="group" id="settings-wrap">
@@ -141,6 +143,8 @@
     <button class="tool" data-tool="smudge" title="Smudge (U) — drags the colors already on the layer; the Strength slider sets how far they carry"><span class="icon">&#9757;</span> Smudge</button>
     <button class="tool" data-tool="fill" title="Fill bucket (G)"><span class="icon">&#9639;</span> Fill</button>
     <button class="tool" data-tool="eyedropper" title="Eyedropper (I)"><span class="icon">&#128167;</span> Pick</button>
+    <button class="tool" data-tool="pen" title="Pen — click to place anchors, click-drag for smooth curves; click the first anchor to close. Esc or right-click finishes the path. (Vector layers)"><span class="icon">&#10000;</span> Pen</button>
+    <button class="tool" data-tool="shape" title="Shapes — drag out a rectangle, ellipse, polygon or star (stay live-editable by their parameters). Shift = square/regular, Alt = from centre. (Vector layers)"><span class="icon">&#9645;</span> Shape</button>
     <button class="tool" data-tool="select" title="Select a rectangle (S) — drag inside it to move; Ctrl+C/X/V copy/cut/paste onto any frame or layer"><span class="icon">&#9633;</span> Select</button>
     <button class="tool" data-tool="pan" title="Drag the canvas around (H — or hold Space or Enter with any tool)"><span class="icon">&#9995;</span> Pan</button>
     <hr>
@@ -170,6 +174,18 @@
         <span>Fill tolerance <input id="tolerance-num" class="num" type="number" min="0" max="100" value="12">%</span>
         <input id="inp-fill-tol" type="range" min="0" max="100" value="12">
       </div>
+    </div>
+    <div id="shape-box" hidden>
+      <div id="shape-types">
+        <button class="shape-type active" data-shape="rect" title="Rectangle">&#9645;</button>
+        <button class="shape-type" data-shape="ellipse" title="Ellipse">&#9711;</button>
+        <button class="shape-type" data-shape="polygon" title="Polygon">&#11040;</button>
+        <button class="shape-type" data-shape="star" title="Star">&#9733;</button>
+      </div>
+      <div class="shape-param" data-for="polygon" hidden><span>Sides <input id="shape-sides" class="num" type="number" min="3" max="100" value="5"></span></div>
+      <div class="shape-param" data-for="star" hidden><span>Points <input id="shape-points" class="num" type="number" min="3" max="100" value="5"></span></div>
+      <div class="shape-param" data-for="star" hidden><span>Inner <input id="shape-inner" class="num" type="number" min="5" max="95" value="50">%</span></div>
+      <div class="shape-param" data-for="rect"><span>Corner <input id="shape-corner" class="num" type="number" min="0" max="9999" value="0"></span></div>
     </div>
     <hr>
     <label id="color-well" title="Current color">
@@ -223,6 +239,14 @@
           <span class="vs-grp vs-dash"><span class="vs-label">Dash</span>
             <input class="vs-dash-on num" type="number" min="0" step="1" title="Dash length in pixels (blank or 0 = solid line)">
             <input class="vs-dash-off num" type="number" min="0" step="1" title="Gap length in pixels between dashes">
+          </span>
+        </span>
+        <span id="vec-fill-sel" class="vec-widths">
+          <span class="vs-grp"><span class="vs-label">Fill</span>
+            <button id="btn-vec-fill" class="vs-swatch" title="Fill colour — click to set the selected shape's fill"></button>
+            <input id="inp-fill" type="color" class="vs-fill-input" value="#000000" aria-hidden="true" tabindex="-1">
+            <button id="btn-vec-fill-none" class="vs-btn vw-preset" title="Remove the fill">None</button>
+            <button id="btn-vec-stroke" class="vs-btn vw-toggle" title="Outline on/off — turn off for a fill-only shape">Stroke</button>
           </span>
         </span>
         <span id="vec-width-sel" class="vec-widths">

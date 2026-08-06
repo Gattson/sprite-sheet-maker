@@ -719,7 +719,17 @@ function render() {
       drawGhost(state.frames[shownIdx + d], state.onionNextColor, alpha);
     }
   }
-  ctx.drawImage(proofed || state.frames[shownIdx].canvas, panX, panY, cw, ch);
+  // Crisp zoom (Phase 12): when it applies, the shown frame comes from a
+  // composite rebuilt at VIEWPORT resolution, so vector edges stay sharp
+  // magnified instead of showing the art-res mirror's pixels. It is already
+  // device-resolution and already positioned, so it blits 1:1 over the whole
+  // viewport rather than being scaled into place. Everything else in render()
+  // — onion ghosts above, chrome below — is untouched.
+  const crisp = crispWanted(state.frames[shownIdx], proofed)
+    ? crispCompose(state.frames[shownIdx], shownIdx)
+    : null;
+  if (crisp) ctx.drawImage(crisp, 0, 0, viewW, viewH);
+  else ctx.drawImage(proofed || state.frames[shownIdx].canvas, panX, panY, cw, ch);
 
   // 3. Grid lines — pixel mode only. Minor lines per pixel (only useful when
   //    zoomed in); stronger lines every 8 pixels as a sprite-work reference.
@@ -762,7 +772,14 @@ function render() {
       // box transform (the same math commit runs), so what a drag shows IS
       // the commit result — no scaled-bitmap mush. Cached per box state;
       // only pointer moves that change the box pay the re-rasterize.
-      const key = `${f.x},${f.y},${f.w},${f.h},${f.angle},${f.flipX},${f.flipY}`;
+      //     The proxy is rasterized to MATCH the canvas behind it: with the
+      //     crisp compositor on, at screen scale, because otherwise a lifted
+      //     stroke is the one blocky thing left on an otherwise sharp canvas.
+      //     Scale is capped to viewport resolution — there is nothing to see
+      //     beyond it, and it keeps this bounded by SCREEN size rather than by
+      //     selection size, the same principle option D rests on.
+      const key = `${f.x},${f.y},${f.w},${f.h},${f.angle},${f.flipX},${f.flipY}`
+                + `,${crisp ? zoom : 1},${viewW},${viewH},${dpr}`;
       if (f.previewKey !== key) {
         const t = vecBoxXform(f);
         const ts = f.vecStrokes.map((s) => xformStroke(s, t));
@@ -771,16 +788,28 @@ function render() {
           const sb = strokeBounds(s);
           b = growRect(b, sb.x0, sb.y0, sb.x1, sb.y1);
         }
-        f.preview = b
-          ? { canvas: strokesProxy(ts, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0),
-              x: b.x0, y: b.y0 }
-          : null;
+        if (b) {
+          const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+          const scale = crisp
+            ? Math.max(1, Math.min(zoom, CRISP_MAX_SCALE,
+                                         (viewW * dpr) / Math.max(1, bw),
+                                         (viewH * dpr) / Math.max(1, bh)))
+            : 1;
+          f.preview = { canvas: strokesProxy(ts, b.x0, b.y0, bw, bh, scale),
+                        x: b.x0, y: b.y0, scale };
+        } else {
+          f.preview = null;
+        }
         f.previewKey = key;
       }
       if (f.preview) {
-        ctx.drawImage(f.preview.canvas,
-          panX + f.preview.x * zoom, panY + f.preview.y * zoom,
-          f.preview.canvas.width * zoom, f.preview.canvas.height * zoom);
+        // Draw at the proxy's ART size (its pixel size divided back out by the
+        // scale), so a sharpened proxy lands on exactly the same rectangle an
+        // art-res one would have.
+        const p = f.preview;
+        ctx.drawImage(p.canvas,
+          panX + p.x * zoom, panY + p.y * zoom,
+          (p.canvas.width / p.scale) * zoom, (p.canvas.height / p.scale) * zoom);
       }
     } else if (f.angle) {
       ctx.save();
@@ -810,17 +839,23 @@ function render() {
       ctx.closePath();
       ctx.stroke();
     };
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)';
-    outline();
-    ctx.strokeStyle = '#ffffff';
-    ctx.setLineDash([5, 4]);
-    outline();
-    ctx.setLineDash([]);
+    // The dashed box is a transform affordance; the Pen edits points, not the
+    // box, so it shows only the anchors (below), not the outline.
+    if (state.tool !== 'pen') {
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)';
+      outline();
+      ctx.strokeStyle = '#ffffff';
+      ctx.setLineDash([5, 4]);
+      outline();
+      ctx.setLineDash([]);
+    }
 
-    // Transform handles — freeform Select only (pixel mode keeps its exact
-    // 90°-button transforms; free resize would resample pixel art).
-    if (state.mode === 'free' && state.tool === 'select') {
+    // Vector editing overlay — Select and Pen (pixel mode keeps its exact
+    // 90°-button transforms; free resize would resample pixel art). Transform
+    // handles are Select-only; the Pen shows just the path's anchors + tangents
+    // so an inserted/edited anchor is immediately visible.
+    if (state.mode === 'free' && (state.tool === 'select' || state.tool === 'pen')) {
       // The handle being dragged — or, at rest, the one under the cursor —
       // draws bigger and accent-blue, so it's obvious what a click will
       // grab before committing to it.
@@ -830,7 +865,7 @@ function render() {
       const isHot = (hnd) => !!active && (hnd.rot
         ? !!active.rot
         : !active.rot && active.hx === hnd.hx && active.hy === hnd.hy);
-      for (const hnd of boxHandles(sel, KNOB_GAP / zoom)) {
+      if (state.tool === 'select') for (const hnd of boxHandles(sel, KNOB_GAP / zoom)) {
         const hot = isHot(hnd);
         const HS = hot ? 6 : 4; // handle half-side, screen px
         const hx = panX + hnd.x * zoom;
@@ -888,18 +923,125 @@ function render() {
           }
           ctx.lineWidth = 1;
         }
+        // Bezier handles (Phase 12): arms + round endpoints for any shown
+        // anchor that carries tangents, so a Pen curve reshapes by its handles.
+        if (!vecWidthMode) {
+          for (const i of dots) {
+            const a = s.pts[i];
+            if (a.length <= 3) continue;
+            const ax = panX + a[0] * zoom, ay = panY + a[1] * zoom;
+            for (const side of [3, 4]) {
+              const h = a[side];
+              if (!h) continue;
+              const hx = panX + (a[0] + h[0]) * zoom, hy = panY + (a[1] + h[1]) * zoom;
+              ctx.strokeStyle = 'rgba(65, 166, 246, 0.85)';
+              ctx.lineWidth = 1;
+              ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(hx, hy); ctx.stroke();
+              ctx.fillStyle = '#41a6f6';
+              ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)';
+              ctx.beginPath(); ctx.arc(hx, hy, 3.5, 0, Math.PI * 2);
+              ctx.fill(); ctx.stroke();
+            }
+          }
+        }
+        // Anchors: square for a Pen anchor (has tangents / could), round for a
+        // plain freehand node — a small cue for what kind of point it is.
         for (const i of dots) {
           const hot = i === hotIdx;
           ctx.fillStyle = hot ? '#41a6f6' : (vecWidthMode ? '#f4a020' : '#ffffff');
           ctx.strokeStyle = hot ? '#ffffff' : 'rgba(0, 0, 0, 0.8)';
-          ctx.beginPath();
-          ctx.arc(panX + s.pts[i][0] * zoom, panY + s.pts[i][1] * zoom,
-                  hot ? 5.5 : 3.5, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
+          const cx = panX + s.pts[i][0] * zoom, cy = panY + s.pts[i][1] * zoom;
+          if (!vecWidthMode && s.pts[i].length > 3) {
+            const r = hot ? 5 : 3.5;
+            ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
+            ctx.strokeRect(cx - r + 0.5, cy - r + 0.5, r * 2 - 1, r * 2 - 1);
+          } else {
+            ctx.beginPath();
+            ctx.arc(cx, cy, hot ? 5.5 : 3.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          }
         }
       }
     }
+  }
+
+  // 5·. Shape tool: preview the primitive being dragged out.
+  if (shapeDrag && !playing) {
+    const box = shapeDragBox(shapeDrag);
+    if (box.w >= 1 && box.h >= 1) {
+      const samples = vecCurvePoints({ pts: shapePts(shapeFromStyle(box)), closed: true });
+      ctx.save();
+      ctx.strokeStyle = '#41a6f6';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      samples.forEach((pt, i) => {
+        const X = panX + pt[0] * zoom, Y = panY + pt[1] * zoom;
+        if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y);
+      });
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // 5a. Pen tool, no path yet: a "+" over an existing ribbon marks where a
+  //     click will insert a shape-preserving anchor.
+  if (penInsertPt && state.tool === 'pen' && !penPath && !playing) {
+    const { x, y } = penInsertPt.loc;
+    const cx = panX + x * zoom, cy = panY + y * zoom;
+    ctx.save();
+    ctx.strokeStyle = '#41a6f6';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+    ctx.moveTo(cx - 3, cy); ctx.lineTo(cx + 3, cy);
+    ctx.moveTo(cx, cy - 3); ctx.lineTo(cx, cy + 3);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 5b. Pen tool: the in-progress construction path — a thin skeleton with a
+  //     rubber-band segment to the cursor, plus anchor squares and handle arms.
+  if (penPath && !playing) {
+    const prev = penPath.pts.map(clonePt);
+    if (penHover && !penPath.closed && !penDrag) prev.push([penHover.x, penHover.y, 1]);
+    const samples = vecCurvePoints({ pts: prev, closed: penPath.closed });
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = '#41a6f6';
+    ctx.beginPath();
+    samples.forEach((pt, i) => {
+      const X = panX + pt[0] * zoom, Y = panY + pt[1] * zoom;
+      if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y);
+    });
+    if (penPath.closed) ctx.closePath();
+    ctx.stroke();
+    // Handle arms (only where an anchor carries them).
+    for (const a of penPath.pts) {
+      if (a.length <= 3) continue;
+      const ax = panX + a[0] * zoom, ay = panY + a[1] * zoom;
+      for (const h of [a[3], a[4]]) {
+        if (!h) continue;
+        const hx = panX + (a[0] + h[0]) * zoom, hy = panY + (a[1] + h[1]) * zoom;
+        ctx.strokeStyle = 'rgba(65, 166, 246, 0.7)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(hx, hy); ctx.stroke();
+        ctx.fillStyle = '#41a6f6';
+        ctx.beginPath(); ctx.arc(hx, hy, 3, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    // Anchor squares; the first lights up when the cursor is close enough to close.
+    penPath.pts.forEach((a, i) => {
+      const X = panX + a[0] * zoom, Y = panY + a[1] * zoom;
+      const canClose = i === 0 && penPath.pts.length >= 2 && penHover &&
+        Math.hypot((a[0] - penHover.x) * zoom, (a[1] - penHover.y) * zoom) <= PEN_CLOSE_PX;
+      ctx.fillStyle = canClose ? '#41a6f6' : '#ffffff';
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)';
+      ctx.fillRect(X - 3, Y - 3, 6, 6);
+      ctx.strokeRect(X - 3 + 0.5, Y - 3 + 0.5, 5, 5);
+    });
+    ctx.restore();
   }
 
   // 6. Cursor. Freeform: a circle matching the tip diameter, at the exact
@@ -1113,7 +1255,17 @@ function setZoom(newZoom, anchorX, anchorY) {
   state.panY = anchorY - (anchorY - state.panY) * k;
   state.zoom = newZoom;
   updateUI();
-  render();
+  // COALESCED, not synchronous. A high-resolution wheel or trackpad fires
+  // several events per displayed frame, and this used to run a full render on
+  // every one. That was invisible when a render was one bitmap blit; with
+  // crisp zoom a render re-rasterizes vector geometry at screen scale, so an
+  // event storm multiplied the most expensive work in the app by the wheel's
+  // event rate — measured at 6 events/frame: 2.8 ms mean and 6.3 ms worst of
+  // JS per frame, against 0.9 ms before crisp existed. renderSoon collapses a
+  // burst to one render per frame, exactly as the live-stroke path already
+  // does for 240 Hz styluses. (It falls back to a synchronous render when
+  // requestAnimationFrame is absent, so the headless suite is unaffected.)
+  renderSoon();
 }
 
 /**
@@ -1756,6 +1908,10 @@ const MITER_LIMIT = 4; // miter length / radius past this falls back to bevel
                        // (SVG defaults to 10; 4 keeps art corners from growing
                        // needle spikes at sharp joints)
 let vecStyle = { cap: 'round', join: 'round', dash: null, curve: false };
+// Pending parameters for the NEXT shape drawn with the Shape tool (12b); also
+// the fallback when a selected shape lacks a param. Persisted like vecStyle.
+let shapeStyle = { kind: 'rect', r: 0, sides: 5, points: 5, inner: 0.5 };
+let shapeDrag = null; // { x0, y0, cx, cy, shift, alt, plane, frame } while dragging one out
 
 /* Curve rendering (2026-07-22): a stroke's `pts` are its editable NODES; by
  * default they're joined by straight capsules, so sparse nodes look faceted.
@@ -1797,17 +1953,253 @@ const strokeLook = (s) => ({
   dash: s.dash ? s.dash.slice() : null, curve: !!s.curve,
 });
 
-/** Deep-copy a stroke so planes never share point arrays (dup frame/layer). */
-const cloneStroke = (s) => ({ ...strokeLook(s), pts: s.pts.map((p) => p.slice()) });
+/* A point is [x, y, w] (no handles — every freehand stroke and every file from
+ * before Phase 12) or [x, y, w, hIn, hOut] where each handle is a RELATIVE
+ * offset vector [dx, dy] in art px from its anchor, or null (Phase 12: per-
+ * point OPTIONAL tangents). Relative offsets are what make a moved anchor carry
+ * its handles for free and let xformStroke rotate/scale a handle without ever
+ * translating it. A point with no handle keeps today's Catmull-Rom auto-tangent
+ * (curve mode) or straight segment; a point with handles uses them. */
+const ptHasHandle = (p) => p.length > 3 && (p[3] || p[4]);
+const strokeHasHandles = (s) => s.pts.some(ptHasHandle);
 
-/** The point list a curved stroke actually rasterizes to: its nodes densified
- *  into a centripetal Catmull-Rom spline through them (x, y AND the width
- *  multiplier). Straight strokes (or <3 nodes) return their nodes unchanged.
- *  Phantom end nodes are reflected so the ends keep a natural tangent. PURE
- *  (unit-tested via __ssmTest). */
-function vecCurvePoints(s) {
+/** Deep-copy ONE editable point, including its handle sub-arrays. A bare
+ *  p.slice() shallow-copies, so two points would share the same [dx,dy] handle
+ *  array — the identity trap that has bitten this project three times. A
+ *  handle-free point stays length-3, which keeps its saved bytes and the
+ *  no-handle render path byte-identical to before. */
+const clonePt = (p) =>
+  p.length > 3
+    ? [p[0], p[1], p[2], p[3] ? p[3].slice() : null, p[4] ? p[4].slice() : null]
+    : [p[0], p[1], p[2]];
+
+/** A fresh, session-unique stroke id (opaque string). 10d (collab) wants
+ *  id + author + timestamp with delete-by-id, and object identity can't cross
+ *  a wire. Built WITHOUT crypto so the headless test shim — which may not
+ *  expose it — mints the same way the browser does. */
+let strokeSeq = 0;
+const STROKE_SESSION = Math.random().toString(36).slice(2, 8) + Date.now().toString(36);
+const mintStrokeId = () => `${STROKE_SESSION}-${++strokeSeq}`;
+
+/** Deep-copy a stroke so planes never share point arrays (dup frame/layer).
+ *  MINTS a new id — never copies one: look is copied, IDENTITY is not, or a
+ *  duplicated frame would seed two strokes with the same id into a collab room
+ *  (gate decision 4, 2026-08-03; the third identity-survives-a-copy trap). The
+ *  `closed` topology flag rides along, but is deliberately NOT in strokeLook —
+ *  splitStroke derives its survivors through strokeLook and they must come out
+ *  open. Every plane build (new, LOAD, dup) runs through here, so a loaded file
+ *  gets session-fresh ids; that only ever mints unique ids, never duplicates,
+ *  which is the property the gate actually requires. */
+const cloneStroke = (s) => ({
+  ...strokeLook(s), id: mintStrokeId(),
+  ...(s.closed ? { closed: true } : {}),
+  ...(s.fill ? { fill: s.fill } : {}),      // shape props (like closed): carried
+  ...(s.noStroke ? { noStroke: true } : {}), // by a full clone, dropped by split
+  ...(s.shape ? { shape: { ...s.shape } } : {}), // a duplicated shape stays live
+  pts: s.pts.map(clonePt),
+});
+
+/* --- Cubic bezier helpers (Phase 12: per-point optional tangents). A stroke
+ * whose points carry handles is evaluated segment by segment as a cubic; where
+ * a handle is absent its control point collapses onto the anchor, so a handle-
+ * less segment is exactly a straight line (standard SVG path semantics — which
+ * is also why future SVG export is exact). Pure — unit-tested via __ssmTest. */
+
+/** One point on the cubic P0..P3 at parameter t∈[0,1]. */
+function cubicAt(P0, P1, P2, P3, t) {
+  const mt = 1 - t, a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
+  return [a * P0[0] + b * P1[0] + c * P2[0] + d * P3[0],
+          a * P0[1] + b * P1[1] + c * P2[1] + d * P3[1]];
+}
+
+/** de Casteljau split of the cubic P0..P3 at t → { left:[4], right:[4] }, two
+ *  cubics that reproduce the original halves EXACTLY (a lerp would change the
+ *  curve). This is what keeps the eraser (splitStroke) and anchor insertion
+ *  from reshaping a handled curve where they cut. */
+function splitCubic(P0, P1, P2, P3, t) {
+  const L = (a, b) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  const A = L(P0, P1), B = L(P1, P2), C = L(P2, P3);
+  const D = L(A, B), E = L(B, C);
+  const M = L(D, E);
+  return { left: [P0, A, D, M], right: [M, E, C, P3] };
+}
+
+/** The sub-cubic of P0..P3 over the parameter window [t0,t1], via de Casteljau
+ *  twice → [Q0,Q1,Q2,Q3]. Used by the eraser and by anchor insertion to carve
+ *  a handled curve without altering its shape. */
+function subCubic(P0, P1, P2, P3, t0, t1) {
+  let a = P0, b = P1, c = P2, d = P3;
+  if (t0 > 0) { const r = splitCubic(a, b, c, d, t0); a = r.right[0]; b = r.right[1]; c = r.right[2]; d = r.right[3]; }
+  if (t1 < 1) {
+    const tt = t0 < 1 ? (t1 - t0) / (1 - t0) : 0;
+    const l = splitCubic(a, b, c, d, tt); a = l.left[0]; b = l.left[1]; c = l.left[2]; d = l.left[3];
+  }
+  return [a, b, c, d];
+}
+
+/** The two cubic control points for the segment anchor a → anchor b, from a's
+ *  hOut (a[4]) and b's hIn (b[3]); an absent handle sits the control on the
+ *  anchor (→ straight). */
+function segCtrl(a, b) {
+  const hOut = a.length > 4 ? a[4] : null;
+  const hIn = b.length > 3 ? b[3] : null;
+  return {
+    P1: [a[0] + (hOut ? hOut[0] : 0), a[1] + (hOut ? hOut[1] : 0)],
+    P2: [b[0] + (hIn ? hIn[0] : 0), b[1] + (hIn ? hIn[1] : 0)],
+  };
+}
+
+/** Densify a HANDLED stroke into render samples [x, y, widthMul] — one cubic
+ *  per segment, plus the closing segment when `closed`. Width interpolates
+ *  linearly across each segment, exactly like the Catmull-Rom path. PURE.
+ *  `density` (see vecCurvePoints) scales the sample rate for crisp zoom. */
+function bezierCurvePoints(s, density = 1) {
+  const p = s.pts, n = p.length;
+  if (n < 2) return p.map((q) => [q[0], q[1], q[2]]);
+  const out = [[p[0][0], p[0][1], p[0][2]]];
+  const segs = s.closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const a = p[i], b = p[(i + 1) % n];
+    const { P1, P2 } = segCtrl(a, b);
+    const P0 = [a[0], a[1]], P3 = [b[0], b[1]];
+    const approx = Math.hypot(P1[0] - P0[0], P1[1] - P0[1])
+                 + Math.hypot(P2[0] - P1[0], P2[1] - P1[1])
+                 + Math.hypot(P3[0] - P2[0], P3[1] - P2[1]);
+    const steps = clamp(Math.ceil(approx * density / 3), 1, 48 * Math.ceil(density));
+    for (let k = 1; k <= steps; k++) {
+      const t = k / steps;
+      const q = cubicAt(P0, P1, P2, P3, t);
+      out.push([q[0], q[1], a[2] + (b[2] - a[2]) * t]);
+    }
+  }
+  return out;
+}
+
+/** Set (or clear) one handle on a point, keeping the array tidy: a near-zero
+ *  handle stores as null, and a point with no handles collapses back to
+ *  length-3 (a plain corner). `side` is 3 (hIn) or 4 (hOut). */
+function setPtHandle(pt, side, h) {
+  const keep = h && (Math.abs(h[0]) > 1e-6 || Math.abs(h[1]) > 1e-6) ? h : null;
+  if (pt.length < 5) { pt[3] = pt[3] || null; pt[4] = pt[4] || null; }
+  pt[side] = keep;
+  if (!pt[3] && !pt[4]) pt.length = 3;
+}
+
+/** Insert an anchor into the segment `seg` at parameter `t`, PRESERVING the
+ *  curve's shape: a handled segment is split with de Casteljau (the new anchor
+ *  and both neighbours get the derived handles), a straight run just gets a
+ *  point on the line. Returns a NEW point array. PURE (unit-tested). */
+function insertAnchor(pts, closed, seg, t) {
+  const n = pts.length;
+  const a = pts[seg], b = pts[(seg + 1) % n];
+  const wNew = a[2] + (b[2] - a[2]) * t;
+  const out = pts.map(clonePt);
+  const A = out[seg], B = out[(seg + 1) % n];
+  const straight = !(a.length > 4 && a[4]) && !(b.length > 3 && b[3]);
+  let np;
+  if (straight) {
+    np = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, wNew];
+  } else {
+    const { P1, P2 } = segCtrl(a, b);
+    const sp = splitCubic([a[0], a[1]], P1, P2, [b[0], b[1]], t);
+    const L = sp.left, R = sp.right;
+    const v = (f, g) => [g[0] - f[0], g[1] - f[1]];
+    setPtHandle(A, 4, v(L[0], L[1]));       // anchor before: new hOut
+    setPtHandle(B, 3, v(R[3], R[2]));       // anchor after: new hIn
+    np = [L[3][0], L[3][1], wNew];
+    setPtHandle(np, 3, v(L[3], L[2]));      // new anchor hIn
+    setPtHandle(np, 4, v(R[0], R[1]));      // new anchor hOut
+  }
+  out.splice(seg + 1, 0, np); // between the two anchors (end, for a closed wrap)
+  return out;
+}
+
+/* --- Shape primitives (Phase 12b): a shape is a closed stroke carrying `shape`
+ * metadata {kind, x, y, w, h, ...params}; shapePts regenerates its point array
+ * from that. All kinds fit the bbox — ellipse and rounded-rect use the per-point
+ * bezier handles for exact curves, polygon/star are corner polylines. Editing
+ * points directly (releaseShape) drops the metadata → a plain path. --- */
+const SHAPE_K = 0.5522847498307936; // handle length ratio for a bezier quarter-circle
+
+function shapePts(shape) {
+  const { kind, x, y, w, h } = shape;
+  const cx = x + w / 2, cy = y + h / 2, rx = w / 2, ry = h / 2;
+  if (kind === 'ellipse') {
+    const kx = rx * SHAPE_K, ky = ry * SHAPE_K;
+    return [
+      [cx, y, 1, [-kx, 0], [kx, 0]],      // top
+      [x + w, cy, 1, [0, -ky], [0, ky]],  // right
+      [cx, y + h, 1, [kx, 0], [-kx, 0]],  // bottom
+      [x, cy, 1, [0, ky], [0, -ky]],      // left
+    ];
+  }
+  if (kind === 'polygon') {
+    const n = Math.max(3, Math.round(shape.sides || 5));
+    const rot = shape.rot != null ? shape.rot : -Math.PI / 2;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const a = rot + (i * 2 * Math.PI) / n;
+      out.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a), 1]);
+    }
+    return out;
+  }
+  if (kind === 'star') {
+    const p = Math.max(3, Math.round(shape.points || 5));
+    const inner = clamp(shape.inner != null ? shape.inner : 0.5, 0.05, 0.95);
+    const rot = shape.rot != null ? shape.rot : -Math.PI / 2;
+    const out = [];
+    for (let i = 0; i < 2 * p; i++) {
+      const a = rot + (i * Math.PI) / p;
+      const rr = i % 2 === 0 ? 1 : inner;
+      out.push([cx + rx * rr * Math.cos(a), cy + ry * rr * Math.sin(a), 1]);
+    }
+    return out;
+  }
+  // rect (default): sharp = 4 corners; rounded = 8 anchors with r*K arc handles.
+  const r = Math.max(0, Math.min(shape.r || 0, Math.min(w, h) / 2));
+  if (r <= 0) return [[x, y, 1], [x + w, y, 1], [x + w, y + h, 1], [x, y + h, 1]];
+  const k = r * SHAPE_K;
+  return [
+    [x + r, y, 1, [-k, 0], null],
+    [x + w - r, y, 1, null, [k, 0]],
+    [x + w, y + r, 1, [0, -k], null],
+    [x + w, y + h - r, 1, null, [0, k]],
+    [x + w - r, y + h, 1, [k, 0], null],
+    [x + r, y + h, 1, null, [-k, 0]],
+    [x, y + h - r, 1, [0, k], null],
+    [x, y + r, 1, null, [0, -k]],
+  ];
+}
+
+/** Rebuild a live shape's points from its params (leaves colour/fill/etc). */
+const regenShape = (s) => { s.pts = shapePts(s.shape); };
+
+/** Drop the parametric link — any direct geometry edit turns a shape into a
+ *  plain editable path. */
+const releaseShape = (s) => { if (s.shape) delete s.shape; };
+
+/** The point list a curved stroke actually rasterizes to. A stroke with
+ *  per-point handles (Phase 12) evaluates as segment-wise cubics; otherwise a
+ *  `curve` stroke densifies into a centripetal Catmull-Rom spline through its
+ *  nodes (x, y AND the width multiplier), and a straight stroke (or <3 nodes)
+ *  returns its nodes unchanged. Phantom end nodes are reflected so the ends
+ *  keep a natural tangent. PURE (unit-tested via __ssmTest).
+ *
+ *  `density` multiplies the sample rate and exists ONLY for crisp zoom
+ *  (Phase 12): the default ~3-art-px spacing becomes ~3 SCREEN px of faceting
+ *  at zoom 8, which is visible precisely when someone zooms in to check our
+ *  vector claim. Crisp rendering passes `zoom`; everything else — and in
+ *  particular strokeBounds and every hit test — leaves it at 1, so bounds and
+ *  picking stay zoom-INDEPENDENT (a dirty rect that breathed with the zoom
+ *  level would be a fine way to corrupt undo patches). At density 1 the output
+ *  is bit-identical to before. */
+function vecCurvePoints(s, density = 1) {
   const p = s.pts;
-  if (!s.curve || p.length < 3) return p;
+  if (strokeHasHandles(s)) return bezierCurvePoints(s, density);
+  // A closed corner path (Pen close, sharp rect, polygon, star) repeats its
+  // first point so the outline and hit-test see the seam edge (buildRunPath
+  // only caps the two ends; the bezier path handles `closed` itself).
+  if (!s.curve || p.length < 3) return s.closed && p.length >= 3 ? p.concat([p[0]]) : p;
   const n = p.length;
   const at = (i) =>
     i < 0 ? [2 * p[0][0] - p[1][0], 2 * p[0][1] - p[1][1], p[0][2]]
@@ -1819,23 +2211,34 @@ function vecCurvePoints(s) {
     const dt = (a, b) => Math.max(Math.pow(Math.hypot(b[0] - a[0], b[1] - a[1]), 0.5), 1e-4);
     const t0 = 0, t1 = t0 + dt(p0, p1), t2 = t1 + dt(p1, p2), t3 = t2 + dt(p2, p3);
     const segLen = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
-    const steps = clamp(Math.ceil(segLen / 3), 1, 32); // ~3 art-px per sample
+    const steps = clamp(Math.ceil(segLen * density / 3), 1, 32 * Math.ceil(density));
     for (let k = 1; k <= steps; k++) {
       const t = t1 + (t2 - t1) * (k / steps);
-      const lerp = (u, av, bv, ta, tb) => ((tb - u) / (tb - ta)) * av + ((u - ta) / (tb - ta)) * bv;
-      const a1x = lerp(t, p0[0], p1[0], t0, t1), a1y = lerp(t, p0[1], p1[1], t0, t1);
-      const a2x = lerp(t, p1[0], p2[0], t1, t2), a2y = lerp(t, p1[1], p2[1], t1, t2);
-      const a3x = lerp(t, p2[0], p3[0], t2, t3), a3y = lerp(t, p2[1], p3[1], t2, t3);
-      const b1x = lerp(t, a1x, a2x, t0, t2), b1y = lerp(t, a1y, a2y, t0, t2);
-      const b2x = lerp(t, a2x, a3x, t1, t3), b2y = lerp(t, a2y, a3y, t1, t3);
+      const q = crPoint(p0, p1, p2, p3, [t0, t1, t2, t3], t);
       out.push([
-        lerp(t, b1x, b2x, t1, t2),
-        lerp(t, b1y, b2y, t1, t2),
+        q[0], q[1],
         p1[2] + (p2[2] - p1[2]) * (k / steps), // width: linear across the span
       ]);
     }
   }
   return out;
+}
+
+/** ONE point on a non-uniform (centripetal) Catmull-Rom segment, by the
+ *  Barry–Goldman recursive lerp. `knots` is [t0,t1,t2,t3] and `t` lies in
+ *  [t1,t2]. Extracted so the renderer and the SVG exporter evaluate the SAME
+ *  curve — the exporter derives its bezier control points by sampling this,
+ *  which is what makes "SVG export is exact" true by construction rather than
+ *  by a formula someone has to keep in sync. PURE. */
+function crPoint(p0, p1, p2, p3, knots, t) {
+  const [t0, t1, t2, t3] = knots;
+  const lerp = (u, av, bv, ta, tb) => ((tb - u) / (tb - ta)) * av + ((u - ta) / (tb - ta)) * bv;
+  const a1x = lerp(t, p0[0], p1[0], t0, t1), a1y = lerp(t, p0[1], p1[1], t0, t1);
+  const a2x = lerp(t, p1[0], p2[0], t1, t2), a2y = lerp(t, p1[1], p2[1], t1, t2);
+  const a3x = lerp(t, p2[0], p3[0], t2, t3), a3y = lerp(t, p2[1], p3[1], t2, t3);
+  const b1x = lerp(t, a1x, a2x, t0, t2), b1y = lerp(t, a1y, a2y, t0, t2);
+  const b2x = lerp(t, a2x, a3x, t1, t3), b2y = lerp(t, a2y, a3y, t1, t3);
+  return [lerp(t, b1x, b2x, t1, t2), lerp(t, b1y, b2y, t1, t2)];
 }
 
 /** A stroke's dirty rect {x0,y0,x1,y1} in float art px (feed to clampRect):
@@ -1893,17 +2296,21 @@ function applyWidthProfile(s, kind) {
  *  path never grows. Returns NEW point arrays. */
 function smoothStroke(pts) {
   const n = pts.length;
-  if (n <= 2) return pts.map((p) => p.slice());
-  const out = [pts[0].slice()];
+  if (n <= 2) return pts.map(clonePt);
+  const out = [clonePt(pts[0])];
   for (let i = 1; i < n - 1; i++) {
     const a = pts[i - 1], b = pts[i], c = pts[i + 1];
-    out.push([
+    const q = [
       0.25 * a[0] + 0.5 * b[0] + 0.25 * c[0],
       0.25 * a[1] + 0.5 * b[1] + 0.25 * c[1],
       0.25 * a[2] + 0.5 * b[2] + 0.25 * c[2],
-    ]);
+    ];
+    // Keep any handles the point carries: they're offsets, valid after the
+    // anchor shifts. A Pen anchor's tangents are the user's, not the pass's.
+    if (b.length > 3) { q[3] = b[3] ? b[3].slice() : null; q[4] = b[4] ? b[4].slice() : null; }
+    out.push(q);
   }
-  out.push(pts[n - 1].slice());
+  out.push(clonePt(pts[n - 1]));
   return out;
 }
 
@@ -1913,7 +2320,7 @@ function smoothStroke(pts) {
  *  long path can't blow the stack. Returns NEW point arrays. */
 function simplifyStroke(pts, tol) {
   const n = pts.length;
-  if (n <= 2 || !(tol > 0)) return pts.map((p) => p.slice());
+  if (n <= 2 || !(tol > 0)) return pts.map(clonePt);
   const keep = new Uint8Array(n);
   keep[0] = keep[n - 1] = 1;
   const tol2 = tol * tol;
@@ -1932,8 +2339,439 @@ function simplifyStroke(pts, tol) {
     }
   }
   const out = [];
-  for (let i = 0; i < n; i++) if (keep[i]) out.push(pts[i].slice());
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(clonePt(pts[i]));
   return out;
+}
+
+/* ======================================================================
+ * SVG path data (Phase 12 — vector interop)
+ * ====================================================================
+ * Two shapes of export, because SVG has ONE stroke-width per path and our
+ * strokes carry a per-point width multiplier (9b):
+ *   - constant width  -> a real <path> with stroke-width/linecap/linejoin,
+ *     which stays editable as a stroke in Illustrator/Affinity/Figma;
+ *   - variable width  -> the OUTLINE as a filled path, which is exactly what
+ *     Illustrator does when you expand a width-profile stroke. Exact, though
+ *     no longer re-editable as a stroke. Averaging to a single width was
+ *     rejected: it silently changes the art.
+ *
+ * The outline is produced by handing the EXISTING geometry builders a
+ * recorder that duck-types the four context methods they use, so an exported
+ * outline cannot drift from what the app actually draws — the same "one
+ * source of truth" reasoning behind strokeLook and the shared serializeStroke.
+ */
+
+/** A stand-in for a canvas context that records SVG path data instead of
+ *  rasterizing. Implements only what the stroke geometry calls. */
+function pathRecorder(prec = 3) {
+  const out = [];
+  const n = (v) => {
+    const r = +(+v).toFixed(prec);
+    return Object.is(r, -0) ? 0 : r;
+  };
+  return {
+    d: () => out.join(''),
+    beginPath() { out.length = 0; },
+    moveTo(x, y) { out.push(`M${n(x)} ${n(y)}`); },
+    lineTo(x, y) { out.push(`L${n(x)} ${n(y)}`); },
+    closePath() { out.push('Z'); },
+    // addCircle only ever asks for a FULL circle. SVG has no circle command,
+    // so emit two half arcs; sweep=1 matches canvas anticlockwise=false.
+    arc(x, y, r) {
+      out.push(`M${n(x + r)} ${n(y)}`
+        + `A${n(r)} ${n(r)} 0 1 1 ${n(x - r)} ${n(y)}`
+        + `A${n(r)} ${n(r)} 0 1 1 ${n(x + r)} ${n(y)}Z`);
+    },
+    fill() {},   // the caller decides fill rule/colour in the SVG attributes
+    save() {},
+    restore() {},
+    set fillStyle(_v) {},
+  };
+}
+
+/** True when every point shares one width multiplier — the case that can be
+ *  exported as a genuine stroked path rather than an expanded outline. */
+function strokeIsUniform(s) {
+  const p = s.pts;
+  for (let i = 1; i < p.length; i++) {
+    if (Math.abs(p[i][2] - p[0][2]) > 1e-6) return false;
+  }
+  return true;
+}
+
+/** The stroke's CENTERLINE as SVG path data — exact, and compact.
+ *  Handled points are already cubics (segCtrl). A centripetal Catmull-Rom
+ *  segment is itself a cubic polynomial, so it has an exact bezier form: with
+ *  the non-uniform tangents m1, m2 over the segment's own parameter interval,
+ *  the control points are p1 + m1/3 and p2 - m2/3. That is why "SVG export is
+ *  exact either way" holds (COMPETITIVE_ROADMAP §3.2) — no curve fitting, no
+ *  densified polyline. */
+function strokeCenterlineD(s, prec = 3) {
+  const p = s.pts;
+  const n = p.length;
+  const rec = pathRecorder(prec);
+  const num = (v) => {
+    const r = +(+v).toFixed(prec);
+    return Object.is(r, -0) ? 0 : r;
+  };
+  if (n === 0) return '';
+  const out = [`M${num(p[0][0])} ${num(p[0][1])}`];
+  const cubic = (P1, P2, P3) =>
+    out.push(`C${num(P1[0])} ${num(P1[1])} ${num(P2[0])} ${num(P2[1])} ${num(P3[0])} ${num(P3[1])}`);
+  if (n === 1) return out.join('');
+
+  if (strokeHasHandles(s)) {
+    const segs = s.closed ? n : n - 1;
+    for (let i = 0; i < segs; i++) {
+      const a = p[i], b = p[(i + 1) % n];
+      const { P1, P2 } = segCtrl(a, b);
+      cubic(P1, P2, [b[0], b[1]]);
+    }
+  } else if (!s.curve || n < 3) {
+    for (let i = 1; i < n; i++) out.push(`L${num(p[i][0])} ${num(p[i][1])}`);
+  } else {
+    // Centripetal Catmull-Rom, matching vecCurvePoints' phantom end points and
+    // its alpha = 0.5 knot spacing exactly.
+    const at = (i) =>
+      i < 0 ? [2 * p[0][0] - p[1][0], 2 * p[0][1] - p[1][1]]
+      : i >= n ? [2 * p[n - 1][0] - p[n - 2][0], 2 * p[n - 1][1] - p[n - 2][1]]
+      : p[i];
+    const dt = (a, b) => Math.max(Math.pow(Math.hypot(b[0] - a[0], b[1] - a[1]), 0.5), 1e-4);
+    for (let i = 0; i < n - 1; i++) {
+      const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+      const t0 = 0, t1 = t0 + dt(p0, p1), t2 = t1 + dt(p1, p2), t3 = t2 + dt(p2, p3);
+      const knots = [t0, t1, t2, t3];
+      // A Catmull-Rom segment IS a cubic, so four samples of it determine the
+      // equivalent bezier exactly. Taking those samples from crPoint — the
+      // renderer's own evaluator — means the exported curve cannot disagree
+      // with the drawn one, and no tangent formula has to be kept in sync.
+      // Inverting the Bernstein basis at u = 1/3 and 2/3:
+      //   27·B(1/3) = 8P0 + 12P1 + 6P2 + P3
+      //   27·B(2/3) =  P0 +  6P1 + 12P2 + 8P3
+      const d2 = t2 - t1;
+      const A = crPoint(p0, p1, p2, p3, knots, t1 + d2 / 3);
+      const B = crPoint(p0, p1, p2, p3, knots, t1 + (2 * d2) / 3);
+      const P0 = [p1[0], p1[1]], P3 = [p2[0], p2[1]];
+      const ctrl = [0, 1].map((k) => {
+        const a = 27 * A[k] - 8 * P0[k] - P3[k];      // = 12·P1 + 6·P2
+        const b = 27 * B[k] - P0[k] - 8 * P3[k];      // =  6·P1 + 12·P2
+        const c1 = (2 * a - b) / 18;
+        return [c1, (b - 6 * c1) / 12];
+      });
+      cubic([ctrl[0][0], ctrl[1][0]], [ctrl[0][1], ctrl[1][1]], P3);
+    }
+  }
+  if (s.closed) out.push('Z');
+  return out.join('');
+}
+
+/** The stroke's OUTLINE as SVG path data — byte-for-byte the geometry
+ *  drawVecStroke fills, because it runs the very same builders. */
+function strokeOutlineD(s, prec = 3) {
+  const rec = pathRecorder(prec);
+  const samples = vecCurvePoints(s).map((q) => [q[0], q[1], vecRadius(s, q[2])]);
+  const runs = s.dash ? dashRuns(samples, s.dash) : [samples];
+  for (const run of runs) buildRunPath(rec, run, s.cap || 'round', s.join || 'round');
+  return rec.d();
+}
+
+/* ======================================================================
+ * SVG import (Phase 12 — vector interop)
+ * ====================================================================
+ * Bezier maps onto our point model with no loss: a cubic P0→P3 with controls
+ * P1,P2 is exactly "P0 with hOut = P1−P0, P3 with hIn = P2−P3" (§2's per-point
+ * optional tangents). Quadratics and arcs convert to cubics exactly, so an
+ * imported path IS the original curve, not a sampled approximation.
+ *
+ * What is deliberately NOT imported (reported to the user rather than dropped
+ * in silence): text, gradients and patterns, filters, clip paths and masks.
+ */
+
+/** Scanner for SVG path data. Written as a scanner rather than a regex
+ *  tokenizer because ARC FLAGS may be written without separators — "a1 1 0
+ *  011 1" is legal and means flags 0,1 then x=1 — and a generic number regex
+ *  silently reads "011" as eleven. PURE (unit-tested via __ssmTest). */
+function parsePathD(d) {
+  const src = String(d || '');
+  let i = 0;
+  const ws = () => { while (i < src.length && /[\s,]/.test(src[i])) i++; };
+  const readNum = () => {
+    ws();
+    const m = /^[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/.exec(src.slice(i));
+    if (!m) return NaN;
+    i += m[0].length;
+    return parseFloat(m[0]);
+  };
+  const readFlag = () => { ws(); const c = src[i]; if (c === '0' || c === '1') { i++; return c === '1'; } return NaN; };
+
+  const subs = [];
+  let pts = null, closed = false;
+  let cx = 0, cy = 0;        // current point
+  let sx = 0, sy = 0;        // subpath start
+  let lastC = null;          // previous cubic's second control (for S)
+  let lastQ = null;          // previous quadratic's control (for T)
+
+  const flush = () => {
+    if (pts && pts.length) subs.push({ pts, closed });
+    pts = null; closed = false;
+  };
+  const push = (x, y) => { pts.push([x, y, 1]); cx = x; cy = y; };
+  const setOut = (hx, hy) => {
+    const p = pts[pts.length - 1];
+    setPtHandle(p, 4, [hx - p[0], hy - p[1]]);
+  };
+  const cubic = (c1x, c1y, c2x, c2y, x, y) => {
+    setOut(c1x, c1y);
+    pts.push([x, y, 1, null, null]);
+    setPtHandle(pts[pts.length - 1], 3, [c2x - x, c2y - y]);
+    cx = x; cy = y;
+    lastC = [c2x, c2y];
+    lastQ = null;
+  };
+
+  while (i < src.length) {
+    ws();
+    if (i >= src.length) break;
+    const ch = src[i];
+    if (!/[MmZzLlHhVvCcSsQqTtAa]/.test(ch)) { i++; continue; } // junk: skip
+    i++;
+    const rel = ch === ch.toLowerCase();
+    const cmd = ch.toUpperCase();
+    // A command letter may be followed by several coordinate sets; the letter
+    // is implicitly repeated (an implicit M repeat means L, per the spec).
+    let first = true;
+    do {
+      if (cmd === 'Z') { closed = true; cx = sx; cy = sy; break; }
+      if (cmd === 'M') {
+        const x = readNum(), y = readNum();
+        if (!isFinite(x) || !isFinite(y)) break;
+        if (first) {
+          flush();
+          pts = [];
+          const ax = rel ? cx + x : x, ay = rel ? cy + y : y;
+          push(ax, ay);
+          sx = ax; sy = ay;
+        } else {
+          push(rel ? cx + x : x, rel ? cy + y : y); // implicit lineto
+        }
+        lastC = lastQ = null;
+      } else if (cmd === 'L') {
+        const x = readNum(), y = readNum();
+        if (!isFinite(x) || !isFinite(y) || !pts) break;
+        push(rel ? cx + x : x, rel ? cy + y : y);
+        lastC = lastQ = null;
+      } else if (cmd === 'H' || cmd === 'V') {
+        const v = readNum();
+        if (!isFinite(v) || !pts) break;
+        if (cmd === 'H') push(rel ? cx + v : v, cy);
+        else push(cx, rel ? cy + v : v);
+        lastC = lastQ = null;
+      } else if (cmd === 'C' || cmd === 'S') {
+        let c1x, c1y;
+        if (cmd === 'C') {
+          c1x = readNum(); c1y = readNum();
+          if (rel) { c1x += cx; c1y += cy; }
+        } else {
+          // Smooth: reflect the previous cubic's second control about the
+          // current point; with no previous cubic the control is the point.
+          c1x = lastC ? 2 * cx - lastC[0] : cx;
+          c1y = lastC ? 2 * cy - lastC[1] : cy;
+        }
+        let c2x = readNum(), c2y = readNum(), x = readNum(), y = readNum();
+        if (!isFinite(x) || !isFinite(y) || !pts) break;
+        if (rel) { c2x += cx; c2y += cy; x += cx; y += cy; }
+        cubic(c1x, c1y, c2x, c2y, x, y);
+      } else if (cmd === 'Q' || cmd === 'T') {
+        let qx, qy;
+        if (cmd === 'Q') {
+          qx = readNum(); qy = readNum();
+          if (rel) { qx += cx; qy += cy; }
+        } else {
+          qx = lastQ ? 2 * cx - lastQ[0] : cx;
+          qy = lastQ ? 2 * cy - lastQ[1] : cy;
+        }
+        let x = readNum(), y = readNum();
+        if (!isFinite(x) || !isFinite(y) || !pts) break;
+        if (rel) { x += cx; y += cy; }
+        // Quadratic → cubic is EXACT: C1 = P0 + 2/3(Q−P0), C2 = P3 + 2/3(Q−P3).
+        const x0 = cx, y0 = cy;
+        const q = [qx, qy];
+        cubic(x0 + (2 / 3) * (qx - x0), y0 + (2 / 3) * (qy - y0),
+              x + (2 / 3) * (qx - x), y + (2 / 3) * (qy - y), x, y);
+        lastQ = q; // cubic() cleared it; T reflects the QUADRATIC control
+      } else if (cmd === 'A') {
+        const rx = readNum(), ry = readNum(), rot = readNum();
+        const fa = readFlag(), fs = readFlag();
+        let x = readNum(), y = readNum();
+        if (!isFinite(x) || !isFinite(y) || !pts) break;
+        if (rel) { x += cx; y += cy; }
+        for (const seg of svgArcToCubics(cx, cy, rx, ry, rot, fa, fs, x, y)) {
+          cubic(seg[0], seg[1], seg[2], seg[3], seg[4], seg[5]);
+        }
+        lastC = lastQ = null;
+      }
+      first = false;
+      ws();
+      // Another coordinate set for the same command?
+    } while (cmd !== 'Z' && i < src.length && /[-+.\d]/.test(src[i]));
+  }
+  flush();
+  // A subpath that closes back onto its own start point carries a duplicate
+  // anchor; fold it away so `closed` alone describes the seam.
+  for (const s of subs) {
+    const p = s.pts;
+    if (s.closed && p.length > 1) {
+      const a = p[0], b = p[p.length - 1];
+      if (Math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-9) {
+        if (b.length > 3 && b[3]) setPtHandle(a, 3, b[3].slice());
+        p.pop();
+      }
+    }
+  }
+  return subs;
+}
+
+/** SVG elliptical arc → cubic segments, each spanning at most 90°, via the
+ *  spec's endpoint-to-centre parameterization (SVG 1.1 F.6.5). Returns
+ *  [c1x,c1y,c2x,c2y,x,y] sextuples in absolute coords. PURE. */
+function svgArcToCubics(x0, y0, rx, ry, rotDeg, fa, fs, x1, y1) {
+  rx = Math.abs(rx); ry = Math.abs(ry);
+  // Degenerate radii mean a straight line (spec): emit one flat cubic.
+  if (!(rx > 0) || !(ry > 0) || (x0 === x1 && y0 === y1)) {
+    return [[x0, y0, x1, y1, x1, y1]];
+  }
+  const phi = (rotDeg || 0) * Math.PI / 180;
+  const cosP = Math.cos(phi), sinP = Math.sin(phi);
+  const dx2 = (x0 - x1) / 2, dy2 = (y0 - y1) / 2;
+  const x1p = cosP * dx2 + sinP * dy2;
+  const y1p = -sinP * dx2 + cosP * dy2;
+  // Scale the radii up if they are too small to span the endpoints (F.6.6).
+  const lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+  if (lam > 1) { const k = Math.sqrt(lam); rx *= k; ry *= k; }
+  const sign = fa === fs ? -1 : 1;
+  const num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+  const den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+  const co = sign * Math.sqrt(Math.max(0, num / den));
+  const cxp = co * (rx * y1p) / ry;
+  const cyp = co * -(ry * x1p) / rx;
+  const cx = cosP * cxp - sinP * cyp + (x0 + x1) / 2;
+  const cy = sinP * cxp + cosP * cyp + (y0 + y1) / 2;
+  const ang = (ux, uy, vx, vy) => {
+    const d = Math.hypot(ux, uy) * Math.hypot(vx, vy);
+    let c = d ? (ux * vx + uy * vy) / d : 1;
+    c = Math.min(1, Math.max(-1, c));
+    const a = Math.acos(c);
+    return ux * vy - uy * vx < 0 ? -a : a;
+  };
+  const t1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+  let dt = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+  if (!fs && dt > 0) dt -= 2 * Math.PI;
+  if (fs && dt < 0) dt += 2 * Math.PI;
+  const n = Math.max(1, Math.ceil(Math.abs(dt) / (Math.PI / 2)));
+  const step = dt / n;
+  // Standard circular-arc bezier magic number for the sub-arc's sweep.
+  const k = (4 / 3) * Math.tan(step / 4);
+  const out = [];
+  let th = t1;
+  const pt = (t) => {
+    const ct = Math.cos(t), st = Math.sin(t);
+    return [cx + rx * ct * cosP - ry * st * sinP, cy + rx * ct * sinP + ry * st * cosP];
+  };
+  const dpt = (t) => {
+    const ct = Math.cos(t), st = Math.sin(t);
+    return [-rx * st * cosP - ry * ct * sinP, -rx * st * sinP + ry * ct * cosP];
+  };
+  for (let s = 0; s < n; s++) {
+    const a = th, b = th + step;
+    const P0 = pt(a), P3 = pt(b), D0 = dpt(a), D3 = dpt(b);
+    out.push([P0[0] + k * D0[0], P0[1] + k * D0[1],
+              P3[0] - k * D3[0], P3[1] - k * D3[1], P3[0], P3[1]]);
+    th = b;
+  }
+  return out;
+}
+
+/** SVG basic shapes → the same {pts, closed} subpaths parsePathD produces, so
+ *  everything downstream handles one shape of data. Ellipses/rounded corners
+ *  go through svgArcToCubics, keeping them exact rather than sampled. */
+function svgShapeSubpaths(el) {
+  const n = (a, d = 0) => {
+    const v = parseFloat(el.getAttribute(a));
+    return isFinite(v) ? v : d;
+  };
+  const tag = el.tagName.toLowerCase();
+  const line = (pairs, closed) => [{ pts: pairs.map(([x, y]) => [x, y, 1]), closed }];
+  const arcPath = (d) => parsePathD(d);
+  if (tag === 'rect') {
+    const x = n('x'), y = n('y'), w = n('width'), h = n('height');
+    if (!(w > 0) || !(h > 0)) return [];
+    let rx = el.hasAttribute('rx') ? n('rx') : (el.hasAttribute('ry') ? n('ry') : 0);
+    let ry = el.hasAttribute('ry') ? n('ry') : rx;
+    rx = Math.min(Math.max(rx, 0), w / 2);
+    ry = Math.min(Math.max(ry, 0), h / 2);
+    if (!rx || !ry) return line([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], true);
+    return arcPath(
+      `M${x + rx} ${y}H${x + w - rx}A${rx} ${ry} 0 0 1 ${x + w} ${y + ry}`
+      + `V${y + h - ry}A${rx} ${ry} 0 0 1 ${x + w - rx} ${y + h}`
+      + `H${x + rx}A${rx} ${ry} 0 0 1 ${x} ${y + h - ry}`
+      + `V${y + ry}A${rx} ${ry} 0 0 1 ${x + rx} ${y}Z`);
+  }
+  if (tag === 'circle' || tag === 'ellipse') {
+    const cx = n('cx'), cy = n('cy');
+    const rx = tag === 'circle' ? n('r') : n('rx');
+    const ry = tag === 'circle' ? n('r') : n('ry');
+    if (!(rx > 0) || !(ry > 0)) return [];
+    return arcPath(`M${cx - rx} ${cy}A${rx} ${ry} 0 0 1 ${cx + rx} ${cy}`
+                 + `A${rx} ${ry} 0 0 1 ${cx - rx} ${cy}Z`);
+  }
+  if (tag === 'line') {
+    return line([[n('x1'), n('y1')], [n('x2'), n('y2')]], false);
+  }
+  if (tag === 'polyline' || tag === 'polygon') {
+    const nums = (el.getAttribute('points') || '').match(/[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || [];
+    const pairs = [];
+    for (let i = 0; i + 1 < nums.length; i += 2) pairs.push([+nums[i], +nums[i + 1]]);
+    if (pairs.length < 2) return [];
+    return line(pairs, tag === 'polygon');
+  }
+  return null; // not a shape we know
+}
+
+/** transform="translate(..) rotate(..) ..." → [a,b,c,d,e,f].
+ *  (x,y) maps to (a·x + c·y + e, b·x + d·y + f). PURE. */
+function parseSvgTransform(str) {
+  let m = [1, 0, 0, 1, 0, 0];
+  if (!str) return m;
+  const re = /(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^)]*)\)/g;
+  let t;
+  while ((t = re.exec(str))) {
+    const v = (t[2].match(/[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || []).map(Number);
+    let k = [1, 0, 0, 1, 0, 0];
+    if (t[1] === 'matrix' && v.length >= 6) k = v.slice(0, 6);
+    else if (t[1] === 'translate') k = [1, 0, 0, 1, v[0] || 0, v.length > 1 ? v[1] : 0];
+    else if (t[1] === 'scale') k = [v[0] === undefined ? 1 : v[0], 0, 0,
+                                    v.length > 1 ? v[1] : (v[0] === undefined ? 1 : v[0]), 0, 0];
+    else if (t[1] === 'rotate') {
+      const a = (v[0] || 0) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+      k = [c, s, -s, c, 0, 0];
+      if (v.length >= 3) { // rotate about a point
+        const [cx, cy] = [v[1], v[2]];
+        k = svgMatMul([1, 0, 0, 1, cx, cy], svgMatMul(k, [1, 0, 0, 1, -cx, -cy]));
+      }
+    } else if (t[1] === 'skewX') k = [1, 0, Math.tan((v[0] || 0) * Math.PI / 180), 1, 0, 0];
+    else if (t[1] === 'skewY') k = [1, Math.tan((v[0] || 0) * Math.PI / 180), 0, 1, 0, 0];
+    m = svgMatMul(m, k);
+  }
+  return m;
+}
+
+/** Compose two affine matrices (apply `b` first, then `a`). PURE. */
+function svgMatMul(a, b) {
+  return [
+    a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
+    a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
+    a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5],
+  ];
 }
 
 /** Draw a whole stroke into ctx `g` at full alpha as ONE path filled ONCE:
@@ -1943,18 +2781,34 @@ function simplifyStroke(pts, tol) {
  *  anti-aliased boundary: edge pixels get the union shape's true coverage
  *  instead of accumulating every segment's rim, so a dense freshly-drawn
  *  stroke and a scaled-up sparse one wear IDENTICAL clean edges. */
-function drawVecStroke(g, s) {
-  g.fillStyle = s.color;
-  g.beginPath();
-  const cap = s.cap || 'round';
-  const join = s.join || 'round';
-  // Precompute per-point radius: dashing cuts BETWEEN points and interpolates
-  // it linearly, and the geometry below never re-derives it. Each sample is
-  // [x, y, r] in art coords. Curved strokes densify to a spline first.
-  const samples = vecCurvePoints(s).map((p) => [p[0], p[1], vecRadius(s, p[2])]);
-  const runs = s.dash ? dashRuns(samples, s.dash) : [samples];
-  for (const run of runs) buildRunPath(g, run, cap, join);
-  g.fill();
+function drawVecStroke(g, s, density = 1) {
+  // Each sample is [x, y, r] in art coords (r feeds the outline; the fill uses
+  // only the centerline). Curved strokes densify to a spline first. Geometry
+  // is always emitted in ART coordinates — the crisp-zoom renderer simply
+  // hands us a context already scaled by `zoom`, so the SAME path rasterizes
+  // at screen resolution without any of this needing to know about it.
+  const samples = vecCurvePoints(s, density).map((p) => [p[0], p[1], vecRadius(s, p[2])]);
+  // Fill the interior FIRST, under the outline (Phase 12b): the centerline
+  // polygon, closed implicitly even for an open path (SVG/Illustrator).
+  if (s.fill && samples.length >= 3) {
+    g.fillStyle = s.fill;
+    g.beginPath();
+    g.moveTo(samples[0][0], samples[0][1]);
+    for (let i = 1; i < samples.length; i++) g.lineTo(samples[i][0], samples[i][1]);
+    g.closePath();
+    g.fill('nonzero');
+  }
+  // Outline, unless the shape is fill-only. Dashing cuts BETWEEN points and
+  // interpolates radius linearly; the geometry never re-derives it.
+  if (!s.noStroke) {
+    g.fillStyle = s.color;
+    g.beginPath();
+    const cap = s.cap || 'round';
+    const join = s.join || 'round';
+    const runs = s.dash ? dashRuns(samples, s.dash) : [samples];
+    for (const run of runs) buildRunPath(g, run, cap, join);
+    g.fill();
+  }
 }
 
 /** Emit `poly` (an array of [x,y]) as ONE clockwise-wound (screen y-down)
@@ -2162,6 +3016,279 @@ function renderVectorPlane(plane, exclude) {
   plane.touched = plane.strokes.length > 0;
 }
 
+/* ======================================================================
+ * Crisp zoom (Phase 12 — gate decision 2, "option D")
+ * ====================================================================
+ * A frame's composite is an ART-RESOLUTION bitmap, so render() scaling it by
+ * `zoom` leaves vector edges soft exactly when someone zooms in to check
+ * whether we are "really" vector — the first thing anyone tests. Option D:
+ * re-rasterize the vector layers at VIEWPORT resolution and composite there.
+ *
+ * Why this shape (see COMPETITIVE_ROADMAP.md §3.2 for the rejected options):
+ *   - Memory is bounded by SCREEN size, not canvas size. That is the whole
+ *     point at 8K, where a high-res mirror (option C) would be 128 MB/plane.
+ *   - Cost is paid on zoom/pan/edit, not per rendered frame (option B).
+ *   - §3 rule 6 (display reads composites, editing writes planes) SURVIVES:
+ *     display still reads a composite, just one built at screen scale.
+ *     NOTHING here writes to a plane. The art-res mirror remains the truth-
+ *     mirror, and playback, thumbnails, onion skin and every export still
+ *     read it, completely unchanged.
+ *
+ * Three viewport-sized canvases at most, reused for the life of the session:
+ * the output composite, one layer buffer, and a per-stroke buffer allocated
+ * only if some stroke is translucent. Deliberately NOT one cache per layer —
+ * that would cost frames x layers x screen bytes to save re-stroking unedited
+ * layers, and every invalidation we actually have (any edit bumps
+ * compositeGen, any zoom, any pan) invalidates all layers at once anyway.
+ */
+const crispBuf = { out: null, layer: null, scratch: null };
+let crispKey = '';
+
+/** Device pixels per art pixel that vector layers are rasterized at — NOT
+ *  necessarily `zoom`. Vector fill cost scales with SCREEN AREA, so it grows
+ *  with zoom², and past roughly this many pixels per art pixel the extra
+ *  resolution is beyond anything an eye resolves: the layer is upscaled the
+ *  rest of the way, which is an upscale of an already razor-sharp render, not
+ *  of the art-res mirror. Chosen at 32 so that everything at or below 32x —
+ *  where zooming measured smooth — is bit-for-bit unchanged, and only the
+ *  deep end, where the cost was becoming visible, is bounded. At 80x this is
+ *  (32/80)² = 16% of the fill work. */
+const CRISP_MAX_SCALE = 32;
+const crispScale = () => Math.min(state.zoom, CRISP_MAX_SCALE);
+
+/** One of the three crisp buffers. `frac` (≤ 1) shrinks it relative to the
+ *  viewport — vector layers use crispScale()/zoom so their fill cost stops
+ *  growing past CRISP_MAX_SCALE; the output composite always stays full size,
+ *  because raster layers must keep their nearest-neighbour blocks at high zoom
+ *  and would be blurred by a round trip through a reduced buffer.
+ *  Pre-transformed so callers draw in CSS pixels. Does NOT clear. */
+function crispCtxFor(slot, frac = 1) {
+  const w = Math.max(1, Math.ceil(viewW * dpr * frac));
+  const h = Math.max(1, Math.ceil(viewH * dpr * frac));
+  let c = crispBuf[slot];
+  if (!c) c = crispBuf[slot] = document.createElement('canvas');
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  const g = c.getContext('2d');
+  g.setTransform(dpr * frac, 0, 0, dpr * frac, 0, 0);
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = 'source-over';
+  return g;
+}
+
+/** Samples per art pixel for crisp rendering — deliberately NOT just `zoom`.
+ *  A chord's flatness error falls with the SQUARE of its spacing, so matching
+ *  zoom linearly oversamples wildly: at 80x it asked for roughly 20x more
+ *  samples than the eye can resolve, and on a round-join stroke every extra
+ *  sample is another filled circle whose cost scales with its SCREEN area —
+ *  so the waste compounds exactly where zoom is deepest. sqrt keeps the error
+ *  flat while bounding the count. Capped at `zoom` so shallow zooms (<= 4x,
+ *  where the two curves cross) render exactly as before. */
+const crispDensity = (z) => Math.min(z, 2 * Math.sqrt(z));
+
+/** A stroke reduced to the points that can actually affect the viewport, or
+ *  null if none can. At 80x a full-canvas stroke has ~99% of its geometry off
+ *  screen, yet every body quad and round join was still being built and
+ *  filled — and a join costs in proportion to its screen area. This is the
+ *  difference between "cost scales with the whole drawing" and "cost scales
+ *  with what you can see".
+ *
+ *  Only applied where dropping points cannot change the picture: a fill
+ *  polygon, a dash phase and a closed seam all depend on points outside the
+ *  view, so those keep the whole path. The kept run is CONTIGUOUS and chosen
+ *  by a conservative per-SEGMENT bounding-box test, so a long segment that
+ *  crosses the viewport with both endpoints outside is never dropped.
+ *
+ *  The new end caps this creates are provably invisible: segment `first-1` did
+ *  not intersect the padded rect, so pts[first] lies outside it, and the pad
+ *  already includes the stroke's own radius. */
+function crispTrim(s) {
+  if (s.fill || s.dash || s.closed || s.curve || strokeHasHandles(s)) return s;
+  const pts = s.pts;
+  if (pts.length < 64) return s; // the scan would cost more than it saves
+  const { panX, panY, zoom } = state;
+  let pad = 2;
+  for (const p of pts) pad = Math.max(pad, vecRadius(s, p[2]) + 2);
+  const x0 = -panX / zoom - pad, x1 = (viewW - panX) / zoom + pad;
+  const y0 = -panY / zoom - pad, y1 = (viewH - panY) / zoom + pad;
+  let first = -1, last = -1;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if (Math.min(a[0], b[0]) > x1 || Math.max(a[0], b[0]) < x0) continue;
+    if (Math.min(a[1], b[1]) > y1 || Math.max(a[1], b[1]) < y0) continue;
+    if (first < 0) first = i;
+    last = i + 1;
+  }
+  if (first < 0) return null;
+  if (first === 0 && last === pts.length - 1) return s;
+  return { ...s, pts: pts.slice(first, last + 1) };
+}
+
+/** The in-progress stroke as a drawable stroke object. Mirrors exactly what
+ *  finishStroke() commits (same look fields, same pts array), so the crisp
+ *  preview and the committed result cannot disagree. */
+function liveVecStroke(s) {
+  return { color: s.color, w: s.vec.w, opacity: s.opacity, pen: s.vec.pen,
+           cap: vecStyle.cap, join: vecStyle.join,
+           dash: vecStyle.dash ? vecStyle.dash.slice() : null,
+           curve: vecStyle.curve, pts: s.vec.pts };
+}
+
+/** Rasterize one vector plane at screen scale into its own buffer, then blit
+ *  that buffer ONCE into `gOut` at the layer's opacity/blend.
+ *
+ *  The layer buffer is not an optimization — it is correctness. Stamping each
+ *  stroke straight into the composite at the layer's alpha would blend every
+ *  overlap within the layer twice, which is not what recomposite() does (it
+ *  draws the finished layer canvas once). Same reason renderVectorPlane keeps
+ *  a per-stroke scratch: a stroke must never darken itself.
+ *
+ *  `exclude` carries renderVectorPlane's contract — strokes lifted into a
+ *  transform float are hidden here too, because the float draws its own
+ *  preview overlay on top.
+ *
+ *  `live` is an in-progress vector stroke on THIS plane. It is rendered right
+ *  alongside the committed ones so that drawing doesn't drop the layer back to
+ *  the art-res mirror — which looked like every existing line popping to its
+ *  own pixels for the duration of the stroke. */
+function crispVecLayer(gOut, plane, exclude, alpha, op, live) {
+  const { panX, panY, zoom } = state;
+  // Past CRISP_MAX_SCALE the layer is rasterized smaller than the viewport and
+  // upscaled at the blit below. The buffer's own transform absorbs `frac`, so
+  // everything inside still draws in logical CSS pixels and none of the
+  // geometry below has to know. frac === 1 (zoom <= 32) is the old path exactly.
+  const frac = crispScale() / zoom;
+  const lg = crispCtxFor('layer', frac);
+  lg.clearRect(0, 0, viewW, viewH);
+  let drew = false;
+  // The live stroke is built exactly as finishStroke() will build it, so what
+  // you see mid-stroke is what lands on release.
+  const list = live ? plane.strokes.concat([liveVecStroke(live)]) : plane.strokes;
+  const den = crispDensity(crispScale()); // samples follow the RENDER scale
+  for (const s0 of list) {
+    if (exclude && exclude.has(s0)) continue;
+    const r = clampRect(strokeBounds(s0)); // art px, clipped to the canvas
+    if (!r) continue;
+    // Whole-stroke culling. At the zoom levels where crisp mode matters, most
+    // of a drawing is off-screen — this is what keeps a 500-stroke piece cheap,
+    // and it is why re-stroking per zoom/pan is affordable at all.
+    const sx = panX + r.x * zoom, sy = panY + r.y * zoom;
+    const sw = r.w * zoom, sh = r.h * zoom;
+    if (sx >= viewW || sy >= viewH || sx + sw <= 0 || sy + sh <= 0) continue;
+    // ...then drop the parts of a surviving stroke that still can't be seen.
+    const s = crispTrim(s0);
+    if (!s) continue;
+    if (s.opacity < 1) {
+      // Translucent stroke: through the scratch, so self-overlap doesn't
+      // darken. Full-viewport clear/blit is heavier than the art-res path's
+      // rect-sized one, but stroke opacity < 1 is the rare case; tighten to
+      // the screen rect if it ever shows up in a profile.
+      const sg = crispCtxFor('scratch', frac); // same resolution as the layer
+      sg.clearRect(0, 0, viewW, viewH);
+      sg.save();
+      sg.translate(panX, panY);
+      sg.scale(zoom, zoom);
+      drawVecStroke(sg, s, den);
+      sg.restore();
+      lg.save();
+      lg.globalAlpha = s.opacity;
+      lg.drawImage(crispBuf.scratch, 0, 0, viewW, viewH); // device px -> 1:1
+      lg.restore();
+    } else {
+      lg.save();
+      lg.translate(panX, panY);
+      lg.scale(zoom, zoom);
+      drawVecStroke(lg, s, den); // enough samples to hide faceting, no more
+      lg.restore();
+    }
+    drew = true;
+  }
+  if (!drew) return; // nothing on screen — skip a pointless full-viewport blit
+  gOut.save();
+  gOut.globalAlpha = alpha;
+  gOut.globalCompositeOperation = op;
+  // Smoothing ON: past CRISP_MAX_SCALE this blit is an upscale, and it must
+  // interpolate. It is upscaling an already razor-sharp render (32 device px
+  // per art px), not the art-res mirror, which is why 80x still looks like
+  // vector rather than like pixels. At frac === 1 it is a 1:1 copy.
+  gOut.imageSmoothingEnabled = true;
+  gOut.drawImage(crispBuf.layer, 0, 0, viewW, viewH);
+  gOut.restore();
+}
+
+/** Build (or reuse) the viewport-resolution composite for frame `f`.
+ *  Cache token: the shown frame, compositeGen (bumped by recomposite(), which
+ *  every vector edit and every layer-meta change already goes through), the
+ *  view transform, and whether a float is hiding strokes. */
+function crispCompose(f, idx) {
+  const key = `${idx}|${compositeGen}|${state.zoom}|${state.panX}|${state.panY}`
+            + `|${viewW}|${viewH}|${dpr}|${floating && floating.vecStrokes ? 'f' : ''}`
+            // A growing live stroke must invalidate even if nothing else moved.
+            + `|${stroke && stroke.vec ? stroke.vec.pts.length : ''}`;
+  if (key === crispKey && crispBuf.out) return crispBuf.out;
+
+  const { panX, panY, zoom } = state;
+  const cw = state.width * zoom, ch = state.height * zoom;
+  const g = crispCtxFor('out');
+  g.clearRect(0, 0, viewW, viewH);
+  g.save();
+  g.beginPath();
+  g.rect(panX, panY, cw, ch);
+  g.clip(); // the canvas edge clips art, exactly as the art-res mirror does
+  const lifted = floating && floating.vecStrokes ? new Set(floating.vecStrokes) : null;
+  state.layers.forEach((m, li) => {
+    if (!m.visible) return;
+    const plane = f.layers[li];
+    if (!plane) return;
+    // A live stroke stands in for ITS OWN PLANE and no other — the same
+    // contract patchComposite's `override` has. This is what keeps drawing on
+    // one layer from dropping every other layer back to art resolution.
+    const live = stroke && stroke.frame === f && stroke.plane === plane ? stroke : null;
+    // Raster paint on a vector plane (erase, alpha lock) has no stroke object
+    // to draw, so those keep using the art-res preview for that layer alone.
+    const liveVec = live && live.vec && !live.erase && !live.lock ? live : null;
+    if (plane.strokes && (!live || liveVec)) {
+      crispVecLayer(g, plane,
+        lifted && floating.plane === plane ? lifted : null,
+        m.opacity, blendOp(m), liveVec);
+    } else {
+      // Raster layer — nothing to sharpen, so it scales up like it always did
+      // — or a plane whose live stroke can only be shown as pixels.
+      g.save();
+      g.globalAlpha = m.opacity;
+      g.globalCompositeOperation = blendOp(m);
+      g.imageSmoothingEnabled = zoom < PIXEL_ZOOM;
+      g.drawImage(live ? live.preview : plane.canvas, panX, panY, cw, ch);
+      g.restore();
+    }
+  });
+  g.restore();
+  crispKey = key;
+  return crispBuf.out;
+}
+
+/** Does crisp zoom apply right now? Only where it pays and cannot distort
+ *  anything else: freeform projects, zoomed IN, at rest, with vector art
+ *  actually on screen.
+ *  - Playback falls back to the art-res mirror BY DESIGN (gate decision 2):
+ *    nobody inspects edge crispness while the animation runs, and this keeps
+ *    playback cost exactly what it was.
+ *  - Gestures do NOT fall back. An earlier cut bailed out for the whole of any
+ *    drag, which was cheap but wrong to look at: every vector line on EVERY
+ *    layer popped to its own pixels for the duration of a stroke and snapped
+ *    back on release — barely visible on a big canvas, glaring on a small one,
+ *    and it happened even when painting raster on a different layer. A live
+ *    stroke now stands in for its own plane only (see crispCompose), and the
+ *    re-rasterize per pointermove is affordable for the same measured reason
+ *    panning is: well under a millisecond. */
+function crispWanted(f, proofed) {
+  if (state.mode !== 'free' || playing || proofed) return false;
+  if (state.zoom <= 1) return false; // at 1:1 the mirror already IS screen res
+  return state.layers.some((m, li) => {
+    const p = m.visible && f.layers[li];
+    return p && p.strokes && p.strokes.length;
+  });
+}
+
 /* ---- Vector stroke EDITING (Phase 8b) — selection, hit tests, snapshots.
  * Selecting strokes reuses the marquee/transform-box UI: a vector selection
  * is the usual {x,y,w,h} box plus a `.strokes` array of the selected stroke
@@ -2171,8 +3298,9 @@ function renderVectorPlane(plane, exclude) {
 /** Snapshot the editable fields of a stroke (for undo edits / drag cancel). */
 const snapVec = (s) => ({
   color: s.color, w: s.w, cap: s.cap, join: s.join,
-  dash: s.dash ? s.dash.slice() : null, curve: !!s.curve,
-  pts: s.pts.map((p) => p.slice()),
+  dash: s.dash ? s.dash.slice() : null, curve: !!s.curve, closed: !!s.closed,
+  fill: s.fill || null, noStroke: !!s.noStroke, shape: s.shape ? { ...s.shape } : null,
+  pts: s.pts.map(clonePt),
 });
 
 /** Pour a snapshot back into the SAME stroke object (identity-keyed undo). */
@@ -2183,7 +3311,11 @@ function applyVecSnap(s, snap) {
   s.join = snap.join;
   s.dash = snap.dash ? snap.dash.slice() : null;
   s.curve = !!snap.curve;
-  s.pts = snap.pts.map((p) => p.slice());
+  s.closed = !!snap.closed;
+  s.fill = snap.fill || null;
+  s.noStroke = !!snap.noStroke;
+  if (snap.shape) s.shape = { ...snap.shape }; else delete s.shape;
+  s.pts = snap.pts.map(clonePt);
 }
 
 /** Selection box around a set of strokes (their combined padded bounds). */
@@ -2241,14 +3373,21 @@ function vecBoxXform(f) {
  *  rasterizes and discards them). Widths scale by the mean axis factor. */
 function xformStroke(s, t) {
   const wScale = (Math.abs(t.sx) + Math.abs(t.sy)) / 2;
+  // A handle is an OFFSET VECTOR — scale + rotate it, never translate (gate).
+  const xh = (h) => { const v = rotVec(h[0] * t.sx, h[1] * t.sy, t.angle); return [v.x, v.y]; };
   return {
     color: s.color, opacity: s.opacity, pen: s.pen,
     cap: s.cap, join: s.join, curve: s.curve, // ride unchanged
+    ...(s.closed ? { closed: true } : {}),
+    ...(s.fill ? { fill: s.fill } : {}),        // fill/outline ride the transform
+    ...(s.noStroke ? { noStroke: true } : {}),
     dash: s.dash ? s.dash.map((d) => d * wScale) : null, // px lengths scale
     w: clamp(s.w * wScale, 0.1, MAX_BRUSH_FREE),
     pts: s.pts.map((p) => {
       const v = rotVec((p[0] - t.ox) * t.sx, (p[1] - t.oy) * t.sy, t.angle);
-      return [t.c1x + v.x, t.c1y + v.y, p[2]];
+      const q = [t.c1x + v.x, t.c1y + v.y, p[2]];
+      if (p.length > 3) { q[3] = p[3] ? xh(p[3]) : null; q[4] = p[4] ? xh(p[4]) : null; }
+      return q;
     }),
   };
 }
@@ -2262,9 +3401,21 @@ function segDist2(px, py, x0, y0, x1, y1) {
   return qx * qx + qy * qy;
 }
 
+/** Is (x,y) inside the polygon `pts` (array of [x,y,...])? Ray-cast. PURE. */
+function pointInPoly(pts, x, y) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
 /** Does (x,y) land on the stroke's ink (+slack, all in art px)? PURE. */
 function strokeHit(s, x, y, slack) {
   const pts = vecCurvePoints(s); // hit-test the rendered curve, not the node polygon
+  // A filled shape is grabbable across its whole interior, not just the ribbon.
+  if (s.fill && pts.length >= 3 && pointInPoly(pts, x, y)) return true;
   if (pts.length === 1) {
     const r = vecRadius(s, pts[0][2]) + slack;
     return (x - pts[0][0]) ** 2 + (y - pts[0][1]) ** 2 <= r * r;
@@ -2304,26 +3455,114 @@ function vecDotAt(s, x, y, zoom) {
   return best;
 }
 
+/** What a grab at (x,y) lands on for the selected stroke (Phase 12): a bezier
+ *  HANDLE endpoint — checked first, they stick out past the anchor — else an
+ *  anchor dot, else null. Handle side is 3 (hIn) or 4 (hOut). */
+function vecTargetAt(s, x, y, zoom) {
+  const slack = 7 / zoom;
+  let best = null, bd = slack * slack;
+  for (const i of vecDotIndices(s, zoom)) {
+    const p = s.pts[i];
+    for (const side of [3, 4]) {
+      const h = p.length > side ? p[side] : null;
+      if (!h) continue;
+      const d = (p[0] + h[0] - x) ** 2 + (p[1] + h[1] - y) ** 2;
+      if (d <= bd) { bd = d; best = { kind: 'handle', index: i, side }; }
+    }
+  }
+  if (best) return best;
+  const di = vecDotAt(s, x, y, zoom);
+  return di !== -1 ? { kind: 'anchor', index: di } : null;
+}
+
+/** The closest point on a stroke's rendered curve to (x,y): {seg, t, x, y} in
+ *  art coords, or null. Samples each segment's cubic — used to place a Pen
+ *  insert on the curve. */
+function locateOnStroke(s, x, y) {
+  const p = s.pts, n = p.length;
+  if (n < 2) return null;
+  const segs = s.closed ? n : n - 1;
+  let best = null;
+  for (let i = 0; i < segs; i++) {
+    const a = p[i], b = p[(i + 1) % n];
+    const { P1, P2 } = segCtrl(a, b);
+    const P0 = [a[0], a[1]], P3 = [b[0], b[1]];
+    for (let k = 0; k <= 48; k++) {
+      const t = k / 48;
+      const q = cubicAt(P0, P1, P2, P3, t);
+      const d = (q[0] - x) ** 2 + (q[1] - y) ** 2;
+      if (!best || d < best.d) best = { seg: i, t, x: q[0], y: q[1], d };
+    }
+  }
+  return best;
+}
+
 /** Render ONLY the given strokes into a box-sized canvas (the float's
  *  visual proxy, and the clipboard bake). Parts of a stroke lying outside
  *  the project canvas can't render here (the scratch is canvas-sized) —
- *  a drag preview may clip them, but commit math never loses them. */
-function strokesProxy(strokes, x, y, w, h) {
+ *  a drag preview may clip them, but commit math never loses them.
+ *
+ *  `scale` > 1 rasterizes at that many device px per art px, for crisp zoom:
+ *  without it a lifted vector selection is the one thing left on screen still
+ *  being upscaled from an art-res bitmap, so a moved stroke goes blocky
+ *  against a now-sharp canvas. ONLY the float preview passes it — the lift-time
+ *  proxy and the clipboard bake are art-res bitmaps by definition and must
+ *  keep their natural size, so the default leaves them byte-for-byte alone. */
+function strokesProxy(strokes, x, y, w, h, scale = 1) {
   const c = document.createElement('canvas');
-  c.width = Math.max(1, Math.ceil(w));
-  c.height = Math.max(1, Math.ceil(h));
+  c.width = Math.max(1, Math.ceil(w * scale));
+  c.height = Math.max(1, Math.ceil(h * scale));
   const g = c.getContext('2d');
-  const scr = vecScratchCtx();
-  for (const s of strokes) {
-    const r = clampRect(strokeBounds(s));
-    if (!r) continue;
-    scr.clearRect(r.x, r.y, r.w, r.h);
-    drawVecStroke(scr, s);
-    g.save();
-    g.globalAlpha = s.opacity;
-    g.drawImage(scr.canvas, r.x, r.y, r.w, r.h, r.x - x, r.y - y, r.w, r.h);
-    g.restore();
+  if (scale === 1) {
+    const scr = vecScratchCtx();
+    for (const s of strokes) {
+      const r = clampRect(strokeBounds(s));
+      if (!r) continue;
+      scr.clearRect(r.x, r.y, r.w, r.h);
+      drawVecStroke(scr, s);
+      g.save();
+      g.globalAlpha = s.opacity;
+      g.drawImage(scr.canvas, r.x, r.y, r.w, r.h, r.x - x, r.y - y, r.w, r.h);
+      g.restore();
+    }
+    return c;
   }
+  // Scaled path: draw the geometry straight in at `scale`, the same trick the
+  // crisp compositor uses. Clipped to the project canvas so the preview still
+  // stops at the canvas edge exactly as the art-res path's clamped blits did.
+  const toProxy = (ctx2) => ctx2.setTransform(scale, 0, 0, scale, -x * scale, -y * scale);
+  g.save();
+  toProxy(g);
+  g.beginPath();
+  g.rect(0, 0, state.width, state.height);
+  g.clip();
+  const den = crispDensity(scale); // geometry rides `scale`; only sampling caps
+  let scr = null; // allocated only if some stroke is translucent
+  for (const s of strokes) {
+    if (!clampRect(strokeBounds(s))) continue;
+    if (s.opacity < 1) {
+      // Through a scratch, so a translucent stroke can't darken itself where
+      // it overlaps — same contract as renderVectorPlane.
+      if (!scr) {
+        const t = document.createElement('canvas');
+        t.width = c.width;
+        t.height = c.height;
+        scr = t.getContext('2d');
+      }
+      scr.setTransform(1, 0, 0, 1, 0, 0);
+      scr.clearRect(0, 0, c.width, c.height);
+      toProxy(scr);
+      drawVecStroke(scr, s, den);
+      g.save();
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.globalAlpha = s.opacity;
+      g.drawImage(scr.canvas, 0, 0);
+      g.restore();
+    } else {
+      drawVecStroke(g, s, den);
+    }
+  }
+  g.restore();
   return c;
 }
 
@@ -2340,6 +3579,11 @@ function strokesProxy(strokes, x, y, w, h) {
  */
 function splitStroke(s, x, y, R) {
   if (s.pts.length === 1) return []; // strokeHit already said the dot is hit
+  // A HANDLED stroke's segments are cubics, not straight chords — cutting on
+  // lerp-inserted chord points would straighten the curve at the cut (the gate's
+  // "largest hidden cost"). splitStrokeHandled carves with de Casteljau so the
+  // survivors keep the exact curve shape, with correct handles at the cuts.
+  if (strokeHasHandles(s)) return splitStrokeHandled(s, x, y, R);
   // Refine first: fast strokes record SPARSE points, and cutting only at
   // recorded points would bite out huge chunks. Subdivide long segments
   // (plain lerp — the capsule between two points IS a straight line, so
@@ -2400,7 +3644,7 @@ function splitStroke(s, x, y, R) {
   const out = [];
   let run = [];
   const flush = () => {
-    if (run.length >= 2) out.push({ ...strokeLook(s), pts: run });
+    if (run.length >= 2) out.push({ ...strokeLook(s), id: mintStrokeId(), pts: run });
     run = [];
   };
   for (let i = 0; i < pts.length; i++) {
@@ -2408,6 +3652,91 @@ function splitStroke(s, x, y, R) {
     else run.push(pts[i].slice());
   }
   flush();
+  return out;
+}
+
+/**
+ * Split a HANDLED stroke around the eraser disc, preserving curve shape. Each
+ * segment is a cubic; we sample it, mark the samples the disc reaches, and for
+ * every surviving t-window carve the exact sub-cubic with de Casteljau
+ * (subCubic). Surviving sub-cubics that meet at an untouched ORIGINAL anchor
+ * are stitched back into one sub-path (that anchor keeps its real handles);
+ * a cut in the middle of a segment becomes a fresh corner (handle → null on
+ * the erased side). Survivors are always OPEN and get a fresh id. Never mutates
+ * `s`. (A closed path is opened; pieces are not stitched across the seam anchor
+ * — an eraser exactly on the seam may leave one extra split, cosmetic only.)
+ */
+function splitStrokeHandled(s, x, y, R) {
+  const p = s.pts, n = p.length;
+  const segs = s.closed ? n : n - 1;
+  const pieces = [];
+  for (let i = 0; i < segs; i++) {
+    const a = p[i], b = p[(i + 1) % n];
+    const { P1, P2 } = segCtrl(a, b);
+    const P0 = [a[0], a[1]], P3 = [b[0], b[1]];
+    const approx = Math.hypot(P1[0] - P0[0], P1[1] - P0[1])
+                 + Math.hypot(P2[0] - P1[0], P2[1] - P1[1])
+                 + Math.hypot(P3[0] - P2[0], P3[1] - P2[1]);
+    // Cut granularity tracks the eraser size, not the segment length.
+    const steps = clamp(Math.ceil(approx / Math.max(R * 0.5, 1)), 8, 256);
+    const touch = new Array(steps + 1);
+    for (let k = 0; k <= steps; k++) {
+      const t = k / steps;
+      const q = cubicAt(P0, P1, P2, P3, t);
+      const r = vecRadius(s, a[2] + (b[2] - a[2]) * t) + R;
+      touch[k] = (q[0] - x) ** 2 + (q[1] - y) ** 2 <= r * r;
+    }
+    // Each maximal untouched sample run (length ≥ 2 samples) → one sub-cubic.
+    let k = 0;
+    while (k <= steps) {
+      if (touch[k]) { k++; continue; }
+      let j = k;
+      while (j + 1 <= steps && !touch[j + 1]) j++;
+      if (j > k) {
+        const t0 = k / steps, t1 = j / steps;
+        const Q = subCubic(P0, P1, P2, P3, t0, t1);
+        const w0 = a[2] + (b[2] - a[2]) * t0, w1 = a[2] + (b[2] - a[2]) * t1;
+        const asVec = (from, to) => [to[0] - from[0], to[1] - from[1]];
+        pieces.push({
+          seg: i, startCut: t0 > 0, endCut: t1 < 1,
+          start: { pos: Q[0], w: w0, hIn: t0 > 0 ? null : (a.length > 3 ? a[3] : null), hOut: asVec(Q[0], Q[1]) },
+          end: { pos: Q[3], w: w1, hIn: asVec(Q[3], Q[2]), hOut: t1 < 1 ? null : (b.length > 4 ? b[4] : null) },
+        });
+      }
+      k = j + 1;
+    }
+  }
+  // Stitch consecutive pieces that meet at an untouched original anchor.
+  const chains = [];
+  let cur = null, prev = null;
+  for (const pc of pieces) {
+    if (cur && prev && !prev.endCut && !pc.startCut && pc.seg === prev.seg + 1) {
+      const shared = cur[cur.length - 1];
+      shared.hOut = pc.start.hOut; // shared original anchor keeps both real handles
+      cur.push(pc.end);
+    } else {
+      if (cur) chains.push(cur);
+      cur = [pc.start, pc.end];
+    }
+    prev = pc;
+  }
+  if (cur) chains.push(cur);
+  // Chain of anchors → stroke. A handle pair that is null on both sides drops
+  // the point back to length-3 (keeps it clean / rig-friendly).
+  const anchorPt = (an) =>
+    an.hIn || an.hOut
+      ? [an.pos[0], an.pos[1], an.w, an.hIn ? an.hIn.slice() : null, an.hOut ? an.hOut.slice() : null]
+      : [an.pos[0], an.pos[1], an.w];
+  const out = [];
+  for (const ch of chains) {
+    if (ch.length < 2) continue;
+    const pts = ch.map(anchorPt);
+    // Drop debris: a chain that spans almost nothing.
+    let span = 0;
+    for (let i = 1; i < pts.length; i++) span += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    if (span < 0.5) continue;
+    out.push({ ...strokeLook(s), id: mintStrokeId(), pts });
+  }
   return out;
 }
 
@@ -2891,7 +4220,7 @@ function finishStroke() {
     // capsules there are the same math a full re-render would produce).
     // The undo entry carries the object, not pixels — undo removes it from
     // the list and re-rasterizes, so truth and mirror can never diverge.
-    const obj = { color: s.color, w: s.vec.w, opacity: s.opacity,
+    const obj = { id: mintStrokeId(), color: s.color, w: s.vec.w, opacity: s.opacity,
                   pen: s.vec.pen,
                   // New strokes take the pending style (9a); undo/xform/clone
                   // all thread these fields, so once set they stay consistent.
@@ -2953,6 +4282,19 @@ function syncSelectBar() {
   // Curve button reflects the selected stroke (single) or the new-stroke default.
   const one = hasVec && selection.strokes.length === 1 ? selection.strokes[0] : null;
   $('btn-vec-curve').classList.toggle('active', one ? !!one.curve : vecStyle.curve);
+  // Fill swatch shows the single stroke's fill (or a red-slash "no fill"); the
+  // Stroke toggle is lit when the outline is on.
+  const fillSw = $('btn-vec-fill');
+  if (one && one.fill) {
+    fillSw.classList.remove('no-fill');
+    fillSw.style.background = one.fill;
+    $('inp-fill').value = one.fill;
+  } else {
+    fillSw.classList.add('no-fill');
+    fillSw.style.background = '';
+  }
+  $('btn-vec-stroke').classList.toggle('active', one ? !one.noStroke : true);
+  updateShapeBox(); // reflect the selected shape's params (or hide the panel)
   updateSelReadout();
 }
 
@@ -3233,6 +4575,7 @@ function liftSelection() {
  * Ctrl+Z reverts the whole lift-move-commit.
  */
 function commitFloat() {
+  penCommit(); // any commit point (save, export, frame/layer switch) also lands the pen path
   if (!floating) return;
   const f = floating;
   floating = null;
@@ -3248,10 +4591,19 @@ function commitFloat() {
     const moved = t.angle !== 0 || t.sx !== 1 || t.sy !== 1 ||
                   t.c1x !== f.ox || t.c1y !== f.oy;
     if (moved) {
+      const dx = t.c1x - t.ox, dy = t.c1y - t.oy;
+      const pureMove = t.angle === 0 && t.sx === 1 && t.sy === 1; // no scale/rotate/flip
       for (const s of f.vecStrokes) {
-        const n = xformStroke(s, t); // same math the live preview showed
-        s.pts = n.pts;
-        s.w = n.w;
+        if (s.shape && pureMove) {
+          // A live shape survives a move: just shift its bbox and regen.
+          s.shape.x += dx; s.shape.y += dy;
+          regenShape(s);
+        } else {
+          if (s.shape) releaseShape(s); // scale/rotate/flip bakes it to a path
+          const n = xformStroke(s, t); // same math the live preview showed
+          s.pts = n.pts;
+          s.w = n.w;
+        }
       }
       pushFreeUndo({ frame, plane,
         vec: { op: 'edit',
@@ -3744,6 +5096,242 @@ $('btn-sel-cancel').addEventListener('click', cancelSelection);
  * Pointer input (mouse / pen / touch via Pointer Events)
  * ==================================================================== */
 
+/* ---- Pen tool (Phase 12): construction-vector path drawing. Click places a
+ * corner anchor; click-drag pulls mirrored smooth handles out of it; clicking
+ * back on the first anchor closes the path; Esc / a right-click / switching
+ * tool, frame or layer commits the open path as one vector stroke. The in-
+ * progress path is UI-only (a thin skeleton with anchors + handles) until
+ * commit, when it rasterizes into the plane like any other vector stroke. ---- */
+let penPath = null;   // { plane, frame, pts, closed } while a path is being drawn
+let penDrag = null;   // { i } — the anchor whose handles the current drag is setting
+let penHover = null;  // { x, y } art coords, for the rubber-band segment preview
+let penInsertPt = null; // { stroke, loc } — insert candidate under the Pen cursor
+const PEN_CLOSE_PX = 8; // screen-px grab radius that closes the path on anchor 0
+
+/** With no path in progress, the topmost stroke whose ribbon (but not a node)
+ *  is under (x,y) on the active vector layer, with where to insert — Pen-on-
+ *  segment. null if the cursor isn't over an insertable stretch. */
+function penInsertTarget(plane, x, y) {
+  if (!plane || !plane.strokes) return null;
+  const slack = 6 / state.zoom;
+  for (let i = plane.strokes.length - 1; i >= 0; i--) {
+    const s = plane.strokes[i];
+    if (!strokeHit(s, x, y, slack)) continue;
+    if (vecDotAt(s, x, y, state.zoom) !== -1) continue; // a node grab, not an insert
+    const loc = locateOnStroke(s, x, y);
+    if (loc) return { stroke: s, loc };
+  }
+  return null;
+}
+
+/** Splice a shape-preserving anchor into `s` at `loc` and book the edit. */
+function insertAnchorInto(s, loc) {
+  const before = snapVec(s);
+  releaseShape(s);
+  s.pts = insertAnchor(s.pts, s.closed, loc.seg, loc.t);
+  commitVecEdit(s, before); // re-renders, re-selects, books undo
+}
+
+/** Land the in-progress pen path into its plane as a real vector stroke. A path
+ *  of fewer than two anchors is not a stroke and is simply dropped. */
+function penCommit() {
+  if (!penPath) return;
+  const path = penPath;
+  penPath = null; penDrag = null; penHover = null;
+  if (path.pts.length < 2) { render(); return; }
+  const obj = {
+    id: mintStrokeId(), color: state.color, w: state.brushSize,
+    opacity: state.brushOpacity, pen: 'pen',
+    cap: vecStyle.cap, join: vecStyle.join,
+    dash: vecStyle.dash ? vecStyle.dash.slice() : null, curve: false,
+    ...(path.closed ? { closed: true } : {}),
+    pts: path.pts,
+  };
+  path.plane.strokes.push(obj);
+  renderVectorPlane(path.plane);
+  const dirty = clampRect(strokeBounds(obj));
+  path.plane.touched = true;
+  pushFreeUndo({ frame: path.frame, plane: path.plane, rect: dirty,
+                 vec: { op: 'add', stroke: obj } });
+  recomposite(path.frame);
+  updateThumb(path.frame);
+  drawLayerThumb(state.layer);
+  updateUI();
+  render();
+}
+
+/** Book a one-stroke reshape as an undo entry and refresh everything the
+ *  change touched. Shared by the anchor convert/delete gestures. */
+function commitVecEdit(s, before) {
+  pushFreeUndo({ frame: cur(), plane: curLayer(),
+    vec: { op: 'edit', edits: [{ stroke: s, before, after: snapVec(s) }] } });
+  renderVectorPlane(curLayer());
+  recomposite(cur());
+  selection = makeVecSelection([s]);
+  updateThumb(cur());
+  drawLayerThumb(state.layer);
+  updateUI();
+  render();
+}
+
+/** Toggle anchor `i` of stroke `s` between smooth (mirrored tangents) and
+ *  corner (no tangents). A corner becomes smooth with handles derived from the
+ *  neighbour chord — Illustrator's convert-anchor gesture. */
+function convertVecAnchor(s, i) {
+  const before = snapVec(s);
+  releaseShape(s); // editing an anchor's handles bakes a live shape to a path
+  const a = s.pts[i];
+  if (a.length > 3 && (a[3] || a[4])) {
+    a.length = 3; // smooth → corner
+  } else {
+    const n = s.pts.length;
+    const prev = s.pts[Math.max(0, i - 1)], next = s.pts[Math.min(n - 1, i + 1)];
+    let tx = next[0] - prev[0], ty = next[1] - prev[1];
+    const tl = Math.hypot(tx, ty) || 1;
+    const len = Math.max(4, Math.min(Math.hypot(a[0] - prev[0], a[1] - prev[1]),
+                                     Math.hypot(a[0] - next[0], a[1] - next[1])) / 3);
+    tx = (tx / tl) * len; ty = (ty / tl) * len;
+    a[3] = [-tx, -ty]; a[4] = [tx, ty]; // smooth, mirrored
+  }
+  commitVecEdit(s, before);
+}
+
+/** Remove anchor `i` (a stroke keeps at least two points). */
+function deleteVecAnchor(s, i) {
+  if (s.pts.length <= 2) return;
+  const before = snapVec(s);
+  releaseShape(s);
+  s.pts.splice(i, 1);
+  hoverDot = null;
+  commitVecEdit(s, before);
+}
+
+/* --- Shape tool (12b): drag out a live parametric primitive. The controls
+ * panel edits `shapeStyle` (pending) or, when a shape is selected, that shape's
+ * params live via regenShape. --- */
+
+/** The single selected stroke IF it is a live shape, else null. */
+function selectedShape() {
+  return selection && selection.strokes && selection.strokes.length === 1 &&
+    selection.strokes[0].shape ? selection.strokes[0] : null;
+}
+
+/** The bbox {x,y,w,h} for a shape drag: Shift = square, Alt = from the centre. */
+function shapeDragBox(sd) {
+  let dx = sd.cx - sd.x0, dy = sd.cy - sd.y0;
+  if (sd.shift) {
+    const m = Math.max(Math.abs(dx), Math.abs(dy));
+    dx = (dx < 0 ? -1 : 1) * m; dy = (dy < 0 ? -1 : 1) * m;
+  }
+  if (sd.alt) return { x: sd.x0 - Math.abs(dx), y: sd.y0 - Math.abs(dy), w: Math.abs(dx) * 2, h: Math.abs(dy) * 2 };
+  return { x: Math.min(sd.x0, sd.x0 + dx), y: Math.min(sd.y0, sd.y0 + dy), w: Math.abs(dx), h: Math.abs(dy) };
+}
+
+/** A shape object of the pending kind, fitted to `box`. */
+function shapeFromStyle(box) {
+  const k = shapeStyle.kind;
+  const shape = { kind: k, x: box.x, y: box.y, w: box.w, h: box.h };
+  if (k === 'rect') shape.r = clamp(shapeStyle.r, 0, Math.min(box.w, box.h) / 2);
+  if (k === 'polygon') { shape.sides = shapeStyle.sides; shape.rot = -Math.PI / 2; }
+  if (k === 'star') { shape.points = shapeStyle.points; shape.inner = shapeStyle.inner; shape.rot = -Math.PI / 2; }
+  return shape;
+}
+
+/** Show/hide the shape controls and reflect the pending style — or a selected
+ *  shape's params if one is selected. */
+function updateShapeBox() {
+  const sel = selectedShape();
+  const show = state.tool === 'shape' || !!sel;
+  $('shape-box').hidden = !show;
+  if (!show) return;
+  const src = sel ? sel.shape : shapeStyle;
+  document.querySelectorAll('#shape-types .shape-type').forEach((b) => {
+    b.classList.toggle('active', b.dataset.shape === src.kind);
+  });
+  document.querySelectorAll('#shape-box .shape-param').forEach((row) => {
+    row.hidden = row.dataset.for !== src.kind;
+  });
+  const put = (id, v) => { const el = $(id); if (document.activeElement !== el) el.value = v; };
+  if (src.kind === 'polygon') put('shape-sides', src.sides != null ? src.sides : shapeStyle.sides);
+  if (src.kind === 'star') {
+    put('shape-points', src.points != null ? src.points : shapeStyle.points);
+    put('shape-inner', Math.round((src.inner != null ? src.inner : shapeStyle.inner) * 100));
+  }
+  if (src.kind === 'rect') put('shape-corner', src.r != null ? src.r : shapeStyle.r);
+}
+
+/** Pick the shape kind for the NEXT shape drawn. Picking a type means "draw
+ *  this next", so it deselects — we never silently convert the shape you just
+ *  drew (its params stay editable while it's selected, but its TYPE is fixed;
+ *  to change type, draw a fresh one). */
+function setShapeKind(k) {
+  shapeStyle.kind = k;
+  persistShapeStyle();
+  dropVecSelection();
+  updateShapeBox();
+  render();
+}
+
+/** Set a shape parameter: pending default, plus live on a selected shape. */
+function setShapeParam(key, val) {
+  shapeStyle[key] = val;
+  persistShapeStyle();
+  const sel = selectedShape();
+  if (sel) editSelectedStrokes('shape', (s) => { if (s.shape) { s.shape[key] = val; regenShape(s); } });
+  updateShapeBox();
+}
+
+function persistShapeStyle() {
+  try { localStorage.setItem('ssm.shapeStyle', JSON.stringify(shapeStyle)); }
+  catch { /* storage blocked — the default just won't survive reload */ }
+}
+
+function loadShapeStyle() {
+  let v = null;
+  try { v = JSON.parse(localStorage.getItem('ssm.shapeStyle') || 'null'); } catch { return; }
+  if (!v || typeof v !== 'object') return;
+  if (['rect', 'ellipse', 'polygon', 'star'].includes(v.kind)) shapeStyle.kind = v.kind;
+  if (Number.isFinite(+v.r)) shapeStyle.r = Math.max(0, +v.r);
+  if (Number.isFinite(+v.sides)) shapeStyle.sides = clamp(Math.round(+v.sides), 3, 100);
+  if (Number.isFinite(+v.points)) shapeStyle.points = clamp(Math.round(+v.points), 3, 100);
+  if (Number.isFinite(+v.inner)) shapeStyle.inner = clamp(+v.inner, 0.05, 0.95);
+}
+
+function wireShapeControls() {
+  document.querySelectorAll('#shape-types .shape-type').forEach((b) => {
+    b.addEventListener('click', () => setShapeKind(b.dataset.shape));
+  });
+  $('shape-sides').addEventListener('change', (e) => setShapeParam('sides', clamp(Math.round(+e.target.value || 5), 3, 100)));
+  $('shape-points').addEventListener('change', (e) => setShapeParam('points', clamp(Math.round(+e.target.value || 5), 3, 100)));
+  $('shape-inner').addEventListener('change', (e) => setShapeParam('inner', clamp((+e.target.value || 50) / 100, 0.05, 0.95)));
+  $('shape-corner').addEventListener('change', (e) => setShapeParam('r', Math.max(0, +e.target.value || 0)));
+}
+
+/** Commit the dragged shape as a live parametric stroke, then select it so the
+ *  params panel is immediately live. */
+function shapeCommit(sd) {
+  const box = shapeDragBox(sd);
+  if (box.w < 1 || box.h < 1) { render(); return; } // a click / tiny drag makes no shape
+  const shape = shapeFromStyle(box);
+  const obj = { id: mintStrokeId(), color: state.color, w: state.brushSize,
+                opacity: state.brushOpacity, pen: 'pen', closed: true,
+                cap: vecStyle.cap, join: vecStyle.join,
+                dash: vecStyle.dash ? vecStyle.dash.slice() : null,
+                shape, pts: shapePts(shape) };
+  sd.plane.strokes.push(obj);
+  renderVectorPlane(sd.plane);
+  const dirty = clampRect(strokeBounds(obj));
+  sd.plane.touched = true;
+  pushFreeUndo({ frame: sd.frame, plane: sd.plane, rect: dirty, vec: { op: 'add', stroke: obj } });
+  recomposite(sd.frame);
+  updateThumb(sd.frame);
+  drawLayerThumb(state.layer);
+  updateUI();
+  selection = makeVecSelection([obj]);
+  syncSelectBar();
+  render();
+}
+
 view.addEventListener('pointerdown', (e) => {
   const sx = e.offsetX, sy = e.offsetY;
 
@@ -3793,6 +5381,58 @@ view.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  // Pen tool: place/extend the construction path.
+  if (state.tool === 'pen') {
+    if (rightBtn) { penCommit(); return; } // right-click finishes the path
+    // Not mid-path and hovering an existing stroke's ribbon? A click INSERTS a
+    // shape-preserving anchor there (Pen-on-segment) rather than starting anew.
+    if (!penPath && state.layers[state.layer].kind === 'vector') {
+      const iq = screenToArtF(sx, sy);
+      const tgt = penInsertTarget(curLayer(), iq.x, iq.y);
+      if (tgt) { insertAnchorInto(tgt.stroke, tgt.loc); flashHint('Anchor added.'); return; }
+    }
+    // A pen path lives on a vector layer; make or host one on the first anchor.
+    if (!penPath) {
+      if (!ensureLayerKind('vector')) return;
+      if (!state.layers[state.layer].visible) {
+        flashHint('The active layer is hidden — click its eye to show it first.');
+        return;
+      }
+      penPath = { plane: curLayer(), frame: cur(), pts: [], closed: false };
+      dropVecSelection(); // don't linger a previous stroke's anchors mid-draw
+    }
+    const q = screenToArtF(sx, sy);
+    // A click back on the first anchor closes the path and commits it.
+    if (penPath.pts.length >= 2) {
+      const a0 = penPath.pts[0];
+      if (Math.hypot((a0[0] - q.x) * state.zoom, (a0[1] - q.y) * state.zoom) <= PEN_CLOSE_PX) {
+        penPath.closed = true; penCommit(); return;
+      }
+    }
+    penPath.pts.push([q.x, q.y, 1]); // corner anchor; a drag adds handles below
+    penDrag = { i: penPath.pts.length - 1, ox: q.x, oy: q.y };
+    penHover = { x: q.x, y: q.y };
+    view.style.cursor = 'crosshair';
+    view.setPointerCapture(e.pointerId);
+    render();
+    return;
+  }
+
+  // Shape tool: begin dragging out a primitive on a vector layer.
+  if (state.tool === 'shape') {
+    if (rightBtn) return;
+    if (!ensureLayerKind('vector')) return;
+    if (!state.layers[state.layer].visible) {
+      flashHint('The active layer is hidden — click its eye to show it first.');
+      return;
+    }
+    const q = screenToArtF(sx, sy);
+    shapeDrag = { x0: q.x, y0: q.y, cx: q.x, cy: q.y,
+                  shift: e.shiftKey, alt: e.altKey, plane: curLayer(), frame: cur() };
+    view.setPointerCapture(e.pointerId);
+    return;
+  }
+
   if (state.tool === 'select') {
     if (rightBtn) {
       cancelSelection();
@@ -3805,13 +5445,15 @@ view.addEventListener('pointerdown', (e) => {
         selection.strokes.length === 1) {
       const s0 = selection.strokes[0];
       const q0 = screenToArtF(sx, sy);
-      const di = vecDotAt(s0, q0.x, q0.y, state.zoom);
-      if (di !== -1) {
-        // Width mode (toggle) or Alt held → drag ⟂ edits thickness (9b);
-        // otherwise the dot repositions the point (8b).
-        vecPointDrag = { stroke: s0, index: di, before: snapVec(s0),
+      const tgt = vecTargetAt(s0, q0.x, q0.y, state.zoom);
+      if (tgt) {
+        // Handle endpoint → reshape that tangent (Alt breaks the mirror). On an
+        // anchor: width mode / Alt drags ⟂ for thickness (9b), else repositions.
+        vecPointDrag = { stroke: s0, index: tgt.index, before: snapVec(s0),
                          plane: curLayer(), frame: cur(), moved: false,
-                         width: vecWidthMode || e.altKey };
+                         handle: tgt.kind === 'handle' ? tgt.side : 0,
+                         width: tgt.kind === 'anchor' && (vecWidthMode || e.altKey),
+                         break: e.altKey };
         view.setPointerCapture(e.pointerId);
         return;
       }
@@ -4017,6 +5659,43 @@ view.addEventListener('pointermove', (e) => {
     return;
   }
 
+  // Pen tool: a drag off the just-placed anchor pulls out mirrored handles;
+  // otherwise the bare hover drives the rubber-band segment to the cursor.
+  if (state.tool === 'pen' && penPath) {
+    const q = screenToArtF(sx, sy);
+    penHover = { x: q.x, y: q.y };
+    if (penDrag) {
+      const a = penPath.pts[penDrag.i];
+      const dx = q.x - penDrag.ox, dy = q.y - penDrag.oy;
+      if (Math.hypot(dx * state.zoom, dy * state.zoom) < 3) {
+        if (a.length > 3) a.length = 3; // too small a pull → keep it a corner
+      } else {
+        a[3] = [-dx, -dy]; // hIn mirrors hOut → a smooth anchor
+        a[4] = [dx, dy];
+      }
+    }
+    view.style.cursor = 'crosshair';
+    render();
+    return;
+  }
+  // Shape drag: grow the bbox (Shift/Alt read live) and preview.
+  if (shapeDrag) {
+    const q = screenToArtF(sx, sy);
+    shapeDrag.cx = q.x; shapeDrag.cy = q.y;
+    shapeDrag.shift = e.shiftKey; shapeDrag.alt = e.altKey;
+    render();
+    return;
+  }
+  // Pen with no path yet: light up an insert "+" when over an existing ribbon.
+  if (state.tool === 'pen' && !penPath) {
+    const q = screenToArtF(sx, sy);
+    penInsertPt = state.layers[state.layer].kind === 'vector'
+      ? penInsertTarget(curLayer(), q.x, q.y) : null;
+    view.style.cursor = penInsertPt ? 'copy' : 'crosshair';
+    render();
+    return;
+  }
+
   const p = screenToArt(sx, sy);
   hover = inBounds(p.x, p.y) ? p : null;
 
@@ -4095,10 +5774,28 @@ view.addEventListener('pointermove', (e) => {
   // offsets recompute from the drag-start snapshot — no accumulation drift.
   if (vecPointDrag) {
     const d = vecPointDrag;
+    if (d.stroke.shape) releaseShape(d.stroke); // reshaping an anchor bakes a live shape
     const q = screenToArtF(sx, sy);
     const P0 = d.before.pts;
-    const K = Math.max(2, Math.round(P0.length / 6));
     const pts = d.stroke.pts;
+    // Bezier handle drag (Phase 12): the endpoint follows the pointer; a smooth
+    // anchor mirrors the opposite handle, Alt breaks the mirror (a corner).
+    if (d.handle) {
+      const a = pts[d.index];
+      const hx = q.x - a[0], hy = q.y - a[1];
+      a[d.handle] = [hx, hy];
+      const other = d.handle === 3 ? 4 : 3;
+      if (!d.break && a[other]) a[other] = [-hx, -hy];
+      d.moved = true;
+      renderVectorPlane(d.plane);
+      recomposite(d.frame);
+      selection = makeVecSelection([d.stroke]);
+      render();
+      return;
+    }
+    // A Pen/bezier stroke reshapes ONE anchor precisely; a freehand polyline
+    // bends a cosine-falloff window of neighbours for an organic drag.
+    const K = strokeHasHandles(d.stroke) ? 0 : Math.max(2, Math.round(P0.length / 6));
     if (d.width) {
       // Width edit (9b): the grabbed point's radius = the pointer's distance
       // from the centerline; neighbors in the same cosine window ride the
@@ -4107,8 +5804,8 @@ view.addEventListener('pointermove', (e) => {
       const targetM = clamp((targetR * 2) / d.stroke.w, WIDTH_MIN, WIDTH_MAX);
       const dM = targetM - P0[d.index][2];
       for (let j = Math.max(0, d.index - K); j <= Math.min(pts.length - 1, d.index + K); j++) {
-        const t = Math.abs(j - d.index) / K;
-        const w = 0.5 * (1 + Math.cos(Math.PI * t));
+        // K=0 (a bezier anchor edits alone) → full weight, no 0/0 falloff.
+        const w = K ? 0.5 * (1 + Math.cos(Math.PI * Math.abs(j - d.index) / K)) : 1;
         pts[j][2] = clamp(P0[j][2] + dM * w, WIDTH_MIN, WIDTH_MAX);
       }
       d.moved = d.moved || dM !== 0;
@@ -4116,8 +5813,7 @@ view.addEventListener('pointermove', (e) => {
       const dx = q.x - P0[d.index][0];
       const dy = q.y - P0[d.index][1];
       for (let j = Math.max(0, d.index - K); j <= Math.min(pts.length - 1, d.index + K); j++) {
-        const t = Math.abs(j - d.index) / K;
-        const w = 0.5 * (1 + Math.cos(Math.PI * t));
+        const w = K ? 0.5 * (1 + Math.cos(Math.PI * Math.abs(j - d.index) / K)) : 1;
         pts[j][0] = P0[j][0] + dx * w;
         pts[j][1] = P0[j][1] + dy * w;
       }
@@ -4152,18 +5848,19 @@ view.addEventListener('pointermove', (e) => {
   // the dot under the cursor so it's obvious which part of the line a grab
   // will reshape. Dots beat handles, matching pointerdown's grab order.
   hoverDot = null;
+  let onVecHandle = false;
   if (state.mode === 'free' && state.tool === 'select' && !floating &&
       selection && selection.strokes && selection.strokes.length === 1) {
     const qd = screenToArtF(sx, sy);
-    const di = vecDotAt(selection.strokes[0], qd.x, qd.y, state.zoom);
-    if (di !== -1) {
-      hoverDot = di;
+    const tgt = vecTargetAt(selection.strokes[0], qd.x, qd.y, state.zoom);
+    if (tgt) {
+      if (tgt.kind === 'anchor') hoverDot = tgt.index; else onVecHandle = true;
       hoverHandle = null;
     }
   }
   if (selBox && !spaceDown && !enterDown) {
     const q = screenToArtF(sx, sy);
-    view.style.cursor = hoverDot !== null ? 'grab'
+    view.style.cursor = (hoverDot !== null || onVecHandle) ? 'grab'
       : hoverHandle
         ? (hoverHandle.rot ? 'grab' : resizeCursor(hoverHandle, selBox.angle || 0))
         : (pointInBox(q.x, q.y, selBox) ? 'move' : '');
@@ -4179,6 +5876,20 @@ function endStroke() {
   if (panning) {
     panning = false;
     wrap.classList.remove('panning-active');
+  }
+  // Releasing after a pen anchor ends its handle drag; the path stays open for
+  // the next click (Esc / right-click / a tool-or-frame switch commits it).
+  if (penDrag) {
+    penDrag = null;
+    render();
+    return;
+  }
+  // Releasing a shape drag commits the primitive.
+  if (shapeDrag) {
+    const sd = shapeDrag;
+    shapeDrag = null;
+    shapeCommit(sd);
+    return;
   }
   // A vector marquee resolves on release: strokes with any point inside the
   // dragged rect become the selection (the rect itself is discarded).
@@ -4239,6 +5950,13 @@ function endStroke() {
     }
     updateUI();
   }
+  // Crisp zoom suppresses itself mid-gesture, and the flags that suppress it
+  // were cleared at the top of this handler — but ENDING a gesture is not
+  // itself a redraw, so without this the canvas would sit in the art-res
+  // fallback until something else happened to render (measured: release the
+  // marquee and the art stayed soft until the next pointer move). The paths
+  // above that return early already render; this covers the rest.
+  renderSoon();
 }
 
 /**
@@ -4257,6 +5975,8 @@ function cancelPointerInput() {
     panning = false;
     wrap.classList.remove('panning-active');
   }
+  if (penDrag) penDrag = null; // a gesture takeover just stops setting handles
+  if (shapeDrag) shapeDrag = null; // a revoked shape drag draws nothing
   // A half-dragged VECTOR marquee is dropped outright — a plain rect must
   // never survive on a vector layer (the pixel lift paths would misread it).
   if (selDrag && selDrag.vec && selection && !selection.strokes) selection = null;
@@ -4314,6 +6034,19 @@ function pointerEnd(e) {
 
 view.addEventListener('pointerup', pointerEnd);
 view.addEventListener('pointercancel', pointerEnd);
+
+// Double-click an anchor of the selected vector stroke to convert it between
+// smooth and corner (Select tool, one stroke, freeform).
+view.addEventListener('dblclick', (e) => {
+  if (state.tool !== 'select' || state.mode !== 'free' || floating) return;
+  if (!selection || !selection.strokes || selection.strokes.length !== 1) return;
+  const s = selection.strokes[0];
+  const q = screenToArtF(e.offsetX, e.offsetY);
+  const di = vecDotAt(s, q.x, q.y, state.zoom);
+  if (di === -1) return;
+  convertVecAnchor(s, di);
+  e.preventDefault();
+});
 
 view.addEventListener('pointerleave', () => {
   hover = null;
@@ -4425,14 +6158,20 @@ window.addEventListener('keydown', (e) => {
     case 'KeyI': selectTool('eyedropper'); break;
     case 'KeyH': selectTool('pan'); break;
     case 'KeyS': selectTool('select'); break;
-    case 'Escape': cancelSelection(); break;
+    case 'Escape': if (penPath) penCommit(); else cancelSelection(); break;
     case 'Comma': selectFrame(state.frame - 1); break;   // previous frame
     case 'Period': selectFrame(state.frame + 1); break;  // next frame
     case 'KeyN': addFrame(); break;
     case 'KeyD': dupFrame(); break;
     case 'Delete':
-      // With a selection active, Delete clears it; otherwise it's the frame.
-      if (selection || floating) clearSelectionPixels();
+      // Hovering an anchor of the selected vector stroke → remove just that
+      // anchor (Illustrator's direct-select delete). Otherwise Delete clears
+      // an active selection, or deletes the frame.
+      if (state.tool === 'select' && state.mode === 'free' && !floating &&
+          selection && selection.strokes && selection.strokes.length === 1 &&
+          hoverDot !== null && selection.strokes[0].pts.length > 2) {
+        deleteVecAnchor(selection.strokes[0], hoverDot);
+      } else if (selection || floating) clearSelectionPixels();
       else deleteFrame();
       break;
     case 'BracketLeft': setBrushSize(state.brushSize - 1); break;
@@ -5107,6 +6846,383 @@ function download(filename, blob) {
 }
 
 /**
+ * The shown frame as an SVG document (Phase 12 — vector interop).
+ *
+ * Vector layers export as real paths, so the art stays resolution-independent
+ * and editable in Illustrator / Affinity / Figma / Inkscape. Raster layers
+ * ride along as embedded PNGs, so a mixed document survives intact rather
+ * than silently losing half its content.
+ *
+ * Per-stroke shape (see the SVG path-data section for the reasoning):
+ *   - uniform width  -> one <path> carrying fill AND stroke, exactly as
+ *     drawVecStroke paints it (fill under outline, same centerline);
+ *   - variable width -> the fill path, then the expanded OUTLINE as a
+ *     separate filled path.
+ * Layer opacity and blend become group attributes; `mix-blend-mode` names
+ * match our stored blend names, which are already canvas/CSS names.
+ */
+function buildSVG(idx = state.frame) {
+  const f = state.frames[idx];
+  const W = state.width, H = state.height;
+  const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                              .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const r3 = (v) => +(+v).toFixed(3);
+  const parts = [
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" `
+    + `width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`,
+  ];
+  state.layers.forEach((m, li) => {
+    if (!m.visible) return;
+    const plane = f.layers[li];
+    if (!plane) return;
+    const attrs = [];
+    if (m.opacity < 1) attrs.push(`opacity="${r3(m.opacity)}"`);
+    if (m.blend && m.blend !== 'normal') attrs.push(`style="mix-blend-mode:${esc(m.blend)}"`);
+    const body = [];
+    if (plane.strokes) {
+      for (const s of plane.strokes) {
+        if (!s.pts.length) continue;
+        const op = s.opacity < 1 ? ` opacity="${r3(s.opacity)}"` : '';
+        const cap = s.cap || 'round', join = s.join || 'round';
+        if (strokeIsUniform(s)) {
+          const a = [`d="${strokeCenterlineD(s)}"`];
+          a.push(`fill="${s.fill ? esc(s.fill) : 'none'}"`);
+          if (!s.noStroke) {
+            a.push(`stroke="${esc(s.color)}"`,
+                   `stroke-width="${r3(vecRadius(s, s.pts[0][2]) * 2)}"`,
+                   `stroke-linecap="${cap}"`, `stroke-linejoin="${join}"`);
+            if (s.dash) a.push(`stroke-dasharray="${s.dash.map(r3).join(' ')}"`);
+          }
+          body.push(`<path ${a.join(' ')}${op}/>`);
+        } else {
+          // Variable width: the stroke becomes an expanded outline, so fill
+          // and outline must be separate paths.
+          if (s.fill) {
+            body.push(`<path d="${strokeCenterlineD(s)}" fill="${esc(s.fill)}"${op}/>`);
+          }
+          if (!s.noStroke) {
+            const d = strokeOutlineD(s);
+            if (d) body.push(`<path d="${d}" fill="${esc(s.color)}" fill-rule="nonzero"${op}/>`);
+          }
+        }
+      }
+    } else if (planeHasArt(plane)) {
+      body.push(`<image x="0" y="0" width="${W}" height="${H}" `
+        + `image-rendering="pixelated" xlink:href="${plane.canvas.toDataURL('image/png')}"/>`);
+    }
+    if (!body.length) return; // an empty layer earns no group
+    parts.push(attrs.length ? `<g ${attrs.join(' ')}>` : '<g>', ...body, '</g>');
+  });
+  parts.push('</svg>');
+  return parts.join('\n');
+}
+
+/** '#rrggbb' → [r,g,b] in 0..1, PDF's colour range. */
+function pdfRGB(hex) {
+  const [r, g, b] = hexToRGB(hex || '#000000');
+  return [r / 255, g / 255, b / 255];
+}
+
+/**
+ * The shown frame as a print-ready PDF (Phase 12, owner-requested alongside
+ * SVG). Vector layers become real PDF paths — resolution-independent, so it
+ * prints at the press's resolution rather than the canvas's — and raster
+ * layers embed losslessly (JPEG would be smaller, but the project bans lossy
+ * export, and PNG is not a PDF image format).
+ *
+ * Reuses the SVG slice's geometry wholesale: `strokeCenterlineD` /
+ * `strokeOutlineD` produce path data, and `parsePathD` turns it back into
+ * points with handles, which ARE cubic controls — so the conversion into PDF
+ * operators is exact and there is still only one geometry implementation.
+ * The uniform-vs-variable width split is the same as SVG's, for the same
+ * reason: PDF also has a single line width per path.
+ */
+async function exportPDF() {
+  commitFloat();
+  const f = cur();
+  const layers = [];
+  for (let li = 0; li < state.layers.length; li++) {
+    const m = state.layers[li];
+    if (!m.visible) continue;
+    const plane = f.layers[li];
+    if (!plane || !planeHasArt(plane)) continue;
+    if (plane.strokes) {
+      const paths = [];
+      for (const s of plane.strokes) {
+        if (!s.pts.length) continue;
+        const uniform = strokeIsUniform(s);
+        if (uniform) {
+          paths.push({
+            subpaths: parsePathD(strokeCenterlineD(s)),
+            fill: s.fill ? pdfRGB(s.fill) : null,
+            stroke: s.noStroke ? null : pdfRGB(s.color),
+            w: vecRadius(s, s.pts[0][2]) * 2,
+            cap: s.cap || 'round', join: s.join || 'round',
+            dash: s.dash || null, opacity: s.opacity,
+          });
+        } else {
+          // Variable width: the outline becomes a filled path, exactly as in
+          // the SVG export, so the taper survives.
+          if (s.fill) {
+            paths.push({ subpaths: parsePathD(strokeCenterlineD(s)),
+                         fill: pdfRGB(s.fill), stroke: null, opacity: s.opacity });
+          }
+          if (!s.noStroke) {
+            paths.push({ subpaths: parsePathD(strokeOutlineD(s)),
+                         fill: pdfRGB(s.color), stroke: null, opacity: s.opacity });
+          }
+        }
+      }
+      if (paths.length) layers.push({ opacity: m.opacity, blend: m.blend, paths });
+    } else {
+      const img = plane.ctx.getImageData(0, 0, state.width, state.height);
+      const n = state.width * state.height;
+      const rgb = new Uint8Array(n * 3);
+      const alpha = new Uint8Array(n);
+      let anyAlpha = false;
+      for (let i = 0; i < n; i++) {
+        rgb[i * 3] = img.data[i * 4];
+        rgb[i * 3 + 1] = img.data[i * 4 + 1];
+        rgb[i * 3 + 2] = img.data[i * 4 + 2];
+        alpha[i] = img.data[i * 4 + 3];
+        if (alpha[i] !== 255) anyAlpha = true;
+      }
+      layers.push({ opacity: m.opacity, blend: m.blend,
+                    image: { rgb, alpha: anyAlpha ? alpha : null,
+                             w: state.width, h: state.height } });
+    }
+  }
+  if (!layers.length) { alert('Nothing to export — this frame is empty.'); return; }
+  // Real deflate when the platform has it (CompressionStream is a web
+  // standard, not a dependency); otherwise the writer falls back to stored
+  // blocks, which is valid but larger.
+  const deflate = typeof CompressionStream === 'function'
+    ? async (bytes) => new Uint8Array(await new Response(
+        new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate'))
+      ).arrayBuffer())
+    : null;
+  const bytes = await Exporters.encodePDF({ width: state.width, height: state.height, layers },
+                                          deflate);
+  download(`frame${state.frame + 1}-${state.width}x${state.height}.pdf`,
+           new Blob([bytes], { type: 'application/pdf' }));
+}
+
+/** Download the shown frame as .svg. */
+function exportSVG() {
+  commitFloat(); // a floating selection belongs in the exported art
+  const svg = buildSVG();
+  download(`frame${state.frame + 1}-${state.width}x${state.height}.svg`,
+           new Blob([svg], { type: 'image/svg+xml' }));
+}
+
+/* ---- SVG import: document walk ---------------------------------------- */
+
+/** Any CSS colour → '#rrggbb', or null for none/transparent. Uses the canvas
+ *  as the parser so named colours, rgb()/hsl() and 8-digit hex all work
+ *  without a lookup table; alpha is returned separately, since our strokes
+ *  carry opacity as its own field. */
+function svgColor(v) {
+  if (!v) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s || s === 'none' || s === 'transparent' || s.startsWith('url(')) return null;
+  const g = vecScratchCtx();
+  const prev = g.fillStyle;
+  g.fillStyle = '#000000';
+  g.fillStyle = s;
+  const got = g.fillStyle;      // normalized: '#rrggbb' or 'rgba(r, g, b, a)'
+  g.fillStyle = prev;
+  if (typeof got === 'string' && got.startsWith('#')) return { hex: got, a: 1 };
+  const m = /rgba?\(([^)]+)\)/.exec(got || '');
+  if (!m) return null;
+  const p = m[1].split(',').map((x) => parseFloat(x));
+  const hex = '#' + [p[0], p[1], p[2]]
+    .map((c) => Math.max(0, Math.min(255, Math.round(c))).toString(16).padStart(2, '0')).join('');
+  return { hex, a: p.length > 3 && isFinite(p[3]) ? p[3] : 1 };
+}
+
+/** Style for one element: inline `style` wins over the presentation
+ *  attribute, and anything unset inherits from the parent chain. */
+function svgStyleOf(el, parent) {
+  const inline = {};
+  for (const decl of (el.getAttribute('style') || '').split(';')) {
+    const k = decl.indexOf(':');
+    if (k > 0) inline[decl.slice(0, k).trim().toLowerCase()] = decl.slice(k + 1).trim();
+  }
+  const get = (name) => {
+    if (inline[name] !== undefined) return inline[name];
+    if (el.hasAttribute(name)) return el.getAttribute(name);
+    return parent[name];
+  };
+  return {
+    fill: get('fill'),
+    stroke: get('stroke'),
+    'stroke-width': get('stroke-width'),
+    'stroke-linecap': get('stroke-linecap'),
+    'stroke-linejoin': get('stroke-linejoin'),
+    'stroke-dasharray': get('stroke-dasharray'),
+    'fill-opacity': get('fill-opacity'),
+    'stroke-opacity': get('stroke-opacity'),
+    // `opacity` is NOT inherited in SVG (it composites a group), but treating
+    // it as inherited is the closest we get without real group compositing.
+    opacity: get('opacity'),
+  };
+}
+
+/**
+ * Import an SVG document as a NEW VECTOR LAYER on the current frame.
+ *
+ * Deliberately additive rather than replacing the project the way image
+ * import does: bringing artwork in from Illustrator/Affinity/Figma means
+ * putting it ALONGSIDE your work, and a vector import that wiped the document
+ * would be a trap. Scaled to fit the canvas, preserving aspect.
+ *
+ * Unsupported constructs are collected and REPORTED rather than dropped in
+ * silence — a half-imported drawing that says nothing is worse than one that
+ * tells you the text and gradients did not come through.
+ */
+function importSVGText(text, label) {
+  if (state.mode !== 'free') {
+    alert('SVG import needs a freeform project — vector layers only exist there.\n\n'
+        + 'Create a freeform project first (File ▸ New ▸ Freeform).');
+    return false;
+  }
+  const doc = new DOMParser().parseFromString(String(text), 'image/svg+xml');
+  if (doc.querySelector('parsererror') || !doc.documentElement
+      || doc.documentElement.tagName.toLowerCase() !== 'svg') {
+    alert('That file is not valid SVG.');
+    return false;
+  }
+  const root = doc.documentElement;
+  // User-space extent: viewBox wins, else width/height, else our canvas.
+  const vb = (root.getAttribute('viewBox') || '').match(/[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g);
+  const num = (v, d) => { const f = parseFloat(v); return isFinite(f) && f > 0 ? f : d; };
+  let vx = 0, vy = 0, vw, vh;
+  if (vb && vb.length >= 4) {
+    vx = +vb[0]; vy = +vb[1]; vw = +vb[2]; vh = +vb[3];
+  } else {
+    vw = num(root.getAttribute('width'), state.width);
+    vh = num(root.getAttribute('height'), state.height);
+  }
+  if (!(vw > 0) || !(vh > 0)) { vw = state.width; vh = state.height; }
+  const k = Math.min(state.width / vw, state.height / vh);
+  const rootMat = [k, 0, 0, k,
+                   -vx * k + (state.width - vw * k) / 2,
+                   -vy * k + (state.height - vh * k) / 2];
+
+  const strokes = [];
+  const skipped = new Set();
+  const SKIP_TAGS = { text: 'text', tspan: 'text', image: 'embedded images',
+                      use: '<use> references', filter: 'filters', mask: 'masks',
+                      clippath: 'clip paths', lineargradient: 'gradients',
+                      radialgradient: 'gradients', pattern: 'patterns' };
+  const QUIET = new Set(['defs', 'title', 'desc', 'metadata', 'style', 'stop', 'script']);
+
+  const walk = (el, mat, style) => {
+    for (const child of Array.from(el.children)) {
+      const tag = child.tagName.toLowerCase();
+      if (QUIET.has(tag)) continue;
+      if (SKIP_TAGS[tag]) { skipped.add(SKIP_TAGS[tag]); continue; }
+      const m = svgMatMul(mat, parseSvgTransform(child.getAttribute('transform')));
+      const st = svgStyleOf(child, style);
+      if (tag === 'g' || tag === 'svg' || tag === 'a' || tag === 'switch') {
+        walk(child, m, st);
+        continue;
+      }
+      const subs = tag === 'path'
+        ? parsePathD(child.getAttribute('d'))
+        : svgShapeSubpaths(child);
+      if (subs === null) { skipped.add(`<${tag}>`); continue; }
+      for (const sp of subs) emit(sp, m, st);
+    }
+  };
+
+  const emit = (sp, m, st) => {
+    if (!sp.pts.length) return;
+    // Points transform as points; handles transform as VECTORS (the same rule
+    // xformStroke follows) — rotate and scale, never translate.
+    const pts = sp.pts.map((p) => {
+      const q = [m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5], p[2]];
+      for (const side of [3, 4]) {
+        const h = p.length > side ? p[side] : null;
+        if (h) {
+          if (q.length < 5) { q[3] = q[3] || null; q[4] = q[4] || null; }
+          q[side] = [m[0] * h[0] + m[2] * h[1], m[1] * h[0] + m[3] * h[1]];
+        }
+      }
+      return q;
+    });
+    // SVG defaults: fill is BLACK, stroke is none. A bare <path d=".."/> is a
+    // filled black shape, and getting that wrong makes imports vanish.
+    const fillRaw = st.fill === undefined ? 'black' : st.fill;
+    const fill = svgColor(fillRaw);
+    const stroke = svgColor(st.stroke);
+    if (!fill && !stroke) return; // invisible either way
+    // Non-uniform scale can't be expressed by one width; sqrt(|det|) is the
+    // standard compromise (it preserves area).
+    const scale = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])) || 1;
+    const swRaw = parseFloat(st['stroke-width']);
+    const w = Math.max(0.1, (isFinite(swRaw) ? swRaw : 1) * scale);
+    const dashNums = (st['stroke-dasharray'] || '').match(/[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g);
+    const dash = dashNums && dashNums.length
+      ? [Math.max(0.1, +dashNums[0] * scale), Math.max(0, (+dashNums[1] || +dashNums[0]) * scale)]
+      : null;
+    const grpA = parseFloat(st.opacity);
+    const strokeA = parseFloat(st['stroke-opacity']);
+    const fillA = parseFloat(st['fill-opacity']);
+    // One opacity per stroke in our model, so fold the SVG's separate
+    // fill/stroke alphas into it, preferring whichever channel is drawn.
+    const chan = stroke ? (isFinite(strokeA) ? strokeA : 1) * stroke.a
+                        : (isFinite(fillA) ? fillA : 1) * (fill ? fill.a : 1);
+    const opacity = clamp((isFinite(grpA) ? grpA : 1) * chan, 0, 1);
+    if (opacity <= 0.002) return;
+    const capRaw = String(st['stroke-linecap'] || 'butt').toLowerCase();
+    const joinRaw = String(st['stroke-linejoin'] || 'miter').toLowerCase();
+    strokes.push({
+      id: mintStrokeId(),
+      color: stroke ? stroke.hex : (fill ? fill.hex : '#000000'),
+      w, opacity, pen: 'marker',
+      cap: capRaw === 'round' || capRaw === 'square' ? capRaw : 'butt',
+      join: joinRaw === 'round' || joinRaw === 'bevel' ? joinRaw : 'miter',
+      dash,
+      curve: false,        // handles carry the curvature; no auto-spline
+      closed: !!sp.closed,
+      fill: fill ? fill.hex : null,
+      noStroke: !stroke,
+      pts,
+    });
+  };
+
+  walk(root, rootMat, {});
+  if (!strokes.length) {
+    alert('Nothing importable in that SVG.'
+      + (skipped.size ? `\n\nUnsupported: ${[...skipped].join(', ')}.` : ''));
+    return false;
+  }
+  commitFloat();
+  if (state.layers.length >= MAX_LAYERS) {
+    alert('This project is at the layer cap, so the SVG has nowhere to go.');
+    return false;
+  }
+  insertLayer({ name: (label || 'SVG').slice(0, 24), visible: true, opacity: 1,
+                blend: 'normal', alphaLock: false, kind: 'vector' });
+  const plane = curLayer();
+  plane.strokes = strokes;
+  plane.touched = true;
+  renderVectorPlane(plane);
+  recomposite(cur());
+  // Undoable as a stroke-list swap (layer add/remove itself is not undoable
+  // anywhere in the app, so undo empties the layer rather than removing it).
+  pushFreeUndo({ frame: cur(), plane, vec: { op: 'list', before: [], after: strokes.slice() } });
+  updateThumb(cur());
+  refreshLayerThumbs();
+  updateUI();
+  render();
+  flashHint(`Imported ${strokes.length} path${strokes.length === 1 ? '' : 's'}`
+    + (skipped.size ? ` — skipped ${[...skipped].join(', ')}` : '') + '.');
+  return true;
+}
+
+/**
  * Compose all frames onto one canvas at native resolution and download it.
  * Layout comes from the "Cols" input: 0/blank = every frame in one horizontal
  * strip (the default game-engine-friendly layout), N = grid N frames wide.
@@ -5212,10 +7328,25 @@ $('btn-export-zip').addEventListener('click', (e) => runExport(e.currentTarget, 
     new Blob([Exporters.encodeZIP(files)], { type: 'application/zip' }));
 }));
 
+$('btn-export-svg').addEventListener('click', () => exportSVG());
+$('btn-export-pdf').addEventListener('click', (e) => runExport(e.currentTarget, exportPDF));
+
 /** Serialize the whole project (frames, layers, palette, size, fps) and download it. */
 // Coords round to 1/100 art px on save — invisible, and it keeps stroke JSON
 // from carrying 15 digits of pointer noise per point.
 const r2 = (v) => Math.round(v * 100) / 100;
+
+/** One handle → its saved form (rounded [dx,dy]) or null. */
+const rH = (h) => (h ? [r2(h[0]), r2(h[1])] : null);
+
+/** One point → its saved form. Stays [x,y,w] — byte-identical to pre-Phase-12
+ *  files — and only widens to [x,y,w,hIn,hOut] where the artist actually gave
+ *  it a handle (the 9a non-default-only rule). */
+function serializePt(p) {
+  const base = [r2(p[0]), r2(p[1]), r2(p[2])];
+  if (p.length > 3 && (p[3] || p[4])) base.push(rH(p[3]), rH(p[4]));
+  return base;
+}
 
 /**
  * One vector stroke → its saved form. Shared by the manual .json save and by
@@ -5228,12 +7359,19 @@ const r2 = (v) => Math.round(v * 100) / 100;
  */
 function serializeStroke(s) {
   return {
+    // id carries stroke identity to disk so the format already has it for 10d
+    // (no future migration). closed rides along non-default, like the styles.
+    ...(s.id ? { id: s.id } : {}),
     color: s.color, w: s.w, opacity: s.opacity, pen: s.pen,
     ...(s.cap && s.cap !== 'round' ? { cap: s.cap } : {}),
     ...(s.join && s.join !== 'round' ? { join: s.join } : {}),
     ...(s.dash ? { dash: s.dash.map(r2) } : {}),
     ...(s.curve ? { curve: 1 } : {}),
-    pts: s.pts.map((p) => [r2(p[0]), r2(p[1]), r2(p[2])]),
+    ...(s.closed ? { closed: 1 } : {}),
+    ...(s.fill ? { fill: s.fill } : {}),
+    ...(s.noStroke ? { noStroke: 1 } : {}),
+    ...(s.shape ? { shape: s.shape } : {}),
+    pts: s.pts.map(serializePt),
   };
 }
 
@@ -5326,6 +7464,14 @@ async function parseProject(text) {
     // range (a v4-with-swell file opened in the OLD app clamps back to ≤1 —
     // graceful: taper survives, only the bulge is lost — so no version bump).
     const marker = s.pen === 'marker';
+    // A saved handle is an optional [dx,dy] offset (Phase 12) at p[3]/p[4]; a
+    // malformed one drops to null (keep the anchor) rather than voiding the
+    // stroke, matching the width/pixel leniency policy.
+    const cleanH = (v) => {
+      if (!Array.isArray(v)) return null;
+      const dx = +v[0], dy = +v[1];
+      return Number.isFinite(dx) && Number.isFinite(dy) ? [dx, dy] : null;
+    };
     const pts = [];
     for (const p of s.pts) {
       const x = Array.isArray(p) ? +p[0] : NaN;
@@ -5333,7 +7479,10 @@ async function parseProject(text) {
       if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
       const pr = +p[2];
       const m = marker ? 1 : (Number.isFinite(pr) ? clamp(pr, WIDTH_MIN, WIDTH_MAX) : 1);
-      pts.push([x, y, m]);
+      const hIn = p.length > 3 ? cleanH(p[3]) : null;
+      const hOut = p.length > 4 ? cleanH(p[4]) : null;
+      if (hIn || hOut) pts.push([x, y, m, hIn, hOut]);
+      else pts.push([x, y, m]);
     }
     // Style fields (9a) are additive: absent → the round/round/null defaults,
     // so v3-and-older files (and unstyled v4 strokes) read exactly as before.
@@ -5345,7 +7494,30 @@ async function parseProject(text) {
         dash = [dn, Number.isFinite(gp) && gp >= 0 ? gp : 0];
       }
     }
+    // Shape metadata (12b): a live primitive; validate, then regen its pts from
+    // the params so the two can never disagree (a RELEASED shape has no `shape`,
+    // so its edited pts are kept). A malformed shape is dropped, keeping the pts.
+    const KINDS = { rect: 1, ellipse: 1, polygon: 1, star: 1 };
+    let shape = null;
+    const sh = s.shape;
+    if (sh && typeof sh === 'object' && KINDS[sh.kind] &&
+        [sh.x, sh.y, sh.w, sh.h].every((v) => Number.isFinite(+v)) && +sh.w > 0 && +sh.h > 0) {
+      shape = { kind: sh.kind, x: +sh.x, y: +sh.y, w: +sh.w, h: +sh.h };
+      if (sh.kind === 'rect') shape.r = Number.isFinite(+sh.r) ? Math.max(0, +sh.r) : 0;
+      if (sh.kind === 'polygon' || sh.kind === 'star') {
+        shape.rot = Number.isFinite(+sh.rot) ? +sh.rot : -Math.PI / 2;
+      }
+      if (sh.kind === 'polygon') shape.sides = Math.max(3, Math.round(+sh.sides || 5));
+      if (sh.kind === 'star') {
+        shape.points = Math.max(3, Math.round(+sh.points || 5));
+        shape.inner = clamp(Number.isFinite(+sh.inner) ? +sh.inner : 0.5, 0.05, 0.95);
+      }
+    }
     return {
+      // Preserve a saved id (the direct wire path in 10d deserializes through
+      // here without rebuilding a plane); mint if absent. makePlane re-mints on
+      // the file-load path, so loaded projects get session-fresh unique ids.
+      id: s.id ? String(s.id) : mintStrokeId(),
       color: isColor(s.color) ? s.color.toLowerCase() : '#000000',
       w: clamp(+s.w || 1, 1, MAX_BRUSH_FREE),
       opacity: typeof s.opacity === 'number' ? clamp(s.opacity, 0.01, 1) : 1,
@@ -5354,7 +7526,13 @@ async function parseProject(text) {
       join: s.join === 'miter' || s.join === 'bevel' ? s.join : 'round',
       dash,
       curve: s.curve === 1 || s.curve === true,
-      pts,
+      closed: s.closed === 1 || s.closed === true,
+      // Fill (12b): a colour, else null. noStroke only survives WITH a fill —
+      // a shape with neither fill nor outline would be invisible.
+      fill: isColor(s.fill) ? s.fill.toLowerCase() : null,
+      noStroke: (s.noStroke === 1 || s.noStroke === true) && isColor(s.fill),
+      ...(shape ? { shape } : {}),
+      pts: shape ? shapePts(shape) : pts,
     };
   };
   // A saved vector plane is { strokes: [...] } — returns the cleaned strokes
@@ -5840,6 +8018,12 @@ $('inp-file').addEventListener('change', async (e) => {
   if (!file) return;
   if (/^image\/(png|jpeg)$/.test(file.type) || /\.(png|jpe?g)$/i.test(file.name)) {
     importImage(file);
+    return;
+  }
+  // SVG is vector: it lands as a new layer ALONGSIDE the current work rather
+  // than replacing the project the way a raster import does.
+  if (file.type === 'image/svg+xml' || /\.svg$/i.test(file.name)) {
+    importSVGText(await file.text(), file.name.replace(/\.svg$/i, ''));
     return;
   }
   const proj = await parseProject(await file.text());
@@ -6602,18 +8786,19 @@ function wireVecStyle() {
 
 /** Apply a taper/swell preset to the selected strokes. */
 function setWidthProfile(kind) {
-  editSelectedStrokes('wprofile', (s) => applyWidthProfile(s, kind));
+  // Per-point width edits don't survive a regen, so a taper releases the shape.
+  editSelectedStrokes('wprofile', (s) => { releaseShape(s); applyWidthProfile(s, kind); });
 }
 
 /** Smooth the selected strokes' paths (one moving-average pass per click). */
 function smoothSelectedStrokes() {
-  editSelectedStrokes('smooth', (s) => { s.pts = smoothStroke(s.pts); });
+  editSelectedStrokes('smooth', (s) => { releaseShape(s); s.pts = smoothStroke(s.pts); });
 }
 
 /** Simplify the selected strokes at the tolerance in the Tol box. */
 function simplifySelectedStrokes() {
   const tol = clamp(parseFloat($('inp-vec-tol').value) || 2, 0.1, 100);
-  editSelectedStrokes('simplify', (s) => { s.pts = simplifyStroke(s.pts, tol); });
+  editSelectedStrokes('simplify', (s) => { releaseShape(s); s.pts = simplifyStroke(s.pts, tol); });
 }
 
 /** Toggle smooth-curve rendering: flips the new-stroke default AND sets it on
@@ -6642,6 +8827,38 @@ function wireWidthControls() {
   $('btn-vec-smooth').addEventListener('click', smoothSelectedStrokes);
   $('btn-vec-simplify').addEventListener('click', simplifySelectedStrokes);
   $('btn-vec-curve').addEventListener('click', toggleVecCurve);
+}
+
+/* --- Fill controls (12b): a fill is a per-shape property, applied to the
+ * SELECTED strokes only (no new-stroke default — drawn paths start unfilled),
+ * so these route straight through editSelectedStrokes with no vecStyle. --- */
+
+/** Set (or clear, with null) the fill colour of the selected strokes. */
+function setVecFill(color) {
+  if (!(selection && selection.strokes)) return;
+  editSelectedStrokes('fill', (s) => { s.fill = color; });
+  syncSelectBar();
+}
+
+/** Toggle the outline on the selection. A shape with neither fill nor outline
+ *  would be invisible, so turning the outline OFF requires a fill. */
+function toggleVecStroke() {
+  if (!(selection && selection.strokes)) return;
+  const one = selection.strokes.length === 1 ? selection.strokes[0] : null;
+  const off = one ? !one.noStroke : true; // toggle the single stroke; multi -> off
+  if (off && one && !one.fill) {
+    flashHint('Add a fill first — a shape needs a fill or an outline.');
+    return;
+  }
+  editSelectedStrokes('nostroke', (s) => { if (off && !s.fill) return; s.noStroke = off; });
+  syncSelectBar();
+}
+
+function wireVecFill() {
+  $('inp-fill').addEventListener('input', (e) => setVecFill(e.target.value));
+  $('btn-vec-fill').addEventListener('click', () => $('inp-fill').click());
+  $('btn-vec-fill-none').addEventListener('click', () => setVecFill(null));
+  $('btn-vec-stroke').addEventListener('click', toggleVecStroke);
 }
 
 /** Rebuild the library list (small enough that full rebuilds are simplest). */
@@ -6767,6 +8984,7 @@ function selectTool(t) {
     flashHint('Smudge is a freeform-mode tool.');
     return;
   }
+  if (t !== 'pen') penCommit(); // leaving the Pen lands its in-progress path
   if (t !== 'select' && (selection || floating)) {
     commitFloat(); // leaving the Select tool lands and drops the selection
     selection = null;
@@ -6790,6 +9008,7 @@ function selectTool(t) {
   $('opacity-box').hidden = t === 'smudge';
   $('strength-box').hidden = t !== 'smudge';
   $('st-tool').textContent = toolLabel();
+  updateShapeBox(); // the shape controls follow the Shape tool
 }
 
 document.querySelectorAll('#toolbar .tool').forEach((b) => {
@@ -6979,7 +9198,8 @@ document.addEventListener('click', (e) => {
   if (!settingsMenu.hidden && !settingsMenu.contains(e.target)) settingsMenu.hidden = true;
 });
 for (const id of ['btn-new', 'btn-save', 'btn-load', 'btn-export',
-                  'btn-export-gif', 'btn-export-apng', 'btn-export-video', 'btn-export-zip']) {
+                  'btn-export-gif', 'btn-export-apng', 'btn-export-video', 'btn-export-zip',
+                  'btn-export-svg', 'btn-export-pdf']) {
   $(id).addEventListener('click', () => { fileMenu.hidden = true; });
 }
 
@@ -7338,6 +9558,9 @@ syncBrushUI();
 loadVecStyle();   // restore the pending stroke style (caps/joins/dashes)
 wireVecStyle();
 wireWidthControls();
+wireVecFill();
+wireShapeControls();
+loadShapeStyle();
 syncVecStyleUI();
 loadStoredBrushes(); // async; re-renders the list when imports arrive
 loadStoredPalettes(); // user palettes + Recents + the active row
@@ -7426,7 +9649,12 @@ if (typeof window.__ssmTest === 'function') {
                      rotVec, boxHandles, pointInBox, boxBounds, scaleBox, resizeCursor, pinchView,
                      crispXY, strokeBounds, cloneStroke, vecRadius, dashRuns,
                      applyWidthProfile, vecSeed, smoothStroke, simplifyStroke,
-                     vecCurvePoints,
+                     vecCurvePoints, clonePt, mintStrokeId, strokeHasHandles,
+                     cubicAt, splitCubic, subCubic, segCtrl, bezierCurvePoints, serializePt,
+                     setPtHandle, insertAnchor, locateOnStroke, pointInPoly,
+                     shapePts, regenShape, releaseShape,
+                     pathRecorder, strokeCenterlineD, strokeOutlineD, strokeIsUniform,
+                     parsePathD, svgArcToCubics,
                      strokeHit, vecDotIndices, makeVecSelection,
                      vecBoxXform, xformStroke, splitStroke, rgbToCmyk, proofRgb,
                      rulerStep, parseHexPalette, parseGplPalette, paletteToHexFile, movePalette });

@@ -463,5 +463,270 @@ function addPngDpi(png, dpi) {
   return out;
 }
 
-return { encodeGIF, encodeAPNG, encodeZIP, recordVideo, addPngDpi };
+/* ======================================================================
+ * PDF (Phase 12 — print-ready vector export)
+ * ====================================================================
+ * A minimal writer, because the no-dependencies rule means no PDF library.
+ * That is affordable here only because PDF's path model is nearly identical
+ * to the one we already have: `m`/`l`/`c`/`h` with `f`/`S`/`B`, so the
+ * geometry work was already done by the SVG slice. What PDF adds is the file
+ * scaffolding (objects, xref, streams) and its own way of expressing opacity
+ * and blending.
+ *
+ * Design notes worth keeping:
+ *  - PDF's origin is BOTTOM-left with y up; ours is top-left with y down. One
+ *    `1 0 0 -1 0 H cm` at the top of the page content flips the whole space,
+ *    so every coordinate below is written in plain art units.
+ *  - Each layer becomes a Form XObject with a TRANSPARENCY GROUP, invoked
+ *    under an ExtGState carrying the layer's alpha and blend mode. That is
+ *    the same correctness point the crisp compositor's layer buffer makes:
+ *    applying a layer's alpha per-path would blend intra-layer overlaps
+ *    twice, which is not what the layer stack means.
+ *  - Raster layers embed as /FlateDecode DeviceRGB with a grayscale /SMask
+ *    for alpha. Lossless: JPEG would be smaller but the project bans lossy
+ *    export, and PNG is not a PDF image format.
+ */
+
+/** Blend names: ours are CSS-style, PDF wants its own capitalized set. */
+const PDF_BLEND = {
+  normal: 'Normal', multiply: 'Multiply', screen: 'Screen', overlay: 'Overlay',
+  darken: 'Darken', lighten: 'Lighten', difference: 'Difference',
+  exclusion: 'Exclusion', 'hard-light': 'HardLight', 'soft-light': 'SoftLight',
+  'color-dodge': 'ColorDodge', 'color-burn': 'ColorBurn',
+};
+
+/** zlib (RFC1950) wrapper using STORED deflate blocks — no compression, but
+ *  valid and lossless, and it needs no deflate implementation. Used only when
+ *  the platform has no CompressionStream to do the real thing. */
+function zlibStored(data) {
+  const out = makeBuf();
+  out.u8(0x78); out.u8(0x01);              // CMF/FLG for a 32K window, no dict
+  let i = 0;
+  do {
+    const len = Math.min(65535, data.length - i);
+    out.u8(i + len >= data.length ? 1 : 0); // BFINAL, BTYPE=00 (stored)
+    out.u8(len & 255); out.u8((len >> 8) & 255);
+    out.u8(~len & 255); out.u8((~len >> 8) & 255);
+    out.bytes(data.subarray(i, i + len));
+    i += len;
+  } while (i < data.length);
+  let a = 1, b = 0;                         // Adler-32
+  for (let k = 0; k < data.length; k++) { a = (a + data[k]) % 65521; b = (b + a) % 65521; }
+  out.u32be((((b << 16) >>> 0) | a) >>> 0);
+  return out.done();
+}
+
+/** Emit one path's subpaths as PDF path operators. Points carry optional
+ *  handles (`hIn`/`hOut` relative offsets), which ARE the cubic controls, so
+ *  the conversion is exact — no flattening. */
+function pdfPathOps(subpaths, r) {
+  let s = '';
+  for (const sp of subpaths) {
+    const p = sp.pts;
+    if (!p || p.length === 0) continue;
+    s += `${r(p[0][0])} ${r(p[0][1])} m\n`;
+    const seg = (a, b) => {
+      const hOut = a.length > 4 ? a[4] : null;
+      const hIn = b.length > 3 ? b[3] : null;
+      if (hOut || hIn) {
+        const c1x = a[0] + (hOut ? hOut[0] : 0), c1y = a[1] + (hOut ? hOut[1] : 0);
+        const c2x = b[0] + (hIn ? hIn[0] : 0), c2y = b[1] + (hIn ? hIn[1] : 0);
+        s += `${r(c1x)} ${r(c1y)} ${r(c2x)} ${r(c2y)} ${r(b[0])} ${r(b[1])} c\n`;
+      } else {
+        s += `${r(b[0])} ${r(b[1])} l\n`;
+      }
+    };
+    for (let i = 1; i < p.length; i++) seg(p[i - 1], p[i]);
+    if (sp.closed) {
+      if (p.length > 2) seg(p[p.length - 1], p[0]); // the seam may be curved
+      s += 'h\n';
+    }
+  }
+  return s;
+}
+
+/** Build one layer's content stream (art coordinates, y down). */
+function pdfLayerContent(layer, r) {
+  let s = '';
+  for (const it of layer.paths || []) {
+    const hasFill = !!it.fill, hasStroke = !!it.stroke;
+    if (!hasFill && !hasStroke) continue;
+    s += 'q\n';
+    if (it.opacity !== undefined && it.opacity < 1) s += `/GA${it.gsAlpha} gs\n`;
+    if (hasFill) {
+      const c = it.fill;
+      s += `${r(c[0])} ${r(c[1])} ${r(c[2])} rg\n`;
+    }
+    if (hasStroke) {
+      const c = it.stroke;
+      s += `${r(c[0])} ${r(c[1])} ${r(c[2])} RG\n`;
+      s += `${r(it.w)} w\n`;
+      s += `${it.cap === 'round' ? 1 : it.cap === 'square' ? 2 : 0} J\n`;
+      s += `${it.join === 'round' ? 1 : it.join === 'bevel' ? 2 : 0} j\n`;
+      s += it.dash && it.dash[0] > 0
+        ? `[${r(it.dash[0])} ${r(it.dash[1] || 0)}] 0 d\n` : '[] 0 d\n';
+    }
+    s += pdfPathOps(it.subpaths, r);
+    s += hasFill && hasStroke ? 'B\n' : hasFill ? 'f\n' : 'S\n';
+    s += 'Q\n';
+  }
+  return s;
+}
+
+/**
+ * Assemble a one-page PDF. `doc` is
+ *   { width, height, layers: [ { opacity, blend, paths[] } | { opacity, blend, image } ] }
+ * where a path item is { subpaths, fill:[r,g,b]|null, stroke:[r,g,b]|null, w,
+ * cap, join, dash, opacity } with colours 0..1, and an image is
+ * { rgb: Uint8Array(w*h*3), alpha: Uint8Array(w*h)|null, w, h }.
+ * `deflate` is an optional async (bytes) => zlib bytes; without it, streams
+ * are stored uncompressed (valid, just larger).
+ */
+async function encodePDF(doc, deflate) {
+  const W = doc.width, H = doc.height;
+  const r = (v) => {
+    const n = Math.round((+v || 0) * 1000) / 1000;
+    return Object.is(n, -0) ? '0' : String(n);
+  };
+  const enc = (s) => {
+    const b = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255;
+    return b;
+  };
+  const zip = async (bytes) => {
+    if (deflate) { try { return { data: await deflate(bytes), filter: '/FlateDecode' }; } catch { /* fall through */ } }
+    return { data: zlibStored(bytes), filter: '/FlateDecode' };
+  };
+
+  const objs = [];                     // 1-based; objs[i] = bytes of object i+1
+  const add = (bytes) => { objs.push(bytes); return objs.length; };
+  const addDict = (s) => add(enc(s));
+
+  // Reserve 1..3 for catalog/pages/page so the page can reference forms later.
+  const CATALOG = add(null), PAGES = add(null), PAGE = add(null), CONTENT = add(null);
+
+  const gsList = [];                   // ExtGState dicts, deduped by key
+  const gsKey = new Map();
+  const needGS = (alpha, blend) => {
+    const key = `${alpha}|${blend}`;
+    if (gsKey.has(key)) return gsKey.get(key);
+    const idx = gsList.length;
+    gsList.push(`<< /Type /ExtGState /ca ${r(alpha)} /CA ${r(alpha)} `
+      + `/BM /${PDF_BLEND[blend] || 'Normal'} >>`);
+    gsKey.set(key, idx);
+    return idx;
+  };
+
+  // PASS 1 — build every layer's content stream and its image objects. No
+  // form objects yet: a form's /Resources must list the ExtGStates its paths
+  // reference, and that list isn't final until all layers have been walked.
+  // (Writing the forms first and string-patching their dictionaries
+  // afterwards was the first attempt; building in dependency order is the
+  // version that doesn't rely on a fragile substring replace.)
+  const pending = [];
+  for (const layer of doc.layers) {
+    let stream, imgRef = null;
+    if (layer.image) {
+      const im = layer.image;
+      const rgbZ = await zip(im.rgb);
+      let smaskRef = null;
+      if (im.alpha) {
+        const aZ = await zip(im.alpha);
+        smaskRef = add(concatBytes(enc(
+          `<< /Type /XObject /Subtype /Image /Width ${im.w} /Height ${im.h} `
+          + `/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter ${aZ.filter} `
+          + `/Length ${aZ.data.length} >>\nstream\n`), aZ.data, enc('\nendstream')));
+      }
+      const iObj = add(concatBytes(enc(
+        `<< /Type /XObject /Subtype /Image /Width ${im.w} /Height ${im.h} `
+        + `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter ${rgbZ.filter} `
+        + (smaskRef ? `/SMask ${smaskRef} 0 R ` : '')
+        + `/Length ${rgbZ.data.length} >>\nstream\n`), rgbZ.data, enc('\nendstream')));
+      imgRef = { name: `Im${pending.length}`, obj: iObj };
+      // A PDF image fills the unit square with its FIRST ROW at the top of
+      // that square — which is upside down once the page space is y-down.
+      stream = `q ${r(W)} 0 0 ${r(-H)} 0 ${r(H)} cm /${imgRef.name} Do Q\n`;
+    } else {
+      for (const it of layer.paths || []) {
+        if (it.opacity !== undefined && it.opacity < 1) it.gsAlpha = needGS(it.opacity, 'normal');
+      }
+      stream = pdfLayerContent(layer, r);
+    }
+    if (!stream.trim()) continue;
+    pending.push({ stream, imgRef, gs: needGS(layer.opacity === undefined ? 1 : layer.opacity,
+                                              layer.blend || 'normal') });
+  }
+
+  // PASS 2 — ExtGStates, now that every alpha/blend pair is known.
+  const gsObjs = gsList.map((d) => addDict(d));
+  const gsResStr = gsObjs.map((o, i) => `/GA${i} ${o} 0 R`).join(' ');
+
+  // PASS 3 — one Form XObject per layer, with correct resources.
+  const forms = [];
+  for (const p of pending) {
+    const z = await zip(enc(p.stream));
+    const name = `Fm${forms.length}`;
+    const obj = add(concatBytes(enc(
+      `<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 ${r(W)} ${r(H)}] `
+      + `/Group << /S /Transparency /CS /DeviceRGB /I true >> `
+      + `/Resources << /ExtGState << ${gsResStr} >> `
+      + (p.imgRef ? `/XObject << /${p.imgRef.name} ${p.imgRef.obj} 0 R >> ` : '')
+      + `>> /Filter ${z.filter} /Length ${z.data.length} >>\nstream\n`),
+      z.data, enc('\nendstream')));
+    forms.push({ name, obj, gs: p.gs });
+  }
+
+  // Page content: flip into art space (top-left origin, y down), then invoke
+  // each layer form under its opacity/blend state.
+  let page = `q 1 0 0 -1 0 ${r(H)} cm\n`;
+  for (const f of forms) page += `q /GA${f.gs} gs /${f.name} Do Q\n`;
+  page += 'Q\n';
+  const pz = await zip(enc(page));
+  objs[CONTENT - 1] = concatBytes(
+    enc(`<< /Filter ${pz.filter} /Length ${pz.data.length} >>\nstream\n`),
+    pz.data, enc('\nendstream'));
+
+  objs[CATALOG - 1] = enc(`<< /Type /Catalog /Pages ${PAGES} 0 R >>`);
+  objs[PAGES - 1] = enc(`<< /Type /Pages /Kids [${PAGE} 0 R] /Count 1 >>`);
+  objs[PAGE - 1] = enc(
+    `<< /Type /Page /Parent ${PAGES} 0 R /MediaBox [0 0 ${r(W)} ${r(H)}] `
+    + `/Group << /S /Transparency /CS /DeviceRGB /I true >> `
+    + `/Resources << /ExtGState << ${gsResStr} >> /XObject << `
+    + forms.map((f) => `/${f.name} ${f.obj} 0 R`).join(' ')
+    + ` >> >> /Contents ${CONTENT} 0 R >>`);
+
+  // Serialize with a cross-reference table.
+  const out = makeBuf();
+  out.ascii('%PDF-1.7\n%\xE2\xE3\xCF\xD3\n');
+  const offsets = [];
+  for (let i = 0; i < objs.length; i++) {
+    offsets.push(out.length);
+    out.ascii(`${i + 1} 0 obj\n`);
+    out.bytes(objs[i]);
+    out.ascii('\nendobj\n');
+  }
+  const xref = out.length;
+  out.ascii(`xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`);
+  for (const off of offsets) out.ascii(`${String(off).padStart(10, '0')} 00000 n \n`);
+  out.ascii(`trailer\n<< /Size ${objs.length + 1} /Root ${CATALOG} 0 R >>\n`
+    + `startxref\n${xref}\n%%EOF\n`);
+  return out.done();
+}
+
+function concatBytes(...parts) {
+  let n = 0;
+  for (const p of parts) n += p ? p.length : 0;
+  const out = new Uint8Array(n);
+  let k = 0;
+  for (const p of parts) { if (p) { out.set(p, k); k += p.length; } }
+  return out;
+}
+
+function bytesToStr(b) {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return s;
+}
+
+return { encodeGIF, encodeAPNG, encodeZIP, recordVideo, addPngDpi, encodePDF, zlibStored };
 })();
