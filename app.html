@@ -90,9 +90,11 @@
         <button id="btn-export" class="menu-item" title="All frames as one PNG sprite sheet">Export sheet (PNG)</button>
         <label title="Sheet layout: columns per row (0 = all frames in one strip)">Cols <input id="inp-cols" type="number" min="0" max="99" value="0"></label>
       </div>
+      <button id="btn-export-atlas" class="menu-item" title="Sprite sheet PNG + an Aseprite-style JSON atlas (frame rects + timing) — the pair Phaser, PixiJS and most game engines load directly">Export atlas (PNG + JSON)</button>
       <button id="btn-export-gif" class="menu-item" title="Animated GIF at the preview FPS — plays anywhere, but caps at 256 colors with hard transparency (smooth freeform art will band; APNG is the lossless option)">Export GIF</button>
       <button id="btn-export-apng" class="menu-item" title="Animated PNG at the preview FPS — lossless, keeps transparency">Export APNG</button>
       <button id="btn-export-video" class="menu-item" title="Record to MP4 or WebM (whichever this browser encodes); transparency becomes dark gray">Export video</button>
+      <button id="btn-export-webm" class="menu-item" title="Alpha-preserving WebM (VP9/VP8) — transparency survives for compositing over other footage in a game engine or video editor">Export WebM (alpha)</button>
       <button id="btn-export-zip" class="menu-item" title="Each frame as its own PNG, zipped — for video editors and game engines">Export frames (ZIP)</button>
       <button id="btn-export-svg" class="menu-item" title="This frame as SVG — vector layers stay real editable paths (Illustrator, Affinity, Figma, Inkscape); raster layers ride along as embedded PNGs">Export frame (SVG)</button>
       <button id="btn-export-pdf" class="menu-item" title="This frame as print-ready PDF — vector layers stay real paths, so it prints at the press's resolution rather than the canvas's">Export frame (PDF)</button>
@@ -146,6 +148,7 @@
     <button class="tool" data-tool="pen" title="Pen — click to place anchors, click-drag for smooth curves; click the first anchor to close. Esc or right-click finishes the path. (Vector layers)"><span class="icon">&#10000;</span> Pen</button>
     <button class="tool" data-tool="shape" title="Shapes — drag out a rectangle, ellipse, polygon or star (stay live-editable by their parameters). Shift = square/regular, Alt = from centre. (Vector layers)"><span class="icon">&#9645;</span> Shape</button>
     <button class="tool" data-tool="select" title="Select a rectangle (S) — drag inside it to move; Ctrl+C/X/V copy/cut/paste onto any frame or layer"><span class="icon">&#9633;</span> Select</button>
+    <button class="tool" data-tool="bone" title="Bones (K) — drag on empty canvas to add a bone (it chains from the selected one); drag a bone to swing it, auto-keying the pose; bind a layer to the selected bone with the &#129460; button in the Layers panel. Rigid cutout posing."><span class="icon">&#129460;</span> Bones</button>
     <button class="tool" data-tool="pan" title="Drag the canvas around (H — or hold Space or Enter with any tool)"><span class="icon">&#9995;</span> Pan</button>
     <hr>
     <div id="brush-box" title="Brush &amp; eraser size — [ and ] to adjust">
@@ -364,6 +367,8 @@
         <button id="btn-layer-group" title="Group the current layer or group into a new folder">&#128193;</button>
         <button id="btn-layer-ungroup" title="Ungroup the selected folder (its layers stay)">&#128194;</button>
         <button id="btn-layer-raster" title="Rasterize this vector layer — strokes become plain pixels on every frame (one-way; can't be undone)">&#9998;&#8594;&#9638;</button>
+        <button id="btn-layer-hold" title="Hold / un-hold THIS layer on the current frame. Held = it keeps the previous frame's drawing, so this layer can stay on twos while others move on ones (Shift+H)">&#8801;</button>
+        <button id="btn-layer-bind" title="Bind this layer to the selected bone (Bone tool), so it follows that bone rigidly. Click again to unbind.">&#129460;</button>
       </div>
     </div>
     <!-- The + button's dropdown: which KIND of layer to add (freeform projects
@@ -379,13 +384,72 @@
     </div>
   </div>
 </main>
+<!-- Dope sheet (13a): one row per layer, one column per frame, showing which
+     drawing is exposed where. Collapsed by default — a six-frame sprite
+     animation doesn't need one, and the frame strip stays the compact view.
+     Sits ABOVE the strip so the strip keeps its place at the bottom edge. -->
+<div id="dopesheet" hidden>
+  <!-- Transform bar (Phase 13): the ACTIVE layer's transform on the CURRENT
+       frame. Editing any field writes a key at that frame (auto-key), which is
+       what makes animating feel direct rather than modal. Lives here rather
+       than in the layers panel so every animation control is in one place. -->
+  <div id="dope-toolbar">
+    <span id="xf-target" title="The layer these values animate">&mdash;</span>
+    <label title="Horizontal offset, in pixels">X <input id="inp-xf-x" class="num" type="number" step="1" value="0"></label>
+    <label title="Vertical offset, in pixels">Y <input id="inp-xf-y" class="num" type="number" step="1" value="0"></label>
+    <label title="Rotation about the layer's pivot, in degrees">Rot <input id="inp-xf-rot" class="num" type="number" step="1" value="0"></label>
+    <label title="Scale about the layer's pivot, percent">Scale <input id="inp-xf-scale" class="num" type="number" step="1" value="100"></label>
+    <label title="Animated alpha — multiplies the layer's own opacity">Alpha <input id="inp-xf-alpha" class="num" type="number" min="0" max="100" step="1" value="100"></label>
+    <label title="How this key eases into the NEXT one. Step holds the value until the next key.">Ease
+      <select id="sel-xf-ease">
+        <option value="inout">Ease in-out</option>
+        <option value="linear">Linear</option>
+        <option value="in">Ease in</option>
+        <option value="out">Ease out</option>
+        <option value="step">Step (hold)</option>
+      </select>
+    </label>
+    <button id="btn-xf-key" title="Set a key on this frame, pinning the pose it currently holds">&#9670; Key</button>
+    <button id="btn-xf-unkey" title="Remove this frame's key">&#10005;</button>
+    <button id="btn-xf-clear" title="Remove ALL of this layer's keys — it stops being animated">Clear</button>
+  </div>
+  <!-- Camera bar (Phase 13): a GLOBAL, non-layer pan/zoom/rotate on the CURRENT
+       frame. Editing any field auto-keys it, exactly like the transform bar
+       above; it drives the Camera lane at the top of the sheet, the track that
+       proves the sheet's lanes need not be layers (decision 6). -->
+  <div id="cam-toolbar">
+    <span id="cam-target" title="The global camera — a non-layer pan/zoom/rotate track">Camera</span>
+    <label title="Camera pan, horizontal, in pixels">X <input id="inp-cam-x" class="num" type="number" step="1" value="0"></label>
+    <label title="Camera pan, vertical, in pixels">Y <input id="inp-cam-y" class="num" type="number" step="1" value="0"></label>
+    <label title="Camera zoom, percent — over 100 magnifies and frames a smaller region">Zoom <input id="inp-cam-zoom" class="num" type="number" step="1" value="100"></label>
+    <label title="Camera rotation, in degrees">Rot <input id="inp-cam-rot" class="num" type="number" step="1" value="0"></label>
+    <label title="How this key eases into the NEXT one. Step holds the value until the next key.">Ease
+      <select id="sel-cam-ease">
+        <option value="inout">Ease in-out</option>
+        <option value="linear">Linear</option>
+        <option value="in">Ease in</option>
+        <option value="out">Ease out</option>
+        <option value="step">Step (hold)</option>
+      </select>
+    </label>
+    <button id="btn-cam-key" title="Set a camera key on this frame — starts the camera here if there isn't one yet">&#9670; Key</button>
+    <button id="btn-cam-unkey" title="Remove this frame's camera key">&#10005;</button>
+    <button id="btn-cam-clear" title="Remove the entire camera track">Clear</button>
+  </div>
+  <div id="dope-scroll">
+    <div id="dope-head" class="dope-row"><span class="dope-name">Frame</span><div class="dope-cells" id="dope-nums"></div></div>
+    <div id="dope-body"></div>
+  </div>
+</div>
 <div id="framebar">
   <div class="group">
+    <button id="btn-dope" title="Show the dope sheet — per-layer exposure across every frame, so one layer can hold while another moves">&#9662; Sheet</button>
     <button id="btn-play" title="Play / pause the animation in the canvas (P)">&#9654; Play</button>
     <label class="fps" title="Playback speed, frames per second">FPS <input id="inp-fps" type="number" min="1" max="60" value="8"></label>
   </div>
   <div class="group">
     <button id="btn-frame-add" title="Add blank frame after current (N)">+ Frame</button>
+    <button id="btn-frame-hold" title="Add a HELD frame — every layer keeps its current drawing, so it stays on screen longer. This is how you shoot on twos (Shift+N)">+ Hold</button>
     <button id="btn-frame-dup" title="Duplicate current frame (D)">&#10697; Dup</button>
     <button id="btn-frame-del" title="Delete current frame (Del)">&#128465;</button>
     <button id="btn-frame-left" title="Move frame left">&#9664;</button>

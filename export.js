@@ -371,30 +371,83 @@ function encodeZIP(files) {
 }
 
 /* ======================================================================
+ * Sprite-atlas JSON (Aseprite-compatible) — pairs with the PNG sheet
+ * ==================================================================== */
+
+/**
+ * Build the JSON metadata that accompanies a sprite-sheet PNG, in Aseprite's
+ * "hash" layout — the de-facto game-dev interchange format (Phaser, PixiJS and
+ * most engines read it directly). Pure: no DOM, so it unit-tests in Node.
+ *
+ * The sheet is laid out exactly as exportSheet() draws it — `cols` columns,
+ * frame i at ((i%cols)·w, floor(i/cols)·h) — so the rects here address that
+ * image. Exposure is uniform-rate, so every frame lasts 1000/fps ms; a held
+ * column is still its own frame in the sheet, so it gets its own entry.
+ */
+function atlasJSON({ n, cols, width, height, fps, image, app = 'Enkava' }) {
+  const rows = Math.ceil(n / cols);
+  const duration = Math.round(1000 / fps);
+  const base = image.replace(/\.png$/i, '');
+  const frames = {};
+  for (let i = 0; i < n; i++) {
+    frames[`${base} ${i}.png`] = {
+      frame: { x: (i % cols) * width, y: Math.floor(i / cols) * height, w: width, h: height },
+      rotated: false,
+      trimmed: false,
+      spriteSourceSize: { x: 0, y: 0, w: width, h: height },
+      sourceSize: { w: width, h: height },
+      duration,
+    };
+  }
+  return JSON.stringify({
+    frames,
+    meta: {
+      app, version: '1.0', image,
+      format: 'RGBA8888',
+      size: { w: cols * width, h: rows * height },
+      scale: '1',
+      frameTags: [], layers: [], slices: [],
+    },
+  }, null, 2);
+}
+
+/* ======================================================================
  * Video (MediaRecorder) — browser-only
  * ==================================================================== */
 
 /**
  * Record the animation to a video file by replaying it on an offscreen
  * canvas. Small sprites are integer-upscaled (nearest-neighbor) so codecs
- * have something to work with; transparency becomes a dark background
- * (video has no alpha). Records at least ~1 second by looping short
+ * have something to work with. Records at least ~1 second by looping short
  * animations. Returns {blob, ext} — mp4 where the browser can encode it,
  * webm otherwise.
+ *
+ * `alpha` keeps transparency: it records WebM VP9/VP8 (the only codecs here
+ * that carry an alpha channel) and CLEARS each frame instead of laying down
+ * the dark backdrop — for compositing over other footage in a game engine or
+ * editor. Without it, transparency flattens to a dark background, since MP4 —
+ * and video generally — has none.
  */
-async function recordVideo(canvases, width, height, fps, smooth) {
+async function recordVideo(canvases, width, height, fps, smooth, alpha) {
   if (typeof MediaRecorder === 'undefined') {
     throw new Error('This browser cannot record video.');
   }
-  const candidates = [
-    'video/mp4;codecs=avc1.42E01E',
-    'video/mp4',
-    'video/webm;codecs=vp9',
-    'video/webm;codecs=vp8',
-    'video/webm',
-  ];
+  // MP4/H.264 has no alpha channel, so an alpha export is WebM-only.
+  const candidates = alpha
+    ? ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    : [
+        'video/mp4;codecs=avc1.42E01E',
+        'video/mp4',
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm',
+      ];
   const mime = candidates.find((m) => MediaRecorder.isTypeSupported(m));
-  if (!mime) throw new Error('This browser supports no video format.');
+  if (!mime) {
+    throw new Error(alpha
+      ? 'This browser cannot record alpha (WebM VP8/VP9) video.'
+      : 'This browser supports no video format.');
+  }
 
   const scale = Math.max(1, Math.round(480 / Math.max(width, height)));
   const c = document.createElement('canvas');
@@ -406,8 +459,8 @@ async function recordVideo(canvases, width, height, fps, smooth) {
   // painted art would be an artifact of the export, not the artwork.
   g.imageSmoothingEnabled = !!smooth;
   const drawFrame = (i) => {
-    g.fillStyle = '#202028';
-    g.fillRect(0, 0, c.width, c.height);
+    if (alpha) g.clearRect(0, 0, c.width, c.height);
+    else { g.fillStyle = '#202028'; g.fillRect(0, 0, c.width, c.height); }
     g.drawImage(canvases[i], 0, 0, width * scale, height * scale);
   };
 
@@ -757,5 +810,5 @@ function bytesToStr(b) {
   return s;
 }
 
-return { encodeGIF, encodeAPNG, encodeZIP, recordVideo, addPngDpi, encodePDF, zlibStored };
+return { encodeGIF, encodeAPNG, encodeZIP, recordVideo, addPngDpi, encodePDF, zlibStored, atlasJSON };
 })();

@@ -1375,6 +1375,253 @@ body.mode-free .brush-sub[hidden] { display: none; }
   outline-offset: 1px;
 }
 
+/* ---------- Dope sheet (13a) ----------
+   One row per layer, one column per frame. Lives above the frame strip and is
+   collapsed by default: the strip stays the compact view for simple sprite
+   work. The name column is sticky so it survives horizontal scrolling — a
+   long animation scrolls the cells, never the labels. */
+#dopesheet {
+  flex: 0 0 auto;
+  max-height: 230px;
+  background: var(--panel);
+  border-top: 1px solid var(--panel-edge);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Transform bar: the active layer's transform on the current frame.
+   The camera bar (#cam-toolbar) is the same control strip for the global
+   camera track, so it shares every rule here. */
+#dope-toolbar, #cam-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--panel-edge);
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+#dope-toolbar label, #cam-toolbar label { display: flex; align-items: center; gap: 4px; }
+#dope-toolbar input.num, #cam-toolbar input.num { width: 54px; }
+#dope-toolbar select, #cam-toolbar select { font: inherit; padding: 2px 4px; }
+
+#xf-target, #cam-target {
+  font-weight: 600;
+  color: var(--text);
+  min-width: 70px;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Keyed ON this frame — the same diamond the track uses. */
+#xf-target.keyed::before, #cam-target.keyed::before { content: '◆ '; color: var(--accent); }
+
+/* No camera track yet: the bar still shows, dimmed, so ◆ Key is discoverable. */
+#cam-target.dim { color: var(--text-dim); font-weight: 500; }
+
+#dopesheet[hidden] { display: none; }
+
+#dope-scroll {
+  flex: 1;
+  overflow: auto;
+  /* Room for the sticky name column to sit over. */
+  position: relative;
+}
+
+.dope-row {
+  display: flex;
+  align-items: stretch;
+  height: 20px;
+  /* The row must be at least as wide as its cells so sticky works across the
+     full scroll width rather than only the visible part. */
+  width: max-content;
+  min-width: 100%;
+}
+
+.dope-name {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  flex: 0 0 110px;
+  width: 110px;
+  display: flex;
+  align-items: center;
+  padding-right: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--panel);
+  border-right: 1px solid var(--panel-edge);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.dope-name:hover { color: var(--text); }
+
+#dope-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  height: 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--panel-edge);
+}
+
+#dope-head .dope-name {
+  z-index: 4; /* over both the sticky column and the sticky header */
+  color: var(--text-dim);
+  cursor: default;
+}
+
+.dope-cells { display: flex; }
+
+.dope-num {
+  flex: 0 0 16px;
+  width: 16px;
+  font-size: 9px;
+  line-height: 18px;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.dope-num.cur { color: var(--accent); font-weight: 600; }
+.dope-num.play { color: #ffc83c; font-weight: 600; }
+
+/* A cell is either the START of a drawing (a block) or a HELD continuation of
+   it (a connecting bar) — the distinction the thumbnail strip cannot show. */
+.dope-cell {
+  flex: 0 0 16px;
+  width: 16px;
+  position: relative;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+}
+
+/* Every 5th column gets a stronger rule, matching the numbered header. */
+.dope-cell:nth-child(5n) { border-right-color: rgba(255, 255, 255, 0.13); }
+
+.dope-cell.start::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  top: 4px;
+  bottom: 4px;
+  border-radius: 2px;
+  background: #6f7683;
+}
+
+/* An empty drawing reads as an outline, so "nothing drawn here yet" is
+   distinguishable from "a drawing that happens to be blank-looking". */
+.dope-cell.start.blank::after {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.dope-cell.held::after {
+  content: '';
+  position: absolute;
+  left: -1px;
+  right: -1px;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
+  background: #4b515c;
+}
+
+.dope-cell.held.blank::after { background: rgba(255, 255, 255, 0.08); }
+
+.dope-cell:hover { background: rgba(255, 255, 255, 0.06); }
+.dope-cell.cur { background: rgba(65, 166, 246, 0.14); }
+.dope-cell.play { background: rgba(255, 200, 60, 0.16); }
+
+/* The one cell being edited: this layer, this frame. */
+.dope-cell.sel { outline: 1px solid var(--accent); outline-offset: -1px; }
+.dope-cell.sel.start::after { background: var(--accent); }
+.dope-cell.sel.held::after { background: var(--accent); }
+
+.dope-grouprow .dope-name { color: var(--text); font-weight: 600; }
+.dope-grouprow { background: rgba(255, 255, 255, 0.03); }
+
+/* ---- Transform track row (Phase 13) ----
+   Shown only once a layer is animated. Keys are diamonds; the line between
+   them is the tween, so a glance says "moving here, still there". */
+.dope-keyrow { height: 16px; }
+.dope-keyrow .dope-name { font-size: 10px; font-style: italic; opacity: 0.75; }
+
+/* The camera lane sits at the top of the sheet and is global, not per-layer,
+   so it reads as its own thing: upright label, accent-tinted, a divider under
+   it to set it apart from the layer rows below. */
+.dope-camrow { border-bottom: 1px solid var(--panel-edge); }
+.dope-camrow .dope-name { font-style: normal; font-weight: 600; opacity: 0.9; color: var(--accent); }
+
+/* Bone rig lanes (B4): named (non-italic), under a "Rig" group header; the
+   SELECTED bone's lane lights up green to match the skeleton overlay + bar. */
+.dope-bonerow .dope-name { font-style: normal; opacity: 0.85; }
+.dope-bonerow.active { background: rgba(120, 230, 130, 0.10); }
+.dope-bonerow.active .dope-name { color: rgba(150, 240, 160, 1); opacity: 1; }
+
+/* The transform bar's label when it is editing a bone rather than a layer. */
+#xf-target.bone { color: rgba(150, 235, 150, 1); }
+
+.dope-cell.dope-key::after {
+  content: '';
+  position: absolute;
+  left: -1px;
+  right: -1px;
+  top: 50%;
+  height: 1px;
+  margin-top: -0.5px;
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.dope-cell.dope-key.keyed::after {
+  left: 4px;
+  right: 4px;
+  top: 4px;
+  bottom: 4px;
+  height: auto;
+  margin: 0;
+  background: var(--accent);
+  transform: rotate(45deg); /* a square on its corner = the keyframe diamond */
+}
+
+/* ---- 13a exposure: held frames ----
+   A held frame carries no new drawing — it re-exposes the previous one. It is
+   dimmed and joined to its neighbour by a left tick, so a run of holds reads as
+   one drawing lasting longer rather than as several identical drawings (which
+   is exactly what the thumbnails would otherwise imply). `part-held` = only
+   SOME layers hold, which a thumbnail cannot show at all. */
+.frame.held { border-left-color: transparent; }
+.frame.held canvas { opacity: 0.55; }
+
+.frame.held::before,
+.frame.part-held::before {
+  content: '';
+  position: absolute;
+  left: -1px;
+  top: 50%;
+  width: 7px;
+  height: 2px;
+  margin-top: -1px;
+  background: var(--text-dim);
+  pointer-events: none;
+}
+
+/* Partially held: the tick is accented rather than dim, because a mixed column
+   is a deliberate act (one layer on twos while another runs on ones). */
+.frame.part-held::before { background: var(--accent); }
+
 .frame span {
   position: absolute;
   bottom: 1px;
@@ -1384,6 +1631,9 @@ body.mode-free .brush-sub[hidden] { display: none; }
   text-shadow: 0 0 3px #000, 0 0 3px #000;
   pointer-events: none;
 }
+
+/* The hold mark replaces the frame number on a fully-held frame. */
+.frame.held span { color: var(--text-dim); }
 
 /* Transport controls (playback lives in the main canvas). */
 #framebar .fps {

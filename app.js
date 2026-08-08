@@ -160,6 +160,11 @@ const ctx = view.getContext('2d');
 // plane. Scoping the id to the session makes plane keys globally unique.
 let planeSeq = 0;
 const PLANE_SESSION = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+/** 13a: marks a loaded/restored cell as HELD — "reuse the previous frame's
+ *  plane on this layer" — as it travels from parseProject/restoreProject into
+ *  startProject. A Symbol so it can never collide with real plane source data
+ *  (a pixel array, an Image, or a stroke list). */
+const HELD = Symbol('held');
 const tagPlane = (p) => { p.id = `${PLANE_SESSION}-${++planeSeq}`; return p; };
 
 function makePlane(src, vector) {
@@ -199,12 +204,18 @@ function makePlane(src, vector) {
  * that displays a frame (render, preview, thumbnails, onion skin, exports)
  * reads the composite; only editing touches individual planes.
  */
-function makeFrame(layerPixels) {
+function makeFrame(layerPixels, adopt) {
   const canvas = document.createElement('canvas');
   canvas.width = state.width;
   canvas.height = state.height;
   const f = {
+    // `adopt[li]` (13a) hands in an existing plane to REFERENCE rather than
+    // create — that cell is HELD. Per-cell, so a partially-held column (one
+    // layer holding while the rest get new drawings) loads correctly. It must
+    // not allocate: a plane canvas is width×height, so building four 8K planes
+    // only to discard them would churn hundreds of MB per held frame.
     layers: state.layers.map((m, li) => {
+      if (adopt && adopt[li]) return adopt[li];
       const src = layerPixels ? layerPixels[li] : null;
       const p = makePlane(src, m.kind === 'vector');
       if (src && state.mode === 'pixel') repaintLayer(p); // free: makePlane drew it
@@ -280,6 +291,7 @@ let vecWidthMode = false;    // 9b: control dots edit WIDTH (drag ⟂), not posi
 let vecErase = null;         // 8c: whole-stroke eraser gesture on a vector layer
 let floatDrag = null;        // {dx, dy} grab offset while moving the buffer
 let xformDrag = null;        // freeform handle drag — see the select pointerdown path
+let boneDrag = null;         // B3 rig gesture: {kind:'rotate'|'draw', ...}
 let hoverHandle = null;      // freeform handle under the cursor (hover highlight)
 let hoverDot = null;         // control-dot index under the cursor (vector stroke)
 let proofing = false;        // print soft-proof view (Toggles menu, print projects)
@@ -366,6 +378,12 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode, extra) {
       // Phase 8a: raster or vector, fixed for the layer's life. Vector only
       // exists in freeform projects — anything else normalizes to raster.
       kind: state.mode === 'free' && m.kind === 'vector' ? 'vector' : 'raster',
+      // Phase 13 transform track. Re-validated here (not just in parseProject)
+      // because this path is also how a crash recovery rebuilds layers.
+      xf: cleanTrack(m.xf),
+      // Phase 13 B1: the bone this layer binds to (rigid), or null. The id is
+      // reconciled against the rebuilt bone list just below.
+      bone: typeof m.bone === 'string' ? m.bone : null,
     }));
   state.layer = state.layers.length - 1; // start on the top layer
   // Layer tree (groups): the loaded/restored structure if valid, else a flat
@@ -373,10 +391,37 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode, extra) {
   // the tree. `extra` is the parseProject result or the autosave manifest.
   state.tree = deserializeTree(extra && extra.tree, state.layers)
     || flatTree(state.layers);
-  state.frames = (frames || [null]).map((fp) => makeFrame(fp));
+  // Camera track (Phase 13): a global non-layer pan/zoom/rotate. Re-validated
+  // here (not only in parseProject) because crash recovery rebuilds through
+  // this same path. Null = no camera, which is the byte-identical default.
+  state.camera = cleanCamera(extra && extra.camera);
+  // Bone rig (Phase 13 B1): a flat bone list, validated the same way. Then any
+  // layer bound to a bone that didn't survive validation is unbound, so a
+  // binding can never dangle into a missing bone.
+  state.bones = cleanBones(extra && extra.bones);
+  state.activeBone = null; // a selected-bone reference can't outlive the project
+  invalidateBones();
+  for (const m of state.layers) if (m.bone && !boneById(m.bone)) m.bone = null;
+  // 13a: built in order, because a HELD cell references the plane the PREVIOUS
+  // frame just created — which is exactly how a hold survives a round trip
+  // without duplicating the drawing.
+  state.frames = [];
+  for (const fp of (frames || [null])) {
+    const prev = state.frames[state.frames.length - 1];
+    const adopt = fp && prev
+      ? fp.map((cell, li) => (cell === HELD ? prev.layers[li] : null))
+      : null;
+    state.frames.push(makeFrame(fp, adopt));
+  }
   state.frame = 0;
   state.undo = [];
   state.redo = [];
+  // makeFrame composited each frame while it was NOT yet in state.frames, so
+  // its frame index read as -1 and any transform track or bone pose was skipped
+  // (both evaluate per frame index). With the frames now in place, rebuild the
+  // composites so a LOADED animation shows its pose, not its rest. Camera needs
+  // no rebuild — it is applied at output, not baked into the composite.
+  if (hasAnyTrack() || hasRig()) recompositeAll();
   renderLayers();
   if (palette) {
     state.palette = palette;
@@ -429,12 +474,684 @@ function newProject(w, h, frames, layersMeta, palette, fpsVal, mode, extra) {
 const BLEND_MODES = ['normal', 'multiply', 'screen', 'overlay'];
 const blendOp = (m) => (m.blend === 'normal' ? 'source-over' : m.blend);
 
+/* ---- Transform tweens (Phase 13) -------------------------------------
+ * A layer can carry a TRANSFORM TRACK: keyframes of position / rotation /
+ * scale / alpha, interpolated over frames and applied AT COMPOSITE TIME.
+ * Per the locked design (COMPETITIVE_ROADMAP §3.4 decision 3):
+ *   - Transforms only. No drawing is ever altered, so raster and vector are
+ *     covered by one implementation and shape morphing stays out of scope.
+ *   - The same shape a BONE will animate later, so the rig is an addition
+ *     rather than a rewrite (one bone per layer is the degenerate case).
+ * A layer with no track is untouched and serializes nothing, so files without
+ * animation stay byte-identical — the v5 `tree` / v6 exposure discipline.
+ * -------------------------------------------------------------------- */
+
+const EASES = ['linear', 'in', 'out', 'inout', 'step'];
+
+/** Identity — what a layer with no track composites as. */
+const XF_ID = { x: 0, y: 0, rot: 0, sx: 1, sy: 1, a: 1 };
+
+/** Is this transform a no-op? Used to keep every fast path alive for layers
+ *  that are keyed but happen to sit at rest on this frame. */
+const xfIsIdentity = (t) =>
+  !t || (t.x === 0 && t.y === 0 && t.rot === 0 &&
+         t.sx === 1 && t.sy === 1 && t.a === 1);
+
+/** Serialize one transform-track key, dropping fields sitting at their default
+ *  (the 9a non-default-only discipline). Shared by the layer track and the bone
+ *  poses (B1), which are the same key shape, so the two can't drift on disk. */
+const serializeXfKey = (k) => ({
+  f: k.f,
+  ...(k.x ? { x: k.x } : {}),
+  ...(k.y ? { y: k.y } : {}),
+  ...(k.rot ? { rot: k.rot } : {}),
+  ...(k.sx !== 1 ? { sx: k.sx } : {}),
+  ...(k.sy !== 1 ? { sy: k.sy } : {}),
+  ...(k.a !== 1 ? { a: k.a } : {}),
+  ...(k.ease !== 'inout' ? { ease: k.ease } : {}),
+});
+
+/** Shape a raw key object, filling defaults. Absent fields mean "at rest",
+ *  which is what lets a key written for position alone stay small. */
+function cleanKey(k) {
+  const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+  return {
+    f: Math.max(0, Math.round(num(k.f, 0))),
+    x: num(k.x, 0),
+    y: num(k.y, 0),
+    rot: num(k.rot, 0),                       // radians
+    sx: clamp(num(k.sx, 1), -100, 100),
+    sy: clamp(num(k.sy, 1), -100, 100),
+    a: clamp(num(k.a, 1), 0, 1),              // multiplies the layer's opacity
+    ease: EASES.includes(k.ease) ? k.ease : 'inout',
+  };
+}
+
+/** Ease a normalized 0..1 segment position. `step` holds the left key's value
+ *  until the next one — the constant-interpolation animators expect, and the
+ *  reason it is in the launch set rather than a later nicety. */
+function easeT(t, kind) {
+  if (kind === 'step') return 0;
+  if (kind === 'in') return t * t;
+  if (kind === 'out') return t * (2 - t);
+  if (kind === 'inout') return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+  return t; // linear
+}
+
+/** The layer's transform on frame `fi`, or null when it has no track.
+ *  Outside the keyed range the nearest key HOLDS — a track never implies
+ *  motion before its first key or after its last. */
+function xfAt(m, fi) {
+  const keys = m.xf && m.xf.keys;
+  if (!keys || !keys.length) return null;
+  if (fi <= keys[0].f) return keys[0];
+  const last = keys[keys.length - 1];
+  if (fi >= last.f) return last;
+  let i = 0;
+  while (i < keys.length - 1 && keys[i + 1].f <= fi) i++;
+  const a = keys[i], b = keys[i + 1];
+  const span = b.f - a.f;
+  const t = span > 0 ? easeT((fi - a.f) / span, a.ease) : 0;
+  const mix = (p, q) => p + (q - p) * t;
+  return {
+    f: fi,
+    x: mix(a.x, b.x), y: mix(a.y, b.y), rot: mix(a.rot, b.rot),
+    sx: mix(a.sx, b.sx), sy: mix(a.sy, b.sy), a: mix(a.a, b.a),
+    ease: a.ease,
+  };
+}
+
+/** The rotation/scale origin for a layer: its own pivot, else the canvas
+ *  centre. A pivot is a RIG property, not an animated one — it lives on the
+ *  layer rather than on each key, which is also where a bone will keep it. */
+const xfPivot = (m) => (m.xf && m.xf.pivot)
+  ? m.xf.pivot : [state.width / 2, state.height / 2];
+
+/** Does any visible layer transform this frame? Drives every fast path that
+ *  assumes a layer blits at 1:1 into place. */
+function frameHasXf(fi) {
+  return state.layers.some((m) => m.visible && !xfIsIdentity(xfAt(m, fi)));
+}
+
+/** Does any visible layer follow a POSED bone this frame? A bound layer whose
+ *  whole bone chain sits at rest still blits 1:1, so only a moved rig counts —
+ *  that keeps a rigged-but-unposed project on the exact fast paths. */
+function frameHasBoundMove(fi) {
+  if (!hasRig()) return false;
+  return state.layers.some((m) => {
+    if (!m.visible || !m.bone) return false;
+    const bone = boneById(m.bone);
+    return bone && boneMovesAt(bone, fi);
+  });
+}
+
+/** Does ANYTHING move a layer's 1:1 blit this frame — its own transform track
+ *  or the bone it is bound to? The single gate for every exact fast path that
+ *  assumes planes land in place (setPixel / GIF flatten / crisp zoom / dirty-
+ *  rect patch / SVG-PDF export). */
+function frameMoved(fi) { return frameHasXf(fi) || frameHasBoundMove(fi); }
+
+/**
+ * Validate a saved transform track. Same defensive posture as `cleanStroke`:
+ * the file may be hand-edited or truncated, so a bad key is dropped rather
+ * than allowed to poison playback. Keys are sorted and de-duplicated by frame,
+ * because `xfAt` assumes ascending order with one key per frame.
+ */
+function cleanTrack(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const keys = Array.isArray(raw.keys)
+    ? raw.keys.filter((k) => k && Number.isFinite(+k.f)).map(cleanKey) : [];
+  keys.sort((a, b) => a.f - b.f);
+  const seen = new Set();
+  const uniq = keys.filter((k) => (seen.has(k.f) ? false : (seen.add(k.f), true)));
+  const pivot = Array.isArray(raw.pivot) && raw.pivot.length === 2 &&
+    Number.isFinite(+raw.pivot[0]) && Number.isFinite(+raw.pivot[1])
+    ? [+raw.pivot[0], +raw.pivot[1]] : null;
+  return uniq.length || pivot ? { pivot, keys: uniq } : null;
+}
+
+/** Apply a layer's transform to a context, ready for drawImage(src, 0, 0).
+ *  Rotation and scale happen about the pivot; position translates after. */
+function applyXf(ctx, m, t) {
+  const [px, py] = xfPivot(m);
+  ctx.translate(px + t.x, py + t.y);
+  ctx.rotate(t.rot);
+  ctx.scale(t.sx, t.sy);
+  ctx.translate(-px, -py);
+}
+
 /** True while every layer stacks the plain way (opaque, normal blend).
  *  setPixel and the GIF flattener have exact fast paths that are only
  *  correct under this condition — undefined fields fail it safely. */
-const layersDefault = () =>
+// `fi` is the frame the fast path is about — editing paths mean the frame being
+// edited, the GIF flattener means each frame in turn. A transformed layer no
+// longer blits 1:1 into place, so every one of these exact fast paths is wrong
+// for it (Phase 13).
+const layersDefault = (fi = state.frame) =>
   state.layers.every((m) => m.opacity === 1 && m.blend === 'normal') &&
-  !treeAltersComposite(state.tree);
+  !treeAltersComposite(state.tree) &&
+  !frameMoved(fi);
+
+/** Does any layer carry a transform track at all? (Cheaper than asking about a
+ *  particular frame, and the right question for format/export warnings.) */
+const hasAnyTrack = () =>
+  state.layers.some((m) => m.xf && m.xf.keys && m.xf.keys.length);
+
+/* --- Camera track (Phase 13) --------------------------------------------
+ * A NON-LAYER track (COMPETITIVE_ROADMAP §3.4 decision 6): one GLOBAL
+ * pan/zoom/rotate applied to the finished COMPOSITE at output time, never to
+ * a layer. This is the item that proves the timeline's lane model can carry a
+ * track that is not a layer, before 13b's audio needs it.
+ *
+ * Model A (owner 2026-08-08): the output stays state.width×height, so exports,
+ * thumbnails and onion skin are untouched — `outputComposite` simply stands
+ * between the composite and the true output readers (preview, playback,
+ * export). The editor view keeps showing the scene AT REST with a frame
+ * overlay, so every editing path (coordinate mapping, patchComposite,
+ * eyedropper — all of which assume f.canvas is the art-space composite) is
+ * unaffected. Parallax/depth is a deferred item (see the roadmap), not this.
+ *
+ * A camera key is {f, x, y, zoom, rot, ease}. Identity = x0 y0 zoom1 rot0 —
+ * what a project with no camera composites as, so a camera-less file stays
+ * byte-identical (the v7 transform-track discipline). x/y pan the camera in
+ * art px; a positive pan slides the CONTENT the opposite way, because framing
+ * a scene point at the centre is the inverse of moving a physical camera.
+ * zoom>1 magnifies about the frame centre; rot is radians.
+ * ------------------------------------------------------------------------ */
+
+/** Identity — what a project with no camera composites as. */
+const CAM_ID = { x: 0, y: 0, zoom: 1, rot: 0 };
+
+/** Is this camera a no-op? Keeps outputComposite returning f.canvas by
+ *  identity for a project that is keyed but sits at rest on this frame. */
+const camIsIdentity = (c) =>
+  !c || (c.x === 0 && c.y === 0 && c.zoom === 1 && c.rot === 0);
+
+/** Shape a raw camera key, filling defaults — mirrors cleanKey. Absent fields
+ *  mean "at rest", which is what lets a key written for a pan alone stay small. */
+function cleanCamKey(k) {
+  const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+  return {
+    f: Math.max(0, Math.round(num(k.f, 0))),
+    x: num(k.x, 0),
+    y: num(k.y, 0),
+    zoom: clamp(num(k.zoom, 1), 0.01, 100),
+    rot: num(k.rot, 0),                       // radians
+    ease: EASES.includes(k.ease) ? k.ease : 'inout',
+  };
+}
+
+/** Validate a saved camera track — same defensive posture as cleanTrack: a
+ *  hand-edited or truncated file must not poison playback, so bad keys are
+ *  dropped rather than trusted. Keys are sorted and de-duplicated by frame,
+ *  because camAt assumes ascending order with one key per frame. */
+function cleanCamera(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const keys = Array.isArray(raw.keys)
+    ? raw.keys.filter((k) => k && Number.isFinite(+k.f)).map(cleanCamKey) : [];
+  keys.sort((a, b) => a.f - b.f);
+  const seen = new Set();
+  const uniq = keys.filter((k) => (seen.has(k.f) ? false : (seen.add(k.f), true)));
+  return uniq.length ? { keys: uniq } : null;
+}
+
+/** The camera on frame `fi`, or null when there is no track. Outside the keyed
+ *  range the nearest key HOLDS — a camera never drifts before its first key or
+ *  after its last. Mirrors xfAt exactly, over the camera's four channels. */
+function camAt(fi) {
+  const keys = state.camera && state.camera.keys;
+  if (!keys || !keys.length) return null;
+  if (fi <= keys[0].f) return keys[0];
+  const last = keys[keys.length - 1];
+  if (fi >= last.f) return last;
+  let i = 0;
+  while (i < keys.length - 1 && keys[i + 1].f <= fi) i++;
+  const a = keys[i], b = keys[i + 1];
+  const span = b.f - a.f;
+  const t = span > 0 ? easeT((fi - a.f) / span, a.ease) : 0;
+  const mix = (p, q) => p + (q - p) * t;
+  return {
+    f: fi,
+    x: mix(a.x, b.x), y: mix(a.y, b.y),
+    zoom: mix(a.zoom, b.zoom), rot: mix(a.rot, b.rot),
+    ease: a.ease,
+  };
+}
+
+/** Apply a camera to a context, ready for drawImage(composite, 0, 0). The
+ *  scene point (W/2 + x, H/2 + y) is framed at the centre, scaled by zoom and
+ *  rotated — the inverse of physically moving the camera, so a positive pan
+ *  slides the content the opposite way. */
+function applyCamera(ctx, c) {
+  const W = state.width, H = state.height;
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(c.zoom, c.zoom);
+  ctx.rotate(c.rot);
+  ctx.translate(-(W / 2 + c.x), -(H / 2 + c.y));
+}
+
+// A single reusable scratch for SINGLE-FRAME display (preview, playback,
+// look-through). Export builds an array of frames at once, so it must NOT
+// share this one canvas — every entry would alias the last frame — and passes
+// its own fresh canvas per frame instead (outputComposite's `into` arg).
+let camScratch = null;
+
+/** The frame's finished OUTPUT image: its composite seen through the camera,
+ *  or the composite itself when the camera is at rest on this frame — so a
+ *  camera-less project pays nothing and keeps returning f.canvas by identity
+ *  (the fast path every reader already takes). `into` reuses a scratch canvas
+ *  for display; omit it (export) to get a fresh canvas that can be arrayed. */
+function outputComposite(f, into) {
+  const fi = state.frames.indexOf(f);
+  const c = fi === -1 ? null : camAt(fi);
+  if (camIsIdentity(c)) return f.canvas;
+  const cv = into || document.createElement('canvas');
+  cv.width = state.width;
+  cv.height = state.height;
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, state.width, state.height);
+  // Crisp for pixel art, smooth otherwise — the same convention the view,
+  // preview and video export already follow for scaled composites.
+  g.imageSmoothingEnabled = state.mode !== 'pixel';
+  g.save();
+  applyCamera(g, c);
+  g.drawImage(f.canvas, 0, 0);
+  g.restore();
+  return cv;
+}
+
+/** outputComposite for single-frame display — reuses the shared scratch. */
+function cameraView(f) {
+  if (!camScratch) camScratch = document.createElement('canvas');
+  return outputComposite(f, camScratch);
+}
+
+/** Does the project carry a camera track at all? (The right question for
+ *  export warnings and the dope-sheet lane.) */
+const hasCamera = () =>
+  !!(state.camera && state.camera.keys && state.camera.keys.length);
+
+/** The scene point that lands at output pixel (ox, oy) under camera `c` — the
+ *  INVERSE of applyCamera. Used to draw the framed region on the scene. */
+function camToScene(c, ox, oy) {
+  const W = state.width, H = state.height;
+  const z = c.zoom, r = -c.rot;              // inverse rotation
+  const dx = (ox - W / 2) / z, dy = (oy - H / 2) / z;
+  const cos = Math.cos(r), sin = Math.sin(r);
+  return { x: W / 2 + c.x + (dx * cos - dy * sin),
+           y: H / 2 + c.y + (dx * sin + dy * cos) };
+}
+
+/** Draw the camera's framed region on the scene (view space), so the user can
+ *  see and author a camera move without the drawing itself moving. The four
+ *  output corners map back through the inverse camera to a scene quad; at rest
+ *  it coincides with the canvas border (a reassuring "camera is here, still").
+ *  Called from render() only while editing. */
+function drawCameraOverlay() {
+  const c = camAt(state.frame) || CAM_ID;
+  const { panX, panY, zoom } = state;
+  const W = state.width, H = state.height;
+  const pts = [[0, 0], [W, 0], [W, H], [0, H]].map(([ox, oy]) => camToScene(c, ox, oy));
+  ctx.save();
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    const sx = panX + p.x * zoom, sy = panY + p.y * zoom;
+    if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+  });
+  ctx.closePath();
+  // A dark under-stroke first so the cyan reads on any artwork, matching the
+  // marquee's "dashed light over solid dark" convention.
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.stroke();
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = 'rgba(90, 200, 255, 0.95)';
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** Draw the skeleton over the scene (view space) while the Bone tool is active:
+ *  each bone's POSED segment head→tip, a joint ring at the head, a tip knob, the
+ *  selected bone highlighted. Same "dark under, colour over" reading trick as
+ *  the camera overlay so it shows on any artwork. */
+function drawSkeleton() {
+  if (!hasRig()) return;
+  const fi = state.frame;
+  const { panX, panY, zoom } = state;
+  const a2s = (p) => [panX + p[0] * zoom, panY + p[1] * zoom];
+  ctx.save();
+  ctx.lineCap = 'round';
+  for (const b of state.bones) {
+    const [hx, hy] = a2s(boneHead(b, fi));
+    const [tx, ty] = a2s(boneTip(b, fi));
+    const active = b.id === state.activeBone;
+    const col = active ? 'rgba(120, 230, 130, 0.95)' : 'rgba(255, 180, 60, 0.9)';
+    ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(tx, ty);
+    ctx.lineWidth = active ? 5 : 4;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.stroke();
+    ctx.lineWidth = active ? 3 : 2;
+    ctx.strokeStyle = col;
+    ctx.stroke();
+    // Tip knob (the rotate handle).
+    ctx.beginPath(); ctx.arc(tx, ty, active ? 4.5 : 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = col;
+    ctx.fill();
+    // Joint ring at the head.
+    ctx.beginPath(); ctx.arc(hx, hy, active ? 5 : 4, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(20, 20, 26, 0.9)';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = col;
+    ctx.stroke();
+  }
+  // Dashed preview of the bone being dragged out.
+  if (boneDrag && boneDrag.kind === 'draw') {
+    const [ax, ay] = a2s([boneDrag.ax, boneDrag.ay]);
+    const [bx, by] = a2s([boneDrag.bx, boneDrag.by]);
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+    ctx.setLineDash([5, 4]); ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(120, 230, 130, 0.9)'; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* --- Bones: rigid cutout rig (Phase 13, B1) ------------------------------
+ * COMPETITIVE_ROADMAP §3.4 "Bones (rigid cutout)". A bone HIERARCHY whose
+ * transforms are keyed on the timeline exactly like a layer's — bones REUSE the
+ * transform-track machinery (`xfAt`/`setKey`/`remapKeys`) wholesale, the same
+ * way the camera did. A whole layer binds RIGIDLY to one bone and follows it.
+ *
+ * The guardrail that keeps IK/weights a later ADDITION, not a rewrite (§3.2):
+ * bones are first-class keyed-transform nodes in a hierarchy, the world
+ * transform is computed by WALKING THE CHAIN, and a binding is a layer→bone-id
+ * reference. Nothing here deforms; a bound layer is transformed rigidly.
+ *
+ * Model. Each bone stores its REST pose in its parent's local frame — joint
+ * (x, y), rest angle `angle0`, length `len` — plus an animated pose `xf` (the
+ * shared keyed track: rotation about the joint, a joint translation, and a
+ * stretch). Its world transform at frame fi is
+ *     world(bone) = world(parent) · T(x+px, y+py) · R(angle0+prot) · S(psx, psy)
+ * with the pose read from `xfAt`. A CHILD's rest joint is stored at (len, 0) in
+ * the parent's local frame, so it rides the parent's tip.
+ *
+ * A bound layer's art was drawn at REST, so it follows the bone by the bone's
+ * rest→posed DELTA:  boundDelta = world(bone, fi) · restWorld(bone)⁻¹  — the
+ * identity for an unposed rig, so binding never makes art jump. B2 applies that
+ * delta at composite time, composed with the layer's own `xf` (decision 1).
+ * ------------------------------------------------------------------------ */
+
+// 2D affine matrices as [a, b, c, d, e, f] — exactly canvas transform() order,
+// mapping (x, y) → (a·x + c·y + e, b·x + d·y + f), so a world matrix can be fed
+// straight to ctx.transform(...) in B2.
+const MAT_ID = [1, 0, 0, 1, 0, 0];
+const matMul = (m, n) => [
+  m[0] * n[0] + m[2] * n[1],
+  m[1] * n[0] + m[3] * n[1],
+  m[0] * n[2] + m[2] * n[3],
+  m[1] * n[2] + m[3] * n[3],
+  m[0] * n[4] + m[2] * n[5] + m[4],
+  m[1] * n[4] + m[3] * n[5] + m[5],
+];
+/** Translate·Rotate·Scale, the order a bone's local frame is built in. */
+const matTRS = (tx, ty, rot, sx, sy) => {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return [c * sx, s * sx, -s * sy, c * sy, tx, ty];
+};
+/** Invert an affine matrix (for the rest→posed delta). Singular → identity. */
+function matInvert(m) {
+  const [a, b, c, d, e, f] = m;
+  const det = a * d - b * c;
+  if (!det) return MAT_ID.slice();
+  const id = 1 / det;
+  return [d * id, -b * id, -c * id, a * id, (c * f - d * e) * id, (b * e - a * f) * id];
+}
+/** Apply an affine matrix to a point → [x, y]. Handy for the overlay + tests. */
+const matApply = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+
+let boneSeq = 0;
+const BONE_SESSION = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const mintBoneId = () => `b-${BONE_SESSION}-${++boneSeq}`;
+
+/** The bone with this id, or null. `state.bones` is a FLAT array; the hierarchy
+ *  lives in each bone's `parent` id, which keeps walking and serialization
+ *  simple (no nested-tree resync, unlike the layer tree). */
+const boneById = (id) => (id == null ? null
+  : state.bones.find((b) => b.id === id) || null);
+
+/** Does the project carry a rig at all? (The v9 gate and the fast-path question.) */
+const hasRig = () => !!(state.bones && state.bones.length);
+
+/** Create a bone and append it. `parent` is a bone id or null (a root). Rest
+ *  pose is joint (x, y) in the PARENT's local frame, angle `angle0`, length
+ *  `len`. The Bone tool (B3) is what supplies these from canvas drags. */
+function addBone(parent, x, y, len, angle0, name) {
+  const b = {
+    id: mintBoneId(),
+    name: name || `Bone ${state.bones.length + 1}`,
+    parent: parent || null,
+    x, y, len, angle0,
+    xf: null, // animated pose; the shared keyed-track shape, null until keyed
+  };
+  state.bones.push(b);
+  invalidateBones();
+  return b;
+}
+
+/** Key a bone's pose on frame `fi` — the shared setKey, since a bone's `xf` is
+ *  the very same track shape a layer's is. Wrapped only to drop the cache. */
+function setBoneKey(bone, fi, vals) {
+  const k = setKey(bone, fi, vals);
+  invalidateBones();
+  return k;
+}
+
+/** Bind a layer (flat index) to a bone id, or null to unbind. */
+function bindLayer(li, boneId) {
+  const m = state.layers[li];
+  if (m) m.bone = boneId || null;
+}
+
+// World transforms walk the chain, so they are memoized per pass: the cache is
+// dropped whenever a bone's rest or pose changes (invalidateBones), and B2 also
+// drops it at the start of each recomposite. Keyed by `${fi}:${id}` for the
+// posed world and `r:${id}` for the (pose-free) rest world.
+let boneCache = new Map();
+const invalidateBones = () => { boneCache = new Map(); };
+
+/** The bone's local frame at frame fi: rest joint/angle with the animated pose
+ *  layered on — rotation adds to angle0, translation moves the joint in parent
+ *  space, scale stretches the bone (so children on its tip ride the stretch). */
+function boneLocal(bone, fi, rest) {
+  const p = rest ? XF_ID : (xfAt(bone, fi) || XF_ID);
+  return matTRS(bone.x + p.x, bone.y + p.y, bone.angle0 + p.rot, p.sx, p.sy);
+}
+
+/** The bone's world transform at frame fi (posed), or its rest world (rest=true
+ *  → all poses identity). Composed up the parent chain. Memoized per pass. */
+function boneWorld(bone, fi, rest) {
+  const key = rest ? `r:${bone.id}` : `${fi}:${bone.id}`;
+  const hit = boneCache.get(key);
+  if (hit) return hit;
+  const local = boneLocal(bone, fi, rest);
+  const parent = boneById(bone.parent);
+  const w = parent ? matMul(boneWorld(parent, fi, rest), local) : local;
+  boneCache.set(key, w);
+  return w;
+}
+const boneWorldAt = (bone, fi) => boneWorld(bone, fi, false);
+const boneRestWorld = (bone) => boneWorld(bone, 0, true);
+
+/** Does this bone — or any ancestor — hold a non-rest pose on frame fi? If the
+ *  whole chain is at rest, a layer bound to it sits exactly where its art was
+ *  drawn, so `boundDelta` is identity and every 1:1 fast path stays valid. */
+function boneMovesAt(bone, fi) {
+  for (let b = bone; b; b = boneById(b.parent)) {
+    if (!xfIsIdentity(xfAt(b, fi))) return true;
+  }
+  return false;
+}
+
+/** The transform a bound layer's REST art takes on frame fi: the bone's
+ *  deviation from its rest pose. Identity when the rig is unposed, so binding
+ *  never jumps the art. This is the matrix B2 pre-multiplies a bound plane by. */
+function boundDelta(bone, fi) {
+  return matMul(boneWorldAt(bone, fi), matInvert(boneRestWorld(bone)));
+}
+
+/** The tip of a bone in world space at frame fi — for drawing the skeleton (B3)
+ *  and for hit-testing a bone. */
+const boneTip = (bone, fi) => matApply(boneWorldAt(bone, fi), bone.len, 0);
+const boneHead = (bone, fi) => matApply(boneWorldAt(bone, fi), 0, 0);
+
+/**
+ * Validate a saved rig — same defensive posture as cleanTrack/cleanCamera: a
+ * hand-edited or truncated file must not poison the compositor. Bad bones are
+ * dropped; a `parent` that doesn't resolve to a kept bone is severed to a root
+ * so the chain can always be walked; each bone's pose track goes through
+ * cleanTrack. Ids are de-duplicated (a repeat would make boneById ambiguous).
+ */
+function cleanBones(raw) {
+  if (!Array.isArray(raw)) return [];
+  const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+  const seen = new Set();
+  const bones = [];
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue;
+    const id = typeof r.id === 'string' && r.id ? r.id : mintBoneId();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    bones.push({
+      id,
+      name: typeof r.name === 'string' && r.name.trim() ? r.name.trim() : 'Bone',
+      parent: typeof r.parent === 'string' ? r.parent : null,
+      x: num(r.x, 0), y: num(r.y, 0),
+      len: Math.max(1, num(r.len, 1)),
+      angle0: num(r.angle0, 0),
+      xf: cleanTrack(r.xf),
+    });
+  }
+  // Sever any parent reference that didn't survive validation, so the chain
+  // always terminates at a root (no dangling pointer, no cycle into nothing).
+  const ids = new Set(bones.map((b) => b.id));
+  for (const b of bones) if (b.parent && !ids.has(b.parent)) b.parent = null;
+  return bones;
+}
+
+/* ---- Bone rig: editing ops + interaction math (Phase 13 B3) ---------- */
+
+/** The selected bone, or null. */
+const activeBone = () => boneById(state.activeBone);
+
+/** Everything after a rig edit — same shape as afterXfChange, minus nothing:
+ *  bones move layers at COMPOSITE time, so every frame must rebuild (a single
+ *  pose key holds across the whole timeline). */
+function afterRigChange() {
+  invalidateBones();
+  markDocDirty();
+  recompositeAll();  // ends in render(); the skeleton overlay rides along
+  renderFrames();
+  renderLayers();    // bind badges / the bind button follow the selection
+}
+
+/** Delete a bone and its whole subtree (rigid rigs have no partial delete that
+ *  isn't confusing), unbinding any layer that pointed into the removed set and
+ *  clearing the selection if it was in it. */
+function deleteBone(bone) {
+  if (!bone) return;
+  const doomed = new Set([bone.id]);
+  let grew = true;
+  while (grew) { // transitive closure of descendants
+    grew = false;
+    for (const b of state.bones) {
+      if (b.parent && doomed.has(b.parent) && !doomed.has(b.id)) { doomed.add(b.id); grew = true; }
+    }
+  }
+  state.bones = state.bones.filter((b) => !doomed.has(b.id));
+  for (const m of state.layers) if (doomed.has(m.bone)) m.bone = null;
+  if (doomed.has(state.activeBone)) state.activeBone = null;
+  afterRigChange();
+}
+
+/** Bones depth-first (each root, then its subtree), with chain depth — the order
+ *  and indentation the dope-sheet Rig lanes render in. */
+function boneOrder() {
+  const out = [];
+  const visit = (parentId, depth) => {
+    for (const b of state.bones) {
+      if ((b.parent || null) === parentId) { out.push({ bone: b, depth }); visit(b.id, depth + 1); }
+    }
+  };
+  visit(null, 0);
+  // Safety net: any bone the walk didn't reach (can't happen post-cleanBones,
+  // which severs dangling parents) still shows, as a root.
+  if (out.length < state.bones.length) {
+    const seen = new Set(out.map((o) => o.bone.id));
+    for (const b of state.bones) if (!seen.has(b.id)) out.push({ bone: b, depth: 0 });
+  }
+  return out;
+}
+
+/** Select a bone: the transform bar switches to edit it (xfTarget), the skeleton
+ *  highlights it, and its dope-sheet lane lights up. */
+function selectBone(id) {
+  state.activeBone = id;
+  renderLayers(); // → refreshXfBar (bar follows the bone) + syncDopeSheet (lane)
+  render();       // skeleton highlight, when the Bone tool is showing it
+}
+
+/** The pose rotation that aims the bone from its (posed) joint toward world
+ *  point (ax, ay). Solving world angle = parentPosedAngle + angle0 + rot for
+ *  rot — the whole cutout gesture, dragging a bone's tip to swing it. */
+function poseRotateTo(bone, fi, ax, ay) {
+  const head = boneHead(bone, fi);
+  const desired = Math.atan2(ay - head[1], ax - head[0]);
+  const pw = bone.parent ? boneWorldAt(boneById(bone.parent), fi) : MAT_ID;
+  return desired - Math.atan2(pw[1], pw[0]) - bone.angle0;
+}
+
+/** Build a bone from a drag (art coords). With a bone selected the new one
+ *  CHAINS as its child from the tip (its rest head = the parent's tip, so they
+ *  stay connected at every pose); otherwise it is a root at the drag start. Only
+ *  the drag's direction + length are used for a child, its start for a root. */
+function createBoneFromDrag(ax, ay, bx, by, parent) {
+  const len = Math.max(1, Math.hypot(bx - ax, by - ay));
+  const worldAngle = Math.atan2(by - ay, bx - ax);
+  if (parent) {
+    const rw = boneRestWorld(parent);
+    return addBone(parent.id, parent.len, 0, len, worldAngle - Math.atan2(rw[1], rw[0]));
+  }
+  return addBone(null, ax, ay, len, worldAngle);
+}
+
+/** Nearest bone whose posed segment is within `slack` SCREEN px of (sx, sy),
+ *  or null. Screen space so the grab feel is zoom-independent. Ties prefer the
+ *  selected bone, then a tip grab, so posing an already-selected bone is easy. */
+function boneHitTest(sx, sy, slack = 9) {
+  const fi = state.frame;
+  const a2s = (p) => [state.panX + p[0] * state.zoom, state.panY + p[1] * state.zoom];
+  let best = null, bestD = slack;
+  for (const b of state.bones) {
+    const [hx, hy] = a2s(boneHead(b, fi));
+    const [tx, ty] = a2s(boneTip(b, fi));
+    const d = distToSeg(sx, sy, hx, hy, tx, ty);
+    // Prefer the currently selected bone on a near-tie so it stays grabbable.
+    if (d < bestD || (d < slack && b.id === state.activeBone && d <= bestD + 3)) {
+      best = b; bestD = d;
+    }
+  }
+  return best;
+}
+
+/** Distance from point (px,py) to segment (ax,ay)-(bx,by). */
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
 
 /** Does any GROUP change the result vs. a flat stack? A styled or hidden group
  *  makes the flat setPixel fast path (which ignores the tree) wrong; a default
@@ -560,12 +1277,23 @@ function pixelAt(f, x, y) {
 
 /** A frame flattened to one pixel array (visible layers only) — for GIF export. */
 function compositePixels(f) {
-  if (state.mode === 'free' || !layersDefault()) {
+  // Per FRAME, not the edited one: a transform can make this frame's stacking
+  // non-trivial while another frame's is fine.
+  const fi = state.frames.indexOf(f);
+  // A camera reframes the whole composite (Model A), so a camera-active frame
+  // must be read from its camera OUTPUT — which also means dropping out of the
+  // plain-pixel fast path below, since that stacks planes and never builds a
+  // composite the camera could transform.
+  const camActive = !camIsIdentity(camAt(fi));
+  if (state.mode === 'free' || !layersDefault(fi) || camActive) {
     // Freeform — or pixel mode once any layer has opacity/blend (stacking
-    // hex arrays can't reproduce those) — reads the composite canvas.
+    // hex arrays can't reproduce those), or once a camera reframes it —
+    // reads the composite canvas. outputComposite is f.canvas when the camera
+    // is at rest, so this stays exactly the old read for camera-less frames.
     // GIF transparency is 1-bit, so alpha ≥ 128 flattens to opaque
     // (a banding warning lands in 6e).
-    const data = f.ctx.getImageData(0, 0, state.width, state.height).data;
+    const data = outputComposite(f).getContext('2d')
+      .getImageData(0, 0, state.width, state.height).data;
     const toHex = (v) => v.toString(16).padStart(2, '0');
     const out = new Array(state.width * state.height).fill(null);
     for (let i = 0; i < out.length; i++) {
@@ -677,6 +1405,10 @@ function groupBuf(depth) {
  * blitting that buffer with the group's own opacity + blend (isolated).
  */
 function compositeForest(dst, nodes, f, override, rect, depth) {
+  // Frame index, for evaluating transform tracks (Phase 13). Resolved once per
+  // call rather than per leaf; the group recursion repeats it, but that is a
+  // handful of lookups, not one per layer.
+  const fi = state.frames.indexOf(f);
   for (const node of nodes) {
     if (node.type === 'group') {
       if (!node.visible) continue;
@@ -702,9 +1434,36 @@ function compositeForest(dst, nodes, f, override, rect, depth) {
       if (!m.visible) continue;
       const li = state.layers.indexOf(m);
       const src = override && li === state.layer ? override : f.layers[li].canvas;
-      dst.globalAlpha = m.opacity;
-      dst.globalCompositeOperation = blendOp(m);
-      dst.drawImage(src, 0, 0);
+      // Transform tween + bone rig (Phase 13): the plane is untouched — only the
+      // way it lands on the composite changes. A layer at rest (no transform,
+      // and not following a POSED bone) takes the original plain blit, so an
+      // unanimated project — and a bound layer whose rig is at rest — pays
+      // nothing and stays byte-identical.
+      const t = fi === -1 ? null : xfAt(m, fi);
+      const bone = (fi !== -1 && m.bone) ? boneById(m.bone) : null;
+      const boneMoves = bone && boneMovesAt(bone, fi);
+      if (xfIsIdentity(t) && !boneMoves) {
+        dst.globalAlpha = m.opacity;
+        dst.globalCompositeOperation = blendOp(m);
+        dst.drawImage(src, 0, 0);
+      } else {
+        dst.save();
+        // Decision 1 (COMPOSE): the bone's rest→posed delta is the OUTER
+        // transform, the layer's own local xf the INNER one — so the plane is
+        // transformed locally, then the whole thing is carried by the bone.
+        if (boneMoves) {
+          const bd = boundDelta(bone, fi);
+          dst.transform(bd[0], bd[1], bd[2], bd[3], bd[4], bd[5]);
+        }
+        if (!xfIsIdentity(t)) applyXf(dst, m, t);
+        // The keyed alpha MULTIPLIES the layer's own opacity rather than
+        // replacing it, so a static layer opacity keeps its meaning while
+        // being faded by an animation. (A bone carries no alpha — rigid.)
+        dst.globalAlpha = m.opacity * (t ? t.a : 1);
+        dst.globalCompositeOperation = blendOp(m);
+        dst.drawImage(src, 0, 0);
+        dst.restore(); // also clears the transform for the next node
+      }
     }
   }
   dst.globalAlpha = 1;
@@ -799,11 +1558,23 @@ function syncFlatToTree() {
   state.layer = clamp(newMetas.indexOf(activeMeta), 0, newMetas.length - 1);
 }
 
-function recomposite(f) {
+function recompositeOne(f) {
   compositeGen++; // the soft-proof cache keys on this
   f.ctx.clearRect(0, 0, state.width, state.height);
   compositeForest(f.ctx, state.tree, f, null, null, 0);
   f.ghost = null;
+}
+
+/** Full rebuild of a frame's composite, and of every frame holding the same
+ *  drawing (13a — see framesSharingWith). `recompositeAll` deliberately calls
+ *  `recompositeOne` instead: it already visits every frame, so propagating
+ *  from inside it would rebuild a hold run once per member. */
+function recomposite(f) {
+  recompositeOne(f);
+  for (const g of framesSharingWith(f)) {
+    recompositeOne(g);
+    updateThumb(g);
+  }
 }
 
 /** Recomposite every frame + refresh thumbnails (after layer-wide changes). */
@@ -839,7 +1610,7 @@ function proofedComposite(f, idx) {
 
 function recompositeAll() {
   for (const f of state.frames) {
-    recomposite(f);
+    recompositeOne(f); // not recomposite(): this loop already covers hold runs
     updateThumb(f);
   }
   render();
@@ -942,10 +1713,16 @@ function render() {
   // device-resolution and already positioned, so it blits 1:1 over the whole
   // viewport rather than being scaled into place. Everything else in render()
   // — onion ghosts above, chrome below — is untouched.
-  const crisp = crispWanted(state.frames[shownIdx], proofed)
+  // During playback the main canvas is the player, so it shows the frame
+  // THROUGH the camera (Model A) — the same view the preview and exports give.
+  // The camera overrides the crisp/proof edit aids (playback judges motion, not
+  // sharpness); a camera-less project stays byte-identical to before.
+  const camActive = playing && !camIsIdentity(camAt(shownIdx));
+  const crisp = !camActive && crispWanted(state.frames[shownIdx], proofed)
     ? crispCompose(state.frames[shownIdx], shownIdx)
     : null;
   if (crisp) ctx.drawImage(crisp, 0, 0, viewW, viewH);
+  else if (camActive) ctx.drawImage(cameraView(state.frames[shownIdx]), panX, panY, cw, ch);
   else ctx.drawImage(proofed || state.frames[shownIdx].canvas, panX, panY, cw, ch);
 
   // 3. Grid lines — pixel mode only. Minor lines per pixel (only useful when
@@ -976,6 +1753,16 @@ function render() {
     ctx.lineTo(panX + cw, oy);
     ctx.stroke();
   }
+
+  // 5.2 Camera frame overlay: while EDITING (never during playback, which shows
+  //     the framed view itself), a project that has a camera draws the region of
+  //     the scene the camera frames on THIS frame — the authoring aid that makes
+  //     a camera move visible without moving the drawing.
+  if (hasCamera() && !playing) drawCameraOverlay();
+
+  // 5.3 Bone skeleton overlay while the Bone tool is active (never during
+  //     playback — the rig is scaffolding, not the animation).
+  if (state.tool === 'bone' && !playing) drawSkeleton();
 
   // 5.5 Floating selection buffer, then the marquee outline (dashed white
   //     over solid dark so it reads on any background). Freeform floats are
@@ -1600,8 +2387,15 @@ function popUndoIfUnchanged() {
  * Per-plane strict LIFO is preserved because every entry is a self-contained
  * before/after for its OWN plane (full pixel snapshot / absolute ImageData
  * patch / identity-keyed stroke-list op), so skipping other planes never
- * corrupts this one. Planes are unique per (frame, layer), so identity match
- * on the plane object already pins both.
+ * corrupts this one.
+ *
+ * ⚠ 13a changed a long-standing invariant: a plane is NO LONGER unique per
+ * (frame, layer) — a HELD cell references the drawing of the cell before it, so
+ * one plane can appear in several consecutive frames. The scan still works
+ * unchanged: sharing is always at the SAME layer index, so
+ * `e.frame.layers.indexOf(e.plane)` still pins the layer, and undoing a shared
+ * drawing correctly changes every frame that holds it — which is what a hold
+ * MEANS. `recomposite` below propagates the repaint across the run.
  */
 function applyHistory(from, to) {
   commitFloat(); // undoing while floating first lands it (so it's undoable too)
@@ -3506,6 +4300,11 @@ function crispWanted(f, proofed) {
   // so fall back to the art-res mirror there — which recomposite() builds
   // group-correctly. (Screen-res group buffers are a later refinement.)
   if (treeAltersComposite(state.tree)) return false;
+  // A transformed OR bone-moved layer (Phase 13) can't be reproduced by the
+  // flat screen-res walk either — crispCompose blits each plane 1:1. Fall back
+  // to the art-res mirror, which recomposite() builds correctly. Same trade,
+  // and for the same reason, as a styled group above.
+  if (frameMoved(state.frames.indexOf(f))) return false;
   return state.layers.some((m, li) => {
     const p = m.visible && f.layers[li];
     return p && p.strokes && p.strokes.length;
@@ -4411,9 +5210,10 @@ function refreshStroke() {
   renderSoon();
 }
 
-/** Rebuild one rect of a frame's composite canvas. While a stroke is live,
- *  `override` (its preview canvas) stands in for the active plane. */
-function patchComposite(f, r, override) {
+/** Rebuild one rect of ONE frame's composite. The workhorse; callers should
+ *  use `patchComposite`, which also refreshes any frames holding the same
+ *  drawing. */
+function patchCompositeOne(f, r, override) {
   compositeGen++; // the soft-proof cache keys on this
   f.ctx.save();
   f.ctx.beginPath();
@@ -4426,6 +5226,53 @@ function patchComposite(f, r, override) {
   compositeForest(f.ctx, state.tree, f, override, r, 0);
   f.ctx.restore(); // also resets globalAlpha / composite op
   f.ghost = null;
+}
+
+/**
+ * Phase 13a — the other frames of a hold run. A held cell REFERENCES the same
+ * plane object as the cell before it (that is what a hold is), so editing that
+ * drawing changes every frame showing it. Those frames' composites are stale
+ * until they are patched too — this is the one place the exposure model leaks
+ * into the render path, and missing it is how a hold silently desyncs.
+ *
+ * Compares by layer index rather than "shares any plane": two frames only ever
+ * share a plane at the SAME layer, and an index-wise compare is what makes a
+ * partially-held column (one layer held, the rest not) come out right.
+ */
+function framesSharingWith(f) {
+  const out = [];
+  for (const g of state.frames) {
+    if (g === f) continue;
+    for (let i = 0; i < g.layers.length; i++) {
+      if (g.layers[i] === f.layers[i]) { out.push(g); break; }
+    }
+  }
+  return out;
+}
+
+/** Rebuild one rect of a frame's composite canvas, and of every frame holding
+ *  the same drawing. While a stroke is live, `override` (its preview canvas)
+ *  stands in for the active plane — and propagation is SKIPPED, because the
+ *  real plane has not changed yet and the artist is looking at this frame. The
+ *  commit path calls again without an override, which is what updates the run. */
+function patchComposite(f, r, override) {
+  // ⚠ Phase 13: a dirty rect is in PLANE space. Once a layer is transformed —
+  // by its own track OR by a posed bone — those pixels land somewhere else on
+  // the composite, so clipping to the plane-space rect would patch the wrong
+  // region and leave the real one stale. Rebuild the whole frame instead —
+  // correct at every angle and scale, and set up after the drawing, not during.
+  if (frameMoved(state.frames.indexOf(f))) {
+    recompositeOne(f);
+    updateThumb(f);
+    for (const g of framesSharingWith(f)) { recompositeOne(g); updateThumb(g); }
+    return;
+  }
+  patchCompositeOne(f, r, override);
+  if (override) return; // live preview — nothing has landed in the plane yet
+  for (const g of framesSharingWith(f)) {
+    patchCompositeOne(g, r);
+    updateThumb(g); // the strip must show the hold changing too
+  }
 }
 
 /** Merge the finished stroke into its plane and record undo history. */
@@ -5601,6 +6448,24 @@ view.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  // Bone tool (B3): grabbing a bone selects it and arms a rotate; dragging on
+  // empty space draws a new bone (a child of the selected one, else a root).
+  if (state.tool === 'bone') {
+    if (rightBtn) return;
+    const hit = boneHitTest(sx, sy);
+    const pf = screenToArtF(sx, sy);
+    if (hit) {
+      state.activeBone = hit.id;
+      boneDrag = { kind: 'rotate', bone: hit };
+    } else {
+      boneDrag = { kind: 'draw', ax: pf.x, ay: pf.y, bx: pf.x, by: pf.y, parent: activeBone() };
+    }
+    view.setPointerCapture(e.pointerId);
+    renderLayers(); // the bind button follows the selection
+    render();
+    return;
+  }
+
   // Pen tool: place/extend the construction path.
   if (state.tool === 'pen') {
     if (rightBtn) { penCommit(); return; } // right-click finishes the path
@@ -5777,6 +6642,29 @@ view.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  // ⚠ Phase 13: a transform is applied at COMPOSITE time — the plane itself is
+  // never moved. So on a transformed frame the pixels you see are not where
+  // the plane holds them, and a stroke would land offset from the cursor by
+  // exactly the transform. Refuse it and say why, rather than paint somewhere
+  // the artist is not looking. (Inverse-mapping the input so painting works
+  // through a transform is a real follow-up, not a rejected idea.)
+  if (!xfIsIdentity(xfAt(state.layers[state.layer], state.frame))) {
+    flashHint('This layer is transformed on this frame — painting is off. '
+            + 'Clear its keys, or edit on a frame where it sits at rest.');
+    return;
+  }
+  // Same reasoning for a layer moved by a POSED bone (B3): the plane is at rest,
+  // the composite is not, so a stroke would land offset. Pose to rest, or edit
+  // on a frame where the rig is unposed.
+  {
+    const bm = state.layers[state.layer].bone;
+    if (bm && boneById(bm) && boneMovesAt(boneById(bm), state.frame)) {
+      flashHint('This layer follows a posed bone here — painting is off. '
+              + 'Edit it on a frame where its rig sits at rest.');
+      return;
+    }
+  }
+
   // Freeform painting & filling (select was handled above, both modes).
   if (state.mode === 'free') {
     const vecLayer = state.layers[state.layer].kind === 'vector';
@@ -5876,6 +6764,20 @@ view.addEventListener('pointermove', (e) => {
     state.panX = panAnchor.panX + (sx - panAnchor.sx);
     state.panY = panAnchor.panY + (sy - panAnchor.sy);
     renderSoon();
+    return;
+  }
+
+  // Bone tool (B3): live-pose or draw-preview.
+  if (boneDrag) {
+    const q = screenToArtF(sx, sy);
+    if (boneDrag.kind === 'rotate') {
+      setBoneKey(boneDrag.bone, state.frame, { rot: poseRotateTo(boneDrag.bone, state.frame, q.x, q.y) });
+      recompositeOne(cur()); // live: just the shown frame; commit rebuilds the rest
+      render();
+    } else {
+      boneDrag.bx = q.x; boneDrag.by = q.y;
+      render(); // drawSkeleton draws the dashed preview segment
+    }
     return;
   }
 
@@ -6241,6 +7143,26 @@ function cancelPointerInput() {
 }
 
 function pointerEnd(e) {
+  // Bone tool (B3): commit the gesture. A rotate was already keyed live, so just
+  // finalize the timeline + thumbs; a draw creates the bone (or, if it barely
+  // moved, was a plain click — select-on-hit already ran, empty deselects).
+  if (boneDrag) {
+    const bd = boneDrag;
+    boneDrag = null;
+    if (bd.kind === 'draw') {
+      if (Math.hypot(bd.bx - bd.ax, bd.by - bd.ay) * state.zoom > 4) {
+        state.activeBone = createBoneFromDrag(bd.ax, bd.ay, bd.bx, bd.by, bd.parent).id;
+        afterRigChange();
+      } else { // a click on empty space clears the selection
+        state.activeBone = null;
+        renderLayers();
+        render();
+      }
+    } else {
+      afterRigChange();
+    }
+    return;
+  }
   if (e.pointerType === 'touch' && touchPts.delete(e.pointerId) && gesture) {
     // Still two fingers down: re-anchor around the survivors (the pair may
     // have changed). Fewer ends the gesture — and the leftover finger stays
@@ -6378,14 +7300,27 @@ window.addEventListener('keydown', (e) => {
     case 'KeyU': selectTool('smudge'); break;           // freeform only (guarded)
     case 'KeyG': selectTool('fill'); break;
     case 'KeyI': selectTool('eyedropper'); break;
-    case 'KeyH': selectTool('pan'); break;
+    // Shift+H toggles the ACTIVE LAYER's hold on this frame (13a); plain H is
+    // still the pan tool. The switch ignores Shift otherwise, so these two
+    // cases are the only places it matters.
+    case 'KeyH': if (e.shiftKey) toggleHold(); else selectTool('pan'); break;
     case 'KeyS': selectTool('select'); break;
-    case 'Escape': if (penPath) penCommit(); else cancelSelection(); break;
+    case 'KeyK': selectTool('bone'); break;              // sKeleton / rig
+    case 'Escape':
+      if (state.tool === 'bone' && state.activeBone) { state.activeBone = null; renderLayers(); render(); }
+      else if (penPath) penCommit();
+      else cancelSelection();
+      break;
     case 'Comma': selectFrame(state.frame - 1); break;   // previous frame
     case 'Period': selectFrame(state.frame + 1); break;  // next frame
-    case 'KeyN': addFrame(); break;
+    case 'KeyN': if (e.shiftKey) addHoldFrame(); else addFrame(); break;
     case 'KeyD': dupFrame(); break;
     case 'Delete':
+      // Bone tool with a selected bone → delete it and its subtree.
+      if (state.tool === 'bone' && state.activeBone && !selection && !floating) {
+        deleteBone(activeBone());
+        break;
+      }
       // Hovering an anchor of the selected vector stroke → remove just that
       // anchor (Illustrator's direct-select delete). Otherwise Delete clears
       // an active selection, or deletes the frame.
@@ -6435,6 +7370,10 @@ function selectFrame(i) {
     el.classList.toggle('active', n === state.frame);
   });
   refreshLayerThumbs(); // layer panel thumbnails track the edited frame
+  refreshExposureUI();  // ...and so do the hold badges / toggle (13a)
+  refreshDopeCurrent(); // ...and the sheet's current-column marker
+  refreshXfBar();       // ...and the transform values shown for this frame
+  refreshCamBar();      // ...and the camera values (global, but per-frame)
   updateStatus();
   updateUI(); // Undo/Redo availability is per-plane in locked mode
   render();
@@ -6442,7 +7381,16 @@ function selectFrame(i) {
 
 /** Insert a frame after the current one and switch to it. */
 function insertFrame(f) {
-  state.frames.splice(state.frame + 1, 0, f);
+  const at = state.frame + 1;
+  // Keys address frames by index, so everything from the insertion point on
+  // shifts one later — otherwise adding a frame in the middle silently
+  // re-times every animation after it (Phase 13).
+  remapKeys((kf) => (kf >= at ? kf + 1 : kf));
+  state.frames.splice(at, 0, f);
+  // Inserting INTO a hold run separates its ends while they still share one
+  // drawing — see normalizeExposure. (The held frame `addHoldFrame` builds is
+  // inserted directly after the frame it holds, so it is never the casualty.)
+  normalizeExposure();
   renderFrames();
   selectFrame(state.frame + 1);
   // Structural changes carry NO undo entry, so the undo-seam hooks never see
@@ -6487,6 +7435,10 @@ function deleteFrame() {
   commitFloat();
   const hasArt = cur().layers.some(planeHasArt);
   if (hasArt && !confirm(`Delete frame ${state.frame + 1}? This can't be undone.`)) return;
+  const gone = state.frame;
+  // Keys on the deleted frame go with it; later ones shift one earlier, or the
+  // animation after this point would drift (Phase 13).
+  remapKeys((kf) => (kf === gone ? -1 : kf > gone ? kf - 1 : kf));
   state.frames.splice(state.frame, 1);
   if (!state.frames.length) state.frames.push(makeFrame()); // never zero frames
   renderFrames();
@@ -6495,13 +7447,314 @@ function deleteFrame() {
   updateUI(); // history entries for the deleted frame are skipped by applyHistory
 }
 
+/* ---- Phase 13a: exposure / holds -------------------------------------
+ * A layer's drawing is EXPOSED across one or more consecutive frames. A held
+ * cell simply references the same plane object as the cell before it, so:
+ *   - a hold costs no memory and no stored blob (the id is written once);
+ *   - editing the drawing changes every frame holding it, by construction;
+ *   - "how long is this drawing on screen" is just how far the reference runs.
+ * This is the standard dope-sheet model (Harmony, TVPaint): the frame rate is
+ * uniform and exposure is how many frames a drawing occupies — NOT a variable
+ * per-frame duration. Adding a hold therefore ADDS a column, exactly like
+ * shooting on twos adds frames to a real exposure sheet.
+ * -------------------------------------------------------------------- */
+
+/** Is this cell a continuation of the drawing before it? */
+function isHeldAt(fi, li) {
+  return fi > 0 && state.frames[fi] && state.frames[fi - 1] &&
+         state.frames[fi].layers[li] === state.frames[fi - 1].layers[li];
+}
+
+/** How many frames the drawing at (fi, li) is exposed for, and where its run
+ *  starts — what the strip badge and the status line report. */
+function exposureAt(fi, li) {
+  const plane = state.frames[fi].layers[li];
+  let start = fi;
+  while (start > 0 && state.frames[start - 1].layers[li] === plane) start--;
+  let end = fi;
+  while (end < state.frames.length - 1 &&
+         state.frames[end + 1].layers[li] === plane) end++;
+  return { start, end, length: end - start + 1 };
+}
+
+/** Does any layer of any frame hold a drawing? Drives the save version, so a
+ *  project that never uses holds keeps writing its old format byte-identically. */
+function anyHolds() {
+  for (let fi = 1; fi < state.frames.length; fi++) {
+    for (let li = 0; li < state.layers.length; li++) if (isHeldAt(fi, li)) return true;
+  }
+  return false;
+}
+
+/**
+ * Hold (fi, li): drop this cell's own drawing and reference the previous cell's
+ * instead. The discarded plane simply stops being referenced — autosave's
+ * prune pass drops its blob because it asks the STORE what it holds rather
+ * than trusting memory (Phase 11), so nothing leaks.
+ */
+function holdAt(fi, li) {
+  if (fi <= 0) return false; // frame 1 has nothing before it to hold
+  if (isHeldAt(fi, li)) return true; // already held — idempotent
+  state.frames[fi].layers[li] = state.frames[fi - 1].layers[li];
+  return true;
+}
+
+/** Give this cell its OWN copy of whatever drawing it currently references,
+ *  unconditionally. The copy is a real new plane (fresh id), which is how
+ *  autosave notices it. */
+function detachCell(fi, li) {
+  const src = state.frames[fi].layers[li];
+  const seed = src.strokes ? src.strokes
+    : state.mode === 'free' ? src.canvas : src.pixels.slice();
+  const copy = makePlane(seed, state.layers[li].kind === 'vector');
+  if (state.mode === 'pixel') repaintLayer(copy); // free/vector: makePlane drew it
+  state.frames[fi].layers[li] = copy;
+  return copy;
+}
+
+/**
+ * Break a hold: this cell stops sharing, so it can be edited without changing
+ * the frames that were holding it.
+ *
+ * ⚠ The REST OF THE RUN has to come with it. Detaching only this cell would
+ * leave the original drawing referenced by the frames BEFORE the break and the
+ * ones AFTER it — a non-contiguous share, the exact state normalizeExposure
+ * exists to prevent: the sheet would show a start where nothing new was drawn,
+ * and editing the earlier frames would silently change the later ones. Moving
+ * the tail onto the new drawing is also what every animation tool means by
+ * breaking a hold — a new drawing begins here, and whatever was holding
+ * through this point goes on holding THIS one.
+ */
+function breakHoldAt(fi, li) {
+  if (!isHeldAt(fi, li)) return false;
+  const src = state.frames[fi].layers[li];
+  const copy = detachCell(fi, li);
+  for (let f = fi + 1; f < state.frames.length; f++) {
+    if (state.frames[f].layers[li] !== src) break; // the run ended
+    state.frames[f].layers[li] = copy;
+  }
+  return true;
+}
+
+/**
+ * ⚠ THE INVARIANT that keeps exposure coherent: a plane may be shared only by
+ * a CONTIGUOUS run of frames. Sharing is object identity, but "held" is
+ * adjacency (`isHeldAt`), and any structural op can pull the two apart —
+ * inserting a frame into the middle of a run, or moving one out of it, leaves
+ * two non-adjacent cells still pointing at one drawing. That state is
+ * genuinely broken, not merely untidy: the strip shows no hold, yet editing
+ * one frame silently changes the other, and saving writes the drawing twice so
+ * the pair quietly becomes independent on reload.
+ *
+ * So every op that reorders, inserts or deletes frames calls this, and any
+ * cell whose reuse is non-contiguous is detached into its own drawing — which
+ * is also what an animator means by dragging a held frame away from the
+ * drawing it was holding.
+ */
+function normalizeExposure() {
+  for (let li = 0; li < state.layers.length; li++) {
+    const lastSeen = new Map(); // plane -> the most recent frame index using it
+    for (let fi = 0; fi < state.frames.length; fi++) {
+      const p = state.frames[fi].layers[li];
+      const prev = lastSeen.get(p);
+      if (prev === undefined || prev === fi - 1) { // new, or still contiguous
+        lastSeen.set(p, fi);
+        continue;
+      }
+      lastSeen.set(detachCell(fi, li), fi);
+    }
+  }
+}
+
+/** Toggle the active layer's exposure at the current frame: a held cell breaks
+ *  into its own drawing, an independent one starts holding the previous. */
+function toggleHold() {
+  commitFloat();
+  const fi = state.frame, li = state.layer;
+  if (isHeldAt(fi, li)) {
+    breakHoldAt(fi, li);
+    flashHint(`"${state.layers[li].name}" now has its own drawing on frame ${fi + 1}.`);
+  } else {
+    if (fi === 0) { flashHint('Frame 1 has no earlier drawing to hold.'); return; }
+    // Refuse to silently discard real art — a hold throws this cell's drawing
+    // away, and on an undo-less structural op that is not recoverable.
+    if (planeHasArt(state.frames[fi].layers[li]) &&
+        !confirm(`Hold the previous drawing on "${state.layers[li].name}"?\n\n`
+               + `This frame's own art on that layer is discarded. This can't be undone.`)) {
+      return;
+    }
+    holdAt(fi, li);
+    const e = exposureAt(fi, li);
+    flashHint(`"${state.layers[li].name}" held — exposed for ${e.length} frames.`);
+  }
+  markDocDirty(); // structural, no undo entry — see insertFrame
+  recompositeAll();
+  renderFrames();
+  refreshLayerThumbs();
+  updateStatus();
+  render();
+}
+
+/** "+ Hold": add a column that holds EVERY layer — shooting on twos in one
+ *  click. The new frame references the current frame's planes wholesale, so it
+ *  allocates nothing. */
+function addHoldFrame() {
+  commitFloat();
+  insertFrame(makeFrame(null, cur().layers)); // adopt = reference, don't allocate
+  flashHint('Held frame added — every layer keeps its current drawing.');
+}
+
+/* ---- Transform keys: editing ops (Phase 13) --------------------------- */
+
+/** The key exactly ON this frame, or null. */
+const keyAt = (m, fi) =>
+  (m.xf && m.xf.keys ? m.xf.keys.find((k) => k.f === fi) : null) || null;
+
+/** Ensure the layer has a track and return it. */
+function ensureTrack(m) {
+  if (!m.xf) m.xf = { pivot: null, keys: [] };
+  if (!m.xf.keys) m.xf.keys = [];
+  return m.xf;
+}
+
+/**
+ * Write a key at `fi`, merging `vals` over whatever the layer is ALREADY doing
+ * there. Merging over the interpolated value (not over identity) is what makes
+ * keying feel right: dropping a key mid-tween must not jerk the layer back to
+ * rest, it must pin the pose it is currently passing through.
+ */
+function setKey(m, fi, vals) {
+  const xf = ensureTrack(m);
+  const base = xfAt(m, fi) || XF_ID;
+  const k = cleanKey({ ...base, ...vals, f: fi });
+  const i = xf.keys.findIndex((q) => q.f === fi);
+  if (i === -1) {
+    xf.keys.push(k);
+    xf.keys.sort((a, b) => a.f - b.f); // evaluation assumes sorted order
+  } else {
+    xf.keys[i] = k;
+  }
+  return k;
+}
+
+/** Remove the key on this frame. Dropping the last one removes the track
+ *  entirely, so the layer goes back to serializing nothing. */
+function removeKey(m, fi) {
+  if (!m.xf || !m.xf.keys) return false;
+  const i = m.xf.keys.findIndex((k) => k.f === fi);
+  if (i === -1) return false;
+  m.xf.keys.splice(i, 1);
+  if (!m.xf.keys.length && !m.xf.pivot) m.xf = null;
+  return true;
+}
+
+/** Drop a layer's animation altogether — the way back to a plain layer. */
+function clearTrack(m) {
+  if (!m.xf) return false;
+  m.xf = null;
+  return true;
+}
+
+/* ---- Camera keys: editing ops (Phase 13) ----------------------------
+ * The global camera track's counterparts to setKey/removeKey/clearTrack, so
+ * the camera bar auto-keys exactly like the transform bar. Frame-index re-timing
+ * is handled inside remapKeys (below), which already walks the camera track. */
+
+/** The camera key exactly ON this frame, or null. */
+const camKeyAt = (fi) =>
+  (state.camera && state.camera.keys ? state.camera.keys.find((k) => k.f === fi) : null) || null;
+
+/** Ensure the camera track exists and return it. */
+function ensureCamera() {
+  if (!state.camera) state.camera = { keys: [] };
+  if (!state.camera.keys) state.camera.keys = [];
+  return state.camera;
+}
+
+/** Write a camera key at `fi`, merging `vals` over whatever the camera is
+ *  ALREADY doing there — the same "merge over the interpolated value, not over
+ *  identity" rule as setKey, so pinning mid-move doesn't jerk the camera back. */
+function setCamKey(fi, vals) {
+  const cam = ensureCamera();
+  const base = camAt(fi) || CAM_ID;
+  const k = cleanCamKey({ ...base, ...vals, f: fi });
+  const i = cam.keys.findIndex((q) => q.f === fi);
+  if (i === -1) {
+    cam.keys.push(k);
+    cam.keys.sort((a, b) => a.f - b.f); // camAt assumes sorted order
+  } else {
+    cam.keys[i] = k;
+  }
+  return k;
+}
+
+/** Remove the camera key on this frame; dropping the last one removes the
+ *  track, so the project goes back to serializing no camera. */
+function removeCamKey(fi) {
+  if (!state.camera || !state.camera.keys) return false;
+  const i = state.camera.keys.findIndex((k) => k.f === fi);
+  if (i === -1) return false;
+  state.camera.keys.splice(i, 1);
+  if (!state.camera.keys.length) state.camera = null;
+  return true;
+}
+
+/** Drop the camera track altogether. */
+function clearCamera() {
+  if (!state.camera) return false;
+  state.camera = null;
+  return true;
+}
+
+/** Re-time keys when frames are inserted, deleted or reordered. Keys address
+ *  frames by INDEX, so a structural change would otherwise silently re-time
+ *  every animation in the project — the same class of problem the exposure
+ *  invariant guards, one level up. `map` gives each old index its new one, or
+ *  -1 if that frame is gone. */
+// Re-time one key list: move each key by `map`, drop the ones the op removed
+// (-1), and on a collision (two old frames landing on one) keep the earlier key.
+function remapKeyList(keys, map) {
+  const moved = [];
+  for (const k of keys) {
+    const to = map(k.f);
+    if (to >= 0) moved.push({ ...k, f: to });
+  }
+  const seen = new Set();
+  return moved.sort((a, b) => a.f - b.f)
+    .filter((k) => (seen.has(k.f) ? false : (seen.add(k.f), true)));
+}
+
+function remapKeys(map) {
+  for (const m of state.layers) {
+    if (!m.xf || !m.xf.keys) continue;
+    m.xf.keys = remapKeyList(m.xf.keys, map);
+    if (!m.xf.keys.length && !m.xf.pivot) m.xf = null;
+  }
+  // The camera and every bone are non-layer tracks, but they address frames by
+  // index just the same, so a structural frame op must re-time them too or the
+  // whole move silently shifts under the animation.
+  if (state.camera && state.camera.keys) {
+    state.camera.keys = remapKeyList(state.camera.keys, map);
+    if (!state.camera.keys.length) state.camera = null;
+  }
+  for (const b of state.bones || []) {
+    if (!b.xf || !b.xf.keys) continue;
+    b.xf.keys = remapKeyList(b.xf.keys, map);
+    if (!b.xf.keys.length && !b.xf.pivot) b.xf = null;
+  }
+  if (state.bones && state.bones.length) invalidateBones();
+}
+
 /** Swap the current frame with a neighbor (dir: -1 = left, +1 = right). */
 function moveFrame(dir) {
   commitFloat();
   const i = state.frame;
   const j = i + dir;
   if (j < 0 || j >= state.frames.length) return;
+  // The two frames swap places, so their keys swap with them (Phase 13).
+  remapKeys((kf) => (kf === i ? j : kf === j ? i : kf));
   [state.frames[i], state.frames[j]] = [state.frames[j], state.frames[i]];
+  normalizeExposure(); // moving a frame out of its run detaches it — see there
   renderFrames();
   selectFrame(j);
   markDocDirty(); // frame ORDER lives in the manifest — see insertFrame
@@ -6523,22 +7776,548 @@ function renderFrames() {
   const scale = Math.min(THUMB / state.width, THUMB / state.height);
   state.frames.forEach((f, i) => {
     const b = document.createElement('button');
-    b.className = 'frame' + (i === state.frame ? ' active' : '');
-    b.title = `Frame ${i + 1}`;
+    // 13a: a frame every layer holds is a pure exposure frame — it introduces
+    // no new drawing at all. One where only SOME layers hold is marked
+    // differently, because that distinction is the whole point of per-layer
+    // exposure and is invisible from the thumbnail (a held layer looks
+    // identical to a redrawn one).
+    const held = state.layers.map((m, li) => isHeldAt(i, li));
+    const allHeld = i > 0 && held.every(Boolean);
+    const someHeld = !allHeld && held.some(Boolean);
+    b.className = 'frame' + (i === state.frame ? ' active' : '')
+      + (allHeld ? ' held' : someHeld ? ' part-held' : '');
+    const heldNames = state.layers.filter((m, li) => held[li]).map((m) => m.name);
+    b.title = `Frame ${i + 1}`
+      + (allHeld ? ' — held (every layer keeps the previous drawing)'
+        : someHeld ? ` — holding: ${heldNames.join(', ')}` : '');
     const t = document.createElement('canvas');
     t.width = Math.max(1, Math.round(state.width * scale));
     t.height = Math.max(1, Math.round(state.height * scale));
     f.thumb = t;
     updateThumb(f);
     const n = document.createElement('span');
-    n.textContent = i + 1;
+    // A held frame shows a hold mark instead of repeating a number that
+    // implies a new drawing — the exposure-sheet convention.
+    n.textContent = allHeld ? '•' : i + 1;
     b.append(t, n);
     b.addEventListener('click', () => selectFrame(i));
     box.appendChild(b);
   });
+  syncDopeSheet(); // the sheet's columns ARE the frames — keep them in step
 }
 
+/* ---- Dope sheet (13a) ------------------------------------------------
+ * One row per LAYER (nested under its groups — this is why layer groups were
+ * pulled ahead of Phase 13: retrofitting nesting into a flat track list is the
+ * painful refactor §3.6 wanted to avoid), one column per frame. A cell shows
+ * whether that layer's drawing STARTS there or is HELD from the frame before,
+ * which is the one thing the thumbnail strip fundamentally cannot show.
+ *
+ * Rebuilt only on structural change; frame switches and playback go through
+ * the cheap `refreshDopeCurrent`, because a rebuild is layers × frames cells
+ * and would otherwise run on every `,`/`.` keypress.
+ * -------------------------------------------------------------------- */
+let dopeOpen = false;
+let dopeCells = [];  // [{ el, fi, li }] for the cheap refresh pass
+let dopeNumEls = []; // header cells, so the playhead can mark a column
+let dopeBoneRows = []; // [{ el, boneId }] so the active bone's lane can highlight
+let dopeSigCache = null;
+
+/**
+ * A cheap signature of everything that changes the sheet's SHAPE — frame
+ * count, layer order/names, group nesting and collapse. Cell CONTENTS (held,
+ * empty) deliberately aren't in it: those change constantly while drawing and
+ * are handled by refreshDopeCells, which touches no DOM structure.
+ *
+ * The point is that selecting a layer must NOT rebuild the grid. A rebuild
+ * would replace the very cell being clicked (killing the double-click that
+ * toggles a hold) and reset the horizontal scroll to frame 1.
+ */
+function dopeSig() {
+  let s = state.frames.length + ';';
+  const walk = (nodes, d) => {
+    for (const n of nodes) {
+      if (n.type === 'group') {
+        s += `g${d}:${n.name}:${n.collapsed ? 1 : 0};`;
+        walk(n.children, d + 1);
+      } else {
+        // Whether the layer HAS a track is structural — gaining its first key
+        // adds the Transform row, so the sheet must rebuild rather than
+        // restyle. How many keys it holds is not: that only restyles cells.
+        s += `l${d}:${n.layer.name}:${n.layer.xf && n.layer.xf.keys.length ? 1 : 0};`;
+      }
+    }
+  };
+  walk(state.tree, 0);
+  // Whether a Camera lane exists is structural (it adds/removes a row); how many
+  // keys it holds is not — that only restyles cells, via refreshDopeCells.
+  s += `cam${hasCamera() ? 1 : 0};`;
+  // Each bone is a lane whether or not it is keyed, so its very existence (and
+  // name/parent, which set the row label + indentation) is structural. Key
+  // COUNT stays out, like everywhere else — that only restyles cells.
+  for (const b of state.bones || []) s += `b:${b.id}:${b.name}:${b.parent || ''};`;
+  return s;
+}
+
+/** Rebuild if the shape changed, otherwise just restyle the existing cells. */
+function syncDopeSheet() {
+  if (!dopeOpen) return;
+  const sig = dopeSig();
+  if (sig !== dopeSigCache) renderDopeSheet();
+  else refreshDopeCells();
+}
+
+/**
+ * Per-pass memo for "does this drawing have art?". `planeHasArt` scans a whole
+ * pixel array in pixel mode, and every cell asks about its drawing — but a held
+ * run is ONE drawing shown many times, so without this the cost would grow with
+ * the timeline's length rather than with the number of drawings, which is
+ * exactly backwards for a feature whose point is that holds are cheap. Built
+ * fresh per pass, so it can never go stale.
+ */
+function dopeArtCache() {
+  const m = new Map();
+  return (p) => {
+    let v = m.get(p);
+    if (v === undefined) { v = planeHasArt(p); m.set(p, v); }
+    return v;
+  };
+}
+
+/** Update what each cell SHOWS (held / start / empty) without creating or
+ *  destroying anything — so scroll position and element identity survive. */
+function refreshDopeCells() {
+  const hasArt = dopeArtCache();
+  for (const c of dopeCells) {
+    if (c.cam) { // camera lane: global, no layer or drawing involved
+      c.el.className = 'dope-cell dope-key' + (camKeyAt(c.fi) ? ' keyed' : '');
+      continue;
+    }
+    if (c.bone) { // bone lane: keyed or not, no layer or drawing involved
+      const b = boneById(c.bone);
+      c.el.className = 'dope-cell dope-key' + (b && keyAt(b, c.fi) ? ' keyed' : '');
+      continue;
+    }
+    const f = state.frames[c.fi];
+    if (!f || !f.layers[c.li]) continue;
+    if (c.key) { // transform-track row: keyed or not, no drawing involved
+      c.el.className = 'dope-cell dope-key'
+        + (keyAt(state.layers[c.li], c.fi) ? ' keyed' : '');
+      continue;
+    }
+    const held = isHeldAt(c.fi, c.li);
+    c.el.className = 'dope-cell' + (held ? ' held' : ' start')
+      + (hasArt(f.layers[c.li]) ? '' : ' blank');
+  }
+  refreshDopeCurrent(); // className above wiped cur/sel/play — put them back
+}
+
+function renderDopeSheet() {
+  if (!dopeOpen) return; // nothing to build while collapsed
+  dopeSigCache = dopeSig();
+  const nums = $('dope-nums');
+  const body = $('dope-body');
+  const keepScroll = $('dope-scroll').scrollLeft; // never yank the view back to frame 1
+  nums.innerHTML = '';
+  body.innerHTML = '';
+  dopeCells = [];
+  dopeNumEls = [];
+  dopeBoneRows = [];
+
+  state.frames.forEach((f, fi) => {
+    const n = document.createElement('span');
+    n.className = 'dope-num';
+    // Every 5th frame is numbered — a full ruler of numbers at this cell width
+    // is unreadable, and 5s are what exposure sheets are ruled in.
+    n.textContent = (fi === 0 || (fi + 1) % 5 === 0) ? String(fi + 1) : '';
+    nums.appendChild(n);
+    dopeNumEls.push(n);
+  });
+
+  const hasArt = dopeArtCache(); // one scan per DRAWING, not per cell
+  const layerRow = (node, depth) => {
+    const li = state.layers.indexOf(node.layer);
+    const row = document.createElement('div');
+    row.className = 'dope-row';
+    const name = document.createElement('span');
+    name.className = 'dope-name';
+    name.style.paddingLeft = `${6 + depth * 12}px`;
+    name.textContent = node.layer.name;
+    name.title = node.layer.name;
+    name.addEventListener('click', () => selectLayer(li));
+    const cells = document.createElement('div');
+    cells.className = 'dope-cells';
+    state.frames.forEach((f, fi) => {
+      const c = document.createElement('button');
+      const held = isHeldAt(fi, li);
+      const art = hasArt(f.layers[li]);
+      c.className = 'dope-cell' + (held ? ' held' : ' start') + (art ? '' : ' blank');
+      c.title = held
+        ? `${node.layer.name}, frame ${fi + 1} — held. Double-click to give it its own drawing.`
+        : `${node.layer.name}, frame ${fi + 1}${art ? '' : ' (empty)'}`
+          + (fi > 0 ? ' — double-click to hold the previous drawing.' : '');
+      c.addEventListener('click', () => { selectFrame(fi); selectLayer(li); });
+      // Double-click toggles the hold, so exposure is editable from the sheet
+      // itself rather than only through the layer panel's button.
+      c.addEventListener('dblclick', () => {
+        selectFrame(fi);
+        selectLayer(li);
+        toggleHold();
+      });
+      cells.appendChild(c);
+      dopeCells.push({ el: c, fi, li });
+    });
+    row.append(name, cells);
+    body.appendChild(row);
+
+    // A second row for the transform track, shown ONLY once the layer is
+    // animated — an unanimated project keeps the sheet at one row per layer.
+    if (node.layer.xf && node.layer.xf.keys && node.layer.xf.keys.length) {
+      const krow = document.createElement('div');
+      krow.className = 'dope-row dope-keyrow';
+      const kname = document.createElement('span');
+      kname.className = 'dope-name';
+      kname.style.paddingLeft = `${16 + depth * 12}px`;
+      kname.textContent = 'Transform';
+      kname.title = `${node.layer.name} — transform keys`;
+      const kcells = document.createElement('div');
+      kcells.className = 'dope-cells';
+      state.frames.forEach((fr, fi) => {
+        const c = document.createElement('button');
+        const on = !!keyAt(node.layer, fi);
+        c.className = 'dope-cell dope-key' + (on ? ' keyed' : '');
+        c.title = on
+          ? `Key on frame ${fi + 1} — double-click to remove it.`
+          : `No key on frame ${fi + 1} — double-click to set one.`;
+        c.addEventListener('click', () => { selectFrame(fi); selectLayer(li); });
+        c.addEventListener('dblclick', () => {
+          selectFrame(fi);
+          selectLayer(li);
+          if (keyAt(node.layer, fi)) removeKey(node.layer, fi);
+          else setKey(node.layer, fi, {}); // pins the pose it passes through
+          afterXfChange();
+        });
+        kcells.appendChild(c);
+        dopeCells.push({ el: c, fi, li, key: true });
+      });
+      krow.append(kname, kcells);
+      body.appendChild(krow);
+    }
+  };
+
+  const groupRow = (node, depth) => {
+    const row = document.createElement('div');
+    row.className = 'dope-row dope-grouprow';
+    const name = document.createElement('span');
+    name.className = 'dope-name';
+    name.style.paddingLeft = `${6 + depth * 12}px`;
+    name.textContent = (node.collapsed ? '▸ ' : '▾ ') + node.name;
+    name.title = node.name;
+    // Mirrors the layers panel's own collapse, so the two views agree.
+    name.addEventListener('click', () => {
+      node.collapsed = !node.collapsed;
+      renderLayers(); // syncs the sheet too — the shape signature just changed
+    });
+    const cells = document.createElement('div');
+    cells.className = 'dope-cells';
+    row.append(name, cells);
+    body.appendChild(row);
+  };
+
+  // Camera lane (Phase 13): a NON-LAYER track pinned to the TOP of the sheet,
+  // shown only once the project has a camera. It is the row that proves the
+  // sheet's lanes need not be layers (decision 6) — one diamond per key, global,
+  // so a click selects the frame but no layer.
+  if (hasCamera()) {
+    const crow = document.createElement('div');
+    crow.className = 'dope-row dope-keyrow dope-camrow';
+    const cname = document.createElement('span');
+    cname.className = 'dope-name';
+    cname.style.paddingLeft = '6px';
+    cname.textContent = 'Camera';
+    cname.title = 'Camera — a global pan/zoom/rotate track';
+    const ccells = document.createElement('div');
+    ccells.className = 'dope-cells';
+    state.frames.forEach((fr, fi) => {
+      const c = document.createElement('button');
+      const on = !!camKeyAt(fi);
+      c.className = 'dope-cell dope-key' + (on ? ' keyed' : '');
+      c.title = on
+        ? `Camera key on frame ${fi + 1} — double-click to remove it.`
+        : `No camera key on frame ${fi + 1} — double-click to set one.`;
+      c.addEventListener('click', () => selectFrame(fi));
+      c.addEventListener('dblclick', () => {
+        selectFrame(fi);
+        if (camKeyAt(fi)) removeCamKey(fi); else setCamKey(fi, {});
+        afterCamChange();
+      });
+      ccells.appendChild(c);
+      dopeCells.push({ el: c, fi, li: -1, cam: true });
+    });
+    crow.append(cname, ccells);
+    body.appendChild(crow);
+  }
+
+  // Rig lanes (B4): each bone is a NON-LAYER lane under a "Rig" header, in
+  // depth-first order and indented by chain depth — the camera-lane pattern,
+  // generalized to a whole hierarchy. A lane shows whether or not the bone is
+  // keyed (unlike the per-layer Transform row, which only appears once animated)
+  // because a bone always exists as a rig element you can select and key.
+  if (hasRig()) {
+    const hdr = document.createElement('div');
+    hdr.className = 'dope-row dope-grouprow';
+    const hname = document.createElement('span');
+    hname.className = 'dope-name';
+    hname.style.paddingLeft = '6px';
+    hname.textContent = 'Rig';
+    const hcells = document.createElement('div');
+    hcells.className = 'dope-cells';
+    hdr.append(hname, hcells);
+    body.appendChild(hdr);
+
+    for (const { bone, depth } of boneOrder()) {
+      const brow = document.createElement('div');
+      brow.className = 'dope-row dope-keyrow dope-bonerow'
+        + (bone.id === state.activeBone ? ' active' : '');
+      const bname = document.createElement('span');
+      bname.className = 'dope-name';
+      bname.style.paddingLeft = `${16 + depth * 12}px`;
+      bname.textContent = bone.name;
+      bname.title = `${bone.name} — bone pose keys`;
+      bname.addEventListener('click', () => selectBone(bone.id));
+      const bcells = document.createElement('div');
+      bcells.className = 'dope-cells';
+      state.frames.forEach((fr, fi) => {
+        const c = document.createElement('button');
+        const on = !!keyAt(bone, fi);
+        c.className = 'dope-cell dope-key' + (on ? ' keyed' : '');
+        c.title = on
+          ? `${bone.name} key on frame ${fi + 1} — double-click to remove it.`
+          : `No ${bone.name} key on frame ${fi + 1} — double-click to set one.`;
+        c.addEventListener('click', () => { selectFrame(fi); selectBone(bone.id); });
+        c.addEventListener('dblclick', () => {
+          selectFrame(fi);
+          selectBone(bone.id);
+          if (keyAt(bone, fi)) removeKey(bone, fi); else setBoneKey(bone, fi, {});
+          afterRigChange();
+        });
+        bcells.appendChild(c);
+        dopeCells.push({ el: c, fi, bone: bone.id });
+      });
+      brow.append(bname, bcells);
+      body.appendChild(brow);
+      dopeBoneRows.push({ el: brow, boneId: bone.id });
+    }
+  }
+
+  // Top-first, matching the layers panel — a track list that disagreed with
+  // the layer panel about order would be its own bug report.
+  const walk = (nodes, depth) => {
+    for (let k = nodes.length - 1; k >= 0; k--) {
+      const node = nodes[k];
+      if (node.type === 'group') {
+        groupRow(node, depth);
+        if (!node.collapsed) walk(node.children, depth + 1);
+      } else {
+        layerRow(node, depth);
+      }
+    }
+  };
+  walk(state.tree, 0);
+  $('dope-scroll').scrollLeft = keepScroll;
+  refreshDopeCurrent();
+}
+
+/** Mark the edited frame's column (and the playhead's, while playing) without
+ *  rebuilding the grid. */
+function refreshDopeCurrent() {
+  if (!dopeOpen) return;
+  const play = playing ? playFrame : -1;
+  for (let i = 0; i < dopeNumEls.length; i++) {
+    dopeNumEls[i].classList.toggle('cur', i === state.frame);
+    dopeNumEls[i].classList.toggle('play', i === play);
+  }
+  for (const c of dopeCells) {
+    c.el.classList.toggle('cur', c.fi === state.frame);
+    c.el.classList.toggle('play', c.fi === play);
+    c.el.classList.toggle('sel', c.fi === state.frame && c.li === state.layer);
+  }
+  // Light the selected bone's lane — cheap, so it follows selection without a
+  // rebuild (activeBone is deliberately out of dopeSig).
+  for (const r of dopeBoneRows) r.el.classList.toggle('active', r.boneId === state.activeBone);
+}
+
+function setDopeOpen(on) {
+  dopeOpen = on;
+  $('dopesheet').hidden = !on;
+  $('btn-dope').innerHTML = (on ? '&#9652;' : '&#9662;') + ' Sheet';
+  $('btn-dope').classList.toggle('active', on);
+  try { localStorage.setItem('ssm.dope', on ? '1' : '0'); }
+  catch { /* storage blocked — it just won't survive reload */ }
+  dopeSigCache = null; // force a build on open; the sheet is stale while closed
+  if (on) { renderDopeSheet(); refreshXfBar(); refreshCamBar(); }
+}
+
+$('btn-dope').addEventListener('click', () => setDopeOpen(!dopeOpen));
+
+/* ---- Transform bar (Phase 13) ---------------------------------------
+ * Shows the ACTIVE layer's transform on the CURRENT frame and writes keys.
+ *
+ * AUTO-KEY: editing any field sets a key on this frame. Chosen over an
+ * explicit arm-record toggle because a value you typed silently not being
+ * recorded is the worse failure — and the ◆ Key button still exists for
+ * pinning a pose without changing it.
+ * -------------------------------------------------------------------- */
+const DEG = 180 / Math.PI;
+
+/** What the transform bar edits: the SELECTED BONE when one is active, else the
+ *  ACTIVE LAYER. This is what makes the one bar double as the bone bar (B4) —
+ *  bone poses and layer transforms are the same keyed-track shape, so the same
+ *  fields drive both. */
+function xfTarget() {
+  const bone = activeBone();
+  return bone ? { obj: bone, isBone: true } : { obj: state.layers[state.layer], isBone: false };
+}
+
+/** Push the current target's transform on this frame into the bar's fields. */
+function refreshXfBar() {
+  if (!dopeOpen) return;
+  const { obj: m, isBone } = xfTarget();
+  if (!m) return;
+  const t = xfAt(m, state.frame) || XF_ID;
+  const onKey = !!keyAt(m, state.frame);
+  $('xf-target').textContent = m.name;
+  $('xf-target').classList.toggle('keyed', onKey);
+  $('xf-target').classList.toggle('bone', isBone); // the label styles as a bone
+  $('inp-xf-x').value = Math.round(t.x * 10) / 10;
+  $('inp-xf-y').value = Math.round(t.y * 10) / 10;
+  $('inp-xf-rot').value = Math.round(t.rot * DEG * 10) / 10;
+  $('inp-xf-scale').value = Math.round(t.sx * 1000) / 10;
+  $('inp-xf-alpha').value = Math.round(t.a * 100);
+  $('inp-xf-alpha').disabled = isBone; // a bone is RIGID — it carries no alpha
+  $('sel-xf-ease').value = (keyAt(m, state.frame) || { ease: 'inout' }).ease;
+  $('btn-xf-unkey').disabled = !onKey;
+  $('btn-xf-clear').disabled = !m.xf;
+}
+
+/** Everything that has to happen after a track changes. */
+function afterXfChange() {
+  markDocDirty(); // structural, no undo entry — same as the other frame ops
+  recompositeAll();
+  renderFrames();  // strip thumbs show the transformed result
+  syncDopeSheet();
+  refreshXfBar();
+  updateStatus();
+  render();
+}
+
+/** Write one field of the current frame's key on the bar's target, creating it
+ *  if needed. A bone edit recomposites the rig; a layer edit its own track. */
+function xfEdit(vals) {
+  const { obj: m, isBone } = xfTarget();
+  if (!m) return;
+  setKey(m, state.frame, vals);
+  if (isBone) afterRigChange(); else afterXfChange();
+}
+
+const xfNum = (id, d = 0) => {
+  const v = parseFloat($(id).value);
+  return Number.isFinite(v) ? v : d;
+};
+
+$('inp-xf-x').addEventListener('change', () => xfEdit({ x: xfNum('inp-xf-x') }));
+$('inp-xf-y').addEventListener('change', () => xfEdit({ y: xfNum('inp-xf-y') }));
+$('inp-xf-rot').addEventListener('change', () => xfEdit({ rot: xfNum('inp-xf-rot') / DEG }));
+$('inp-xf-scale').addEventListener('change', () => {
+  const s = xfNum('inp-xf-scale', 100) / 100;
+  xfEdit({ sx: s, sy: s }); // uniform in the UI; the model keeps both axes
+});
+$('inp-xf-alpha').addEventListener('change', () =>
+  xfEdit({ a: clamp(xfNum('inp-xf-alpha', 100) / 100, 0, 1) }));
+$('sel-xf-ease').addEventListener('change', () =>
+  xfEdit({ ease: $('sel-xf-ease').value }));
+
+// Pin the pose the layer is currently passing through, without changing it —
+// setKey merges over the interpolated value, so this is exactly that.
+$('btn-xf-key').addEventListener('click', () => xfEdit({}));
+
+$('btn-xf-unkey').addEventListener('click', () => {
+  const { obj: m, isBone } = xfTarget();
+  if (m && removeKey(m, state.frame)) (isBone ? afterRigChange() : afterXfChange());
+});
+
+$('btn-xf-clear').addEventListener('click', () => {
+  const { obj: m, isBone } = xfTarget();
+  if (!m || !m.xf) return;
+  if (!confirm(`Remove all ${isBone ? 'pose' : 'transform'} keys from "${m.name}"?`)) return;
+  clearTrack(m);
+  if (isBone) afterRigChange(); else afterXfChange();
+});
+
+/* ---- Camera bar (Phase 13) ------------------------------------------
+ * The transform bar's twin for the GLOBAL camera track: shows the camera on
+ * the CURRENT frame and auto-keys on edit. Because the camera is applied at
+ * OUTPUT time (Model A), a change never touches the composites — so unlike
+ * afterXfChange this does NOT recomposite; it just repaints the view (overlay),
+ * the preview and the sheet. */
+
+/** Push the current frame's camera into the bar's fields. */
+function refreshCamBar() {
+  if (!dopeOpen) return;
+  const c = camAt(state.frame) || CAM_ID;
+  const onKey = !!camKeyAt(state.frame);
+  const exists = hasCamera();
+  $('cam-target').classList.toggle('keyed', onKey);
+  $('cam-target').classList.toggle('dim', !exists);
+  $('inp-cam-x').value = Math.round(c.x * 10) / 10;
+  $('inp-cam-y').value = Math.round(c.y * 10) / 10;
+  $('inp-cam-zoom').value = Math.round(c.zoom * 1000) / 10;
+  $('inp-cam-rot').value = Math.round(c.rot * DEG * 10) / 10;
+  $('sel-cam-ease').value = (camKeyAt(state.frame) || { ease: 'inout' }).ease;
+  $('btn-cam-unkey').disabled = !onKey;
+  $('btn-cam-clear').disabled = !exists;
+}
+
+/** Everything that has to happen after the camera track changes. */
+function afterCamChange() {
+  markDocDirty();  // structural, no undo entry — same as the transform track
+  syncDopeSheet(); // gains/loses the Camera lane; restyles its key cells
+  refreshCamBar();
+  updatePreview(); // the preview shows the framed view
+  updateStatus();
+  render();        // main view: the overlay quad follows the camera
+}
+
+/** Write one field of the current frame's camera key, creating it if needed. */
+function camEdit(vals) {
+  setCamKey(state.frame, vals);
+  afterCamChange();
+}
+
+$('inp-cam-x').addEventListener('change', () => camEdit({ x: xfNum('inp-cam-x') }));
+$('inp-cam-y').addEventListener('change', () => camEdit({ y: xfNum('inp-cam-y') }));
+$('inp-cam-zoom').addEventListener('change', () =>
+  camEdit({ zoom: clamp(xfNum('inp-cam-zoom', 100) / 100, 0.01, 100) }));
+$('inp-cam-rot').addEventListener('change', () => camEdit({ rot: xfNum('inp-cam-rot') / DEG }));
+$('sel-cam-ease').addEventListener('change', () => camEdit({ ease: $('sel-cam-ease').value }));
+
+// ◆ Key pins the camera pose it is passing through (and starts the camera here
+// if none exists yet) — setCamKey merges over the interpolated value.
+$('btn-cam-key').addEventListener('click', () => camEdit({}));
+
+$('btn-cam-unkey').addEventListener('click', () => {
+  if (removeCamKey(state.frame)) afterCamChange();
+});
+
+$('btn-cam-clear').addEventListener('click', () => {
+  if (!hasCamera()) return;
+  if (!confirm('Remove the entire camera track?')) return;
+  clearCamera();
+  afterCamChange();
+});
+
 $('btn-frame-add').addEventListener('click', addFrame);
+$('btn-frame-hold').addEventListener('click', addHoldFrame);
 $('btn-frame-dup').addEventListener('click', dupFrame);
 $('btn-frame-del').addEventListener('click', deleteFrame);
 $('btn-frame-left').addEventListener('click', () => moveFrame(-1));
@@ -6573,6 +8352,11 @@ bindToggle('chk-undo-across', 'undoAcrossLayers', () => {
 
 /** Restore per-browser editor settings on boot. */
 function loadSettings() {
+  try {
+    // The sheet is a workspace preference like the panel toggles — whether you
+    // animate with it open shouldn't depend on which project you opened.
+    if (localStorage.getItem('ssm.dope') === '1') setDopeOpen(true);
+  } catch { /* storage blocked — it just opens closed */ }
   try {
     if (localStorage.getItem('ssm.undoAcross') === '1') {
       state.undoAcrossLayers = true;
@@ -6716,8 +8500,12 @@ function refreshLayerThumbs() {
 }
 
 /** Shared "opacity% / blend initial / lock" badge text for a leaf or group. */
-function appearanceBadges(m, isGroup) {
+function appearanceBadges(m, isGroup, li) {
   const parts = [];
+  // 13a: this layer is HELD on the current frame — it shows the previous
+  // frame's drawing. Leading, because it is a property of what you're looking
+  // at right now rather than of the layer itself.
+  if (!isGroup && li >= 0 && isHeldAt(state.frame, li)) parts.push('≡');
   if (!isGroup && m.kind === 'vector') parts.push('V');
   if (m.opacity !== 1) parts.push(`${Math.round(m.opacity * 100)}%`);
   if (m.blend !== 'normal') parts.push(m.blend[0].toUpperCase());
@@ -6731,9 +8519,15 @@ function appearanceBadges(m, isGroup) {
  * their children indented one level; a collapsed group hides its children.
  * Leaf rows carry the flat index they map to (their position in flatten order).
  */
+// 13a: {meta, badges} per rendered LEAF row, so refreshExposureUI can update
+// the hold badges on a frame switch without rebuilding the panel (which would
+// lose its scroll position) and without querying the DOM.
+let exposureRows = [];
+
 function renderLayers() {
   const box = $('layers');
   box.innerHTML = '';
+  exposureRows = [];
   skipLayerClick = false; // fresh rows; no stale drag-click to swallow
   const scale = Math.min(LAYER_THUMB / state.width, LAYER_THUMB / state.height);
   const idxOf = new Map(flattenLeaves(state.tree).map((n, i) => [n, i]));
@@ -6761,7 +8555,8 @@ function renderLayers() {
     name.title = 'Click to select · double-click to rename';
     const badges = document.createElement('span');
     badges.className = 'layer-badges';
-    badges.textContent = appearanceBadges(m, false);
+    badges.textContent = appearanceBadges(m, false, i);
+    exposureRows.push({ meta: m, badges });
     row.__node = node; // for drag hit-testing (see startLayerDrag/dropSlotFor)
     row.addEventListener('pointerdown', (e) => startLayerDrag(e, node, row));
     row.addEventListener('click', () => {
@@ -6839,6 +8634,43 @@ function renderLayers() {
   $('btn-layer-lock').classList.toggle('active', sel.alphaLock === true);
   $('btn-layer-lock').disabled = !!state.selGroup; // groups have no alpha lock
   $('btn-layer-ungroup').disabled = !state.selGroup; // only a group can be ungrouped
+  // Bind button (B3): lit when the selected LEAF follows a bone; a group can't
+  // bind (whole-layer rigid binding only, weights/sub-part binding deferred).
+  const bindBtn = $('btn-layer-bind');
+  if (bindBtn) {
+    bindBtn.classList.toggle('active', !state.selGroup && !!sel.bone);
+    bindBtn.disabled = !!state.selGroup;
+  }
+  refreshExposureUI();
+  // The sheet's rows ARE the layer tree. Cheap unless the shape changed —
+  // selecting a layer must not rebuild it (see dopeSig).
+  syncDopeSheet();
+  refreshXfBar(); // the bar follows the ACTIVE layer
+}
+
+/**
+ * 13a: refresh the parts of the layer panel that depend on the CURRENT FRAME
+ * rather than on the layer list — the hold toggle and each row's hold badge.
+ * Split out of renderLayers because switching frames changes all of it without
+ * changing a single layer, and rebuilding the whole panel on every `,`/`.`
+ * would throw away the panel's scroll position.
+ */
+function refreshExposureUI() {
+  const holdBtn = $('btn-layer-hold');
+  if (holdBtn) {
+    // Exposure is a per-LEAF property, so the toggle is meaningless for a
+    // group, and frame 1 has nothing before it to hold.
+    holdBtn.classList.toggle('active',
+      !state.selGroup && isHeldAt(state.frame, state.layer));
+    holdBtn.disabled = !!state.selGroup || state.frame === 0;
+  }
+  // Walks the rows leafRow() recorded rather than querying the DOM: the row
+  // keeps a direct handle on its own badges span, so this needs no selector
+  // support and no classList — both of which the headless shim only partly has.
+  for (const row of exposureRows) {
+    row.badges.textContent =
+      appearanceBadges(row.meta, false, state.layers.indexOf(row.meta));
+  }
 }
 
 /* --- Layer/group drag-and-drop reorg (pointer-based, like the float drags) ---
@@ -7176,6 +9008,19 @@ function rasterizeLayer() {
 }
 
 $('btn-layer-raster').addEventListener('click', rasterizeLayer);
+$('btn-layer-hold').addEventListener('click', toggleHold);
+
+// Bind / unbind the active layer to the SELECTED bone (B3). Rigid: the whole
+// layer follows the bone. Toggling off, or picking a different bone, is one tap.
+$('btn-layer-bind').addEventListener('click', () => {
+  if (state.selGroup) { flashHint('Select a layer to bind — groups can’t bind.'); return; }
+  const m = state.layers[state.layer];
+  if (!m) return;
+  const bone = activeBone();
+  if (!bone) { flashHint('Select a bone first with the Bone tool (K).'); return; }
+  m.bone = m.bone === bone.id ? null : bone.id; // toggle against the picked bone
+  afterRigChange();
+});
 
 /**
  * The + button. A freeform project can hold raster AND vector layers, so +
@@ -7314,7 +9159,9 @@ const fps = () => clamp(parseInt($('inp-fps').value, 10) || 8, 1, 60);
 
 function drawPreview(f) {
   prevCtx.clearRect(0, 0, preview.width, preview.height);
-  prevCtx.drawImage(f.canvas, 0, 0);
+  // The preview is the "what it looks like" view, so it shows the frame through
+  // the camera (Model A). cameraView is f.canvas when the camera is at rest.
+  prevCtx.drawImage(cameraView(f), 0, 0);
 }
 
 /** While stopped, the popup mirrors the frame being edited (live). */
@@ -7328,6 +9175,7 @@ function markPlayFrame(i) {
   document.querySelectorAll('#frames .frame').forEach((el, n) => {
     el.classList.toggle('playing', n === i);
   });
+  refreshDopeCurrent(); // the sheet shows the playhead too
 }
 
 function playTick() {
@@ -7384,6 +9232,15 @@ $('btn-preview-close').addEventListener('click', () => {
 // Bump when the save format changes; loaders can then migrate old files.
 // v1: frames = [pixelArray]. v2: layers metadata + frames = [[layerPixels]].
 // v3: + mode field; freeform planes are PNG data-URL strings, not arrays.
+// v5: + layer tree (groups), written only when a group exists.
+// v6: + 13a exposure — a null frame cell means "held: same drawing as the
+//     previous frame on this layer". Written only when a hold exists.
+// v7: + Phase 13 transform tracks — per-layer `xf` {pivot?, keys[]}, written
+//     only for an animated layer.
+// v8: + Phase 13 camera track — a global non-layer `camera` {keys[]}, written
+//     only when the project has a camera.
+// v9: + Phase 13 bone rig — a flat `bones[]` (rigid cutout) plus each bound
+//     layer's `bone` id, written only when the project has a rig.
 const PROJECT_VERSION = 4; // v4 = v3 + vector layers (kind + stroke lists)
 
 /** Trigger a browser download of a Blob. */
@@ -7807,29 +9664,45 @@ function importSVGText(text, label) {
  * Layout comes from the "Cols" input: 0/blank = every frame in one horizontal
  * strip (the default game-engine-friendly layout), N = grid N frames wide.
  */
-function exportSheet() {
-  commitFloat();
-  const n = state.frames.length;
+/** The sheet grid layout for `n` frames, honoring the Cols input (0/blank = one
+ *  row). Shared by the PNG sheet and the atlas JSON so their rects can't drift. */
+function sheetLayout(n) {
   let cols = parseInt($('inp-cols').value, 10) || 0;
   if (cols <= 0 || cols > n) cols = n;
-  const rows = Math.ceil(n / cols);
-  // Browsers hard-cap canvas dimensions (~32,767px per side, ~268M px area);
-  // past that toBlob silently yields nothing. Large frames hit this fast.
+  return { cols, rows: Math.ceil(n / cols), n };
+}
+
+/** Compose every frame into one sheet canvas, or null if it would exceed the
+ *  browser's canvas cap (past which toBlob silently yields nothing). */
+function composeSheet() {
+  commitFloat();
+  const { cols, rows, n } = sheetLayout(state.frames.length);
+  // Browsers hard-cap canvas dimensions (~32,767px per side, ~268M px area).
   const sw = cols * state.width;
   const sh = rows * state.height;
   if (sw > 32767 || sh > 32767 || sw * sh > 268435456) {
     alert(`This sheet would be ${sw}×${sh}px — too large for the browser to compose.\n` +
           `Try a different Cols value to make the sheet squarer, or fewer/smaller frames.`);
-    return;
+    return null;
   }
   const sheet = document.createElement('canvas');
   sheet.width = sw;
   sheet.height = sh;
   const g = sheet.getContext('2d');
   state.frames.forEach((f, i) => {
-    g.drawImage(f.canvas, (i % cols) * state.width, Math.floor(i / cols) * state.height);
+    // outputComposite applies the camera (Model A) and is f.canvas when the
+    // camera is at rest, so a camera-less sheet is byte-identical to before.
+    g.drawImage(outputComposite(f), (i % cols) * state.width, Math.floor(i / cols) * state.height);
   });
-  sheet.toBlob(async (blob) => {
+  return { sheet, cols, rows, n };
+}
+
+const sheetName = () => `spritesheet-${state.width}x${state.height}-${state.frames.length}f.png`;
+
+function exportSheet() {
+  const s = composeSheet();
+  if (!s) return;
+  s.sheet.toBlob(async (blob) => {
     // Print projects: tag the PNG with its physical density (pHYs chunk)
     // so the file opens and prints at the true physical size elsewhere.
     if (blob && state.intent === 'print') {
@@ -7837,7 +9710,33 @@ function exportSheet() {
         [Exporters.addPngDpi(new Uint8Array(await blob.arrayBuffer()), state.dpi)],
         { type: 'image/png' });
     }
-    download(`spritesheet-${state.width}x${state.height}-${n}f.png`, blob);
+    download(sheetName(), blob);
+  }, 'image/png');
+}
+
+/**
+ * The sprite sheet PNG plus its Aseprite-style JSON atlas — the export game
+ * engines want (Phaser/PixiJS load the pair directly). The JSON's frame rects
+ * are generated from the SAME layout composeSheet() drew, and its `image`
+ * field names the PNG we download alongside it, so an engine can find it.
+ */
+function exportAtlas() {
+  const s = composeSheet();
+  if (!s) return;
+  const image = sheetName();
+  const json = Exporters.atlasJSON({
+    n: s.n, cols: s.cols, width: state.width, height: state.height,
+    fps: fps(), image,
+  });
+  download(image.replace(/\.png$/i, '.json'),
+    new Blob([json], { type: 'application/json' }));
+  s.sheet.toBlob(async (blob) => {
+    if (blob && state.intent === 'print') {
+      blob = new Blob(
+        [Exporters.addPngDpi(new Uint8Array(await blob.arrayBuffer()), state.dpi)],
+        { type: 'image/png' });
+    }
+    download(image, blob);
   }, 'image/png');
 }
 
@@ -7845,10 +9744,12 @@ function exportSheet() {
 
 const exportBase = () => `${state.width}x${state.height}-${state.frames.length}f`;
 
-/** Every frame PNG-encoded by the browser, as Uint8Arrays (for APNG/ZIP). */
+/** Every frame PNG-encoded by the browser, as Uint8Arrays (for APNG/ZIP).
+ *  Read through outputComposite so a camera move is baked into the exported
+ *  frames (f.canvas when the camera is at rest — no cost, byte-identical). */
 function framePNGs() {
   return Promise.all(state.frames.map((f) => new Promise((resolve, reject) => {
-    f.canvas.toBlob(async (b) => {
+    outputComposite(f).toBlob(async (b) => {
       if (!b) return reject(new Error('PNG encoding failed.'));
       resolve(new Uint8Array(await b.arrayBuffer()));
     }, 'image/png');
@@ -7892,9 +9793,21 @@ $('btn-export-apng').addEventListener('click', (e) => runExport(e.currentTarget,
 
 $('btn-export-video').addEventListener('click', (e) => runExport(e.currentTarget, async () => {
   const { blob, ext } = await Exporters.recordVideo(
-    state.frames.map((f) => f.canvas), state.width, state.height, fps(),
+    // outputComposite bakes in the camera (Model A); each call with no scratch
+    // returns a distinct canvas, so the array never aliases one frame.
+    state.frames.map((f) => outputComposite(f)), state.width, state.height, fps(),
     state.mode === 'free'); // smooth upscaling for painted art, crisp for pixels
   download(`animation-${exportBase()}.${ext}`, blob);
+}));
+
+$('btn-export-webm').addEventListener('click', (e) => runExport(e.currentTarget, async () => {
+  // Alpha-preserving WebM (VP9/VP8) — transparency survives for compositing in
+  // a game engine or editor, where the ordinary video export flattens it to a
+  // dark backdrop. Same camera-baked frames, the sixth arg turns alpha on.
+  const { blob, ext } = await Exporters.recordVideo(
+    state.frames.map((f) => outputComposite(f)), state.width, state.height, fps(),
+    state.mode === 'free', true);
+  download(`animation-${exportBase()}-alpha.${ext}`, blob);
 }));
 
 $('btn-export-zip').addEventListener('click', (e) => runExport(e.currentTarget, async () => {
@@ -7908,8 +9821,29 @@ $('btn-export-zip').addEventListener('click', (e) => runExport(e.currentTarget, 
     new Blob([Exporters.encodeZIP(files)], { type: 'application/zip' }));
 }));
 
-$('btn-export-svg').addEventListener('click', () => exportSVG());
-$('btn-export-pdf').addEventListener('click', (e) => runExport(e.currentTarget, exportPDF));
+/**
+ * ⚠ Phase 13 scope boundary. SVG and PDF export walk the LAYER TREE and emit
+ * each layer's own geometry, unlike every raster export, which reads the
+ * finished composite and therefore gets transforms for free. Carrying a
+ * transform into those two means threading a matrix through the export node
+ * tree (an SVG `transform` attribute, a PDF `cm` inside the form) — real work,
+ * and deliberately not in this slice. Until then, say so rather than hand back
+ * a file that silently shows the drawing at rest.
+ */
+function xfExportOK(what) {
+  if (!frameMoved(state.frame)) return true;
+  return confirm(
+    `${what} writes each layer's own artwork, so the transform/rig animation on `
+    + `this frame will NOT be included — layers export at rest.\n\n`
+    + `Raster exports (PNG, GIF, APNG, video, ZIP) do include it.\n\nExport anyway?`);
+}
+
+$('btn-export-svg').addEventListener('click', () => {
+  if (xfExportOK('SVG export')) exportSVG();
+});
+$('btn-export-pdf').addEventListener('click', (e) => {
+  if (xfExportOK('PDF export')) runExport(e.currentTarget, exportPDF);
+});
 
 /** Serialize the whole project (frames, layers, palette, size, fps) and download it. */
 // Coords round to 1/100 art px on save — invisible, and it keeps stroke JSON
@@ -7969,7 +9903,8 @@ function saveProject() {
     // loadable by the deployed pre-Phase-8 app until vector art appears; v4
     // adds vector layers, v5 adds groups. Grouping is additive (a `tree`
     // field, below), so a group-less v4/v3 file is byte-identical to before.
-    version: hasGroups ? 5 : anyVector ? PROJECT_VERSION : 3,
+    version: hasRig() ? 9 : hasCamera() ? 8 : hasAnyTrack() ? 7 : anyHolds() ? 6
+      : hasGroups ? 5 : anyVector ? PROJECT_VERSION : 3,
     ...printMeta,
     mode: state.mode,
     width: state.width,
@@ -7982,20 +9917,64 @@ function saveProject() {
       name: m.name, visible: m.visible,
       opacity: m.opacity, blend: m.blend, alphaLock: m.alphaLock,
       ...(m.kind === 'vector' ? { kind: 'vector' } : {}),
+      // v7 transform track — written ONLY for an animated layer, so an
+      // unanimated project stays byte-identical (the v5 tree / v6 exposure
+      // discipline). Keys drop fields sitting at their default for the same
+      // reason 9a writes only non-default stroke style.
+      ...(m.xf && ((m.xf.keys && m.xf.keys.length) || m.xf.pivot)
+        ? { xf: {
+            ...(m.xf.pivot ? { pivot: m.xf.pivot.slice() } : {}),
+            keys: (m.xf.keys || []).map(serializeXfKey),
+          } }
+        : {}),
+      // v9: the bone this layer binds to (rigid), written only when bound.
+      ...(m.bone ? { bone: m.bone } : {}),
     })),
     // Layer tree (v5): only written when groups exist, so group-less files stay
     // byte-identical. Leaves are their flat index into `layers`; loaders that
     // don't understand it (or its absence) fall back to a flat tree.
     ...(hasGroups ? { tree: serializeTree(state.tree) } : {}),
+    // Camera track (v8): a global non-layer pan/zoom/rotate, written only when
+    // the project has one, so camera-less files stay byte-identical. Keys drop
+    // fields sitting at their default, the same discipline as the transform
+    // track above.
+    ...(hasCamera()
+      ? { camera: { keys: state.camera.keys.map((k) => ({
+          f: k.f,
+          ...(k.x ? { x: k.x } : {}),
+          ...(k.y ? { y: k.y } : {}),
+          ...(k.zoom !== 1 ? { zoom: k.zoom } : {}),
+          ...(k.rot ? { rot: k.rot } : {}),
+          ...(k.ease !== 'inout' ? { ease: k.ease } : {}),
+        })) } }
+      : {}),
+    // Bone rig (v9): a flat bone list, written only when a rig exists so rig-less
+    // files stay byte-identical. `parent` is omitted for roots, and a bone's
+    // pose track rides as `xf` (same key shape as a layer) only when keyed.
+    ...(hasRig()
+      ? { bones: state.bones.map((b) => ({
+          id: b.id, name: b.name,
+          ...(b.parent ? { parent: b.parent } : {}),
+          x: b.x, y: b.y, len: b.len, angle0: b.angle0,
+          ...(b.xf && b.xf.keys && b.xf.keys.length
+            ? { xf: { keys: b.xf.keys.map(serializeXfKey) } } : {}),
+        })) }
+      : {}),
     // Pixel planes save as hex arrays (diff-able, hand-fixable). Freeform
     // raster planes save as PNG data-URLs — the plane's canvas is the truth
     // there, and lossless PNG is hugely smaller than a per-pixel string
     // array. Vector planes (v4) save their stroke lists — the truth — and
     // re-rasterize on load.
-    frames: state.frames.map((f) => f.layers.map((l) =>
-      l.strokes
-        ? { strokes: l.strokes.map(serializeStroke) }
-        : state.mode === 'free' ? l.canvas.toDataURL('image/png') : l.pixels)),
+    // 13a exposure: a HELD cell writes `null` — "same drawing as the previous
+    // frame on this layer". That is what makes a hold cost nothing on disk as
+    // well as in memory, and it keeps hold-free projects byte-identical, since
+    // a cell was never null before. Loaders that don't understand it can't
+    // exist yet (v6 is gated on a hold actually being present).
+    frames: state.frames.map((f, fi) => f.layers.map((l, li) =>
+      (isHeldAt(fi, li) ? null
+        : l.strokes
+          ? { strokes: l.strokes.map(serializeStroke) }
+          : state.mode === 'free' ? l.canvas.toDataURL('image/png') : l.pixels))),
   };
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
   download(`sprite-project-${state.width}x${state.height}-${state.frames.length}f.json`, blob);
@@ -8154,12 +10133,24 @@ async function parseProject(text) {
       // else (or any older version) normalizes to raster.
       kind: mode === 'free' && d.version >= 4 && m && m.kind === 'vector'
         ? 'vector' : 'raster',
+      // v7 transform track, validated key by key like everything else here —
+      // a hand-edited or truncated file must load, not crash. A track that
+      // ends up with no keys and no pivot becomes no track at all.
+      xf: cleanTrack(m && m.xf),
+      // v9 bone binding — the id is reconciled against the rebuilt bone list
+      // in newProject (a binding to a dropped bone is unbound there).
+      bone: m && typeof m.bone === 'string' ? m.bone : null,
     }));
     for (const fl of d.frames) {
       if (!Array.isArray(fl) || fl.length !== layers.length) return null;
       const planes = [];
       for (let li = 0; li < fl.length; li++) {
         const px = fl[li];
+        // v6 exposure: a null cell HOLDS the previous frame's drawing on this
+        // layer. On frame 0 there is nothing to hold, so it loads as an empty
+        // plane rather than rejecting a file that is otherwise fine — the same
+        // leniency the malformed-tree path uses.
+        if (px === null) { planes.push(frames.length ? HELD : null); continue; }
         const p = layers[li].kind === 'vector' ? cleanVecPlane(px)
           : mode === 'free' ? await decodePlane(px, w, h)
           : cleanPlane(px);
@@ -8175,6 +10166,12 @@ async function parseProject(text) {
     // Layer tree (v5, additive): passed to newProject as extra.tree, validated
     // there against the built leaves; absent/invalid falls back to a flat tree.
     tree: d.tree,
+    // Camera track (v8, additive): passed as extra.camera, validated by
+    // cleanCamera in newProject; absent/invalid = no camera.
+    camera: d.camera,
+    // Bone rig (v9, additive): passed as extra.bones, validated by cleanBones
+    // in newProject; absent/invalid = no rig.
+    bones: d.bones,
     palette: palette.length ? palette : null,
     fps: parseInt(d.fps, 10) || null,
     // Print metadata (optional, additive): absent or invalid = digital.
@@ -8456,10 +10453,18 @@ function buildManifest() {
     layers: state.layers.map((m) => ({
       name: m.name, visible: m.visible, opacity: m.opacity,
       blend: m.blend, alphaLock: m.alphaLock, kind: m.kind,
+      // Animation must survive a crash too — tracks are tiny, so they ride in
+      // the manifest whole rather than being reconstructed.
+      ...(m.xf ? { xf: { pivot: m.xf.pivot, keys: m.xf.keys.map((k) => ({ ...k })) } } : {}),
+      ...(m.bone ? { bone: m.bone } : {}),
     })),
     // Group structure must survive a crash too (restoreProject passes this
     // manifest as newProject's `extra`). Tiny — an array of leaf indices.
     tree: serializeTree(state.tree),
+    // The camera track must survive a crash too — tiny, so it rides whole.
+    ...(hasCamera() ? { camera: { keys: state.camera.keys.map((k) => ({ ...k })) } } : {}),
+    // The bone rig too — the whole flat list, poses included.
+    ...(hasRig() ? { bones: state.bones.map((b) => ({ ...b, xf: b.xf ? { keys: b.xf.keys.map((k) => ({ ...k })) } : null })) } : {}),
     frames: state.frames.map((f) => f.layers.map((p) => (
       p.strokes
         ? { id: p.id, kind: 'vector', strokes: p.strokes.map(serializeStroke) }
@@ -8480,12 +10485,15 @@ async function autosaveNow() {
   autosaveRunning = true;
   try {
     const live = new Set();
-    const writes = [];
+    // A Set, not an array: 13a lets one plane appear in several frames (a
+    // hold), and the same drawing must not be encoded and written once per
+    // frame holding it — that is exactly the cost a hold is supposed to avoid.
+    const writes = new Set();
     for (const f of state.frames) {
       for (const p of f.layers) {
         live.add(p.id);
         if (p.strokes) continue; // vector: stroke list rides in the manifest
-        if (dirtyPlanes.has(p) || !storedPlanes.has(p.id)) writes.push(p);
+        if (dirtyPlanes.has(p) || !storedPlanes.has(p.id)) writes.add(p);
       }
     }
     for (const p of writes) {
@@ -8561,7 +10569,18 @@ async function restoreProject(man) {
   const frames = [];
   for (const fr of man.frames) {
     const row = [];
-    for (const ref of fr) {
+    const prev = man.frames[frames.length - 1];
+    for (let li = 0; li < fr.length; li++) {
+      const ref = fr[li];
+      // 13a: the manifest already writes a held cell as the SAME plane id as
+      // the cell before it (planes ride as ids), so a repeated id at the same
+      // layer IS the hold. Restoring it as HELD is what keeps the recovered
+      // project sharing one drawing instead of silently un-holding into N
+      // independent copies of it.
+      if (prev && ref && prev[li] && ref.id && prev[li].id === ref.id) {
+        row.push(HELD);
+        continue;
+      }
       if (ref.kind === 'vector') { row.push(ref.strokes || []); continue; }
       let src = null;
       try {
@@ -8600,6 +10619,7 @@ async function discardRecovery() {
 }
 
 $('btn-export').addEventListener('click', exportSheet);
+$('btn-export-atlas').addEventListener('click', exportAtlas);
 $('btn-save').addEventListener('click', saveProject);
 $('btn-load').addEventListener('click', () => $('inp-file').click());
 
@@ -9602,6 +11622,13 @@ function selectTool(t) {
   $('strength-box').hidden = t !== 'smudge';
   $('st-tool').textContent = toolLabel();
   updateShapeBox(); // the shape controls follow the Shape tool
+  // Rig selection lives with the Bone tool: leaving it drops the selected bone
+  // so the transform bar returns to the active layer and no stray bone stays
+  // lit in the sheet. refreshXfBar/render self-guard on an open sheet / a
+  // project existing (selectTool also runs once at boot, pre-newProject).
+  if (t !== 'bone') state.activeBone = null;
+  refreshXfBar();
+  if (state.frames && state.frames.length) render();
 }
 
 document.querySelectorAll('#toolbar .tool').forEach((b) => {
@@ -9731,8 +11758,14 @@ bindSliderPair('inp-fill-tol', 'tolerance-num', (v) => {
 
 function updateStatus() {
   $('st-coords').textContent = hover ? `${hover.x}, ${hover.y}` : '—';
+  // 13a: when the active layer's drawing spans more than one frame, say so and
+  // say where you are inside the run — "which drawing am I actually editing"
+  // is the question a dope sheet exists to answer.
+  const e = exposureAt(state.frame, state.layer);
+  const exposure = e.length > 1
+    ? ` · held ${state.frame - e.start + 1}/${e.length}` : '';
   $('st-frame').textContent =
-    `frame ${state.frame + 1}/${state.frames.length} · ${state.layers[state.layer].name}`;
+    `frame ${state.frame + 1}/${state.frames.length} · ${state.layers[state.layer].name}${exposure}`;
 }
 
 // Briefly replace the status-bar hint with a message, then restore it.
@@ -9795,9 +11828,9 @@ document.addEventListener('click', (e) => {
   if (!settingsMenu.hidden && !settingsMenu.contains(e.target)) settingsMenu.hidden = true;
   if (!layerAddMenu.hidden && !layerAddMenu.contains(e.target)) layerAddMenu.hidden = true;
 });
-for (const id of ['btn-new', 'btn-save', 'btn-load', 'btn-export',
-                  'btn-export-gif', 'btn-export-apng', 'btn-export-video', 'btn-export-zip',
-                  'btn-export-svg', 'btn-export-pdf']) {
+for (const id of ['btn-new', 'btn-save', 'btn-load', 'btn-export', 'btn-export-atlas',
+                  'btn-export-gif', 'btn-export-apng', 'btn-export-video', 'btn-export-webm',
+                  'btn-export-zip', 'btn-export-svg', 'btn-export-pdf']) {
   $(id).addEventListener('click', () => { fileMenu.hidden = true; });
 }
 
@@ -10257,6 +12290,21 @@ if (typeof window.__ssmTest === 'function') {
                      vecBoxXform, xformStroke, splitStroke, rgbToCmyk, proofRgb,
                      flatTree, treeHasGroups, flattenLeaves, treeAltersComposite,
                      serializeTree, deserializeTree, leafNodeAt,
+                     isHeldAt, exposureAt, anyHolds, toggleHold, addHoldFrame,
+                     holdAt, breakHoldAt, selectFrame, framesSharingWith,
+                     moveFrame, normalizeExposure, detachCell,
+                     setDopeOpen, dopeSig, syncDopeSheet,
+                     xfAt, setKey, removeKey, clearTrack, keyAt, cleanTrack,
+                     afterXfChange, recompositeAll,
+                     xfIsIdentity, frameHasXf, hasAnyTrack, easeT, remapKeys,
+                     camAt, camIsIdentity, cleanCamera, cleanCamKey, hasCamera, outputComposite,
+                     camKeyAt, setCamKey, removeCamKey, clearCamera, camToScene,
+                     matMul, matTRS, matInvert, matApply, MAT_ID,
+                     addBone, boneById, bindLayer, setBoneKey, hasRig, cleanBones,
+                     boneWorldAt, boneRestWorld, boundDelta, boneTip, boneHead, invalidateBones,
+                     boneMovesAt, frameHasBoundMove, frameMoved,
+                     distToSeg, createBoneFromDrag, poseRotateTo, deleteBone, activeBone,
+                     selectBone, boneOrder, xfTarget, afterRigChange,
                      selectLayer, selectGroup, addLayer, groupSelected,
                      ungroupSelected, moveLayer, deleteSelection, moveLayerNode,
                      findParent, state,
